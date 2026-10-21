@@ -1,0 +1,6 @@
+{
+  "name": "OmniDrop - Personal Video Downloader",
+  "description": "Download full quality videos with no watermark from TikTok, YouTube, Instagram, and Facebook directly to your device.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

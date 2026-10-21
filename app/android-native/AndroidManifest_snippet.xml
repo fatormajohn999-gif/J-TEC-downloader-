@@ -1,0 +1,42 @@
+<!-- 
+Add these entries to your android/app/src/main/AndroidManifest.xml 
+inside the <manifest> and <application> tags.
+-->
+
+<!-- 1. Permissions (inside <manifest>) -->
+<uses-permission android:name="android.permission.INTERNET" />
+<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+
+<!-- 2. Inside <application> tags: -->
+
+<!-- Floating Bubble Service -->
+<service
+    android:name="com.omnidrop.app.plugin.FloatingBubbleService"
+    android:enabled="true"
+    android:exported="false"
+    android:foregroundServiceType="specialUse" />
+
+<!-- Transparent Clipboard Bridge Activity -->
+<activity
+    android:name="com.omnidrop.app.plugin.ClipboardBridgeActivity"
+    android:theme="@android:style/Theme.Translucent.NoTitleBar"
+    android:excludeFromRecents="true"
+    android:launchMode="singleTask"
+    android:exported="false" />
+
+<!-- Share Intent Receiver for Social Media apps (TikTok, YouTube, IG, FB) -->
+<activity
+    android:name="com.omnidrop.app.plugin.ShareActivity"
+    android:exported="true"
+    android:theme="@android:style/Theme.Translucent.NoTitleBar">
+    <intent-filter>
+        <action android:name="android.intent.action.SEND" />
+        <category android:name="android.intent.category.DEFAULT" />
+        <data android:mimeType="text/plain" />
+    </intent-filter>
+</activity>
