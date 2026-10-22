@@ -13,46 +13,115 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Java 17
+      - name: Setup Java 21
         uses: actions/setup-java@v4
         with:
-          distribution: "zulu"
-          java-version: "17"
-          cache: "gradle"
+          distribution: "temurin"
+          java-version: "21"
 
       - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: "npm"
 
       - name: Install Node Dependencies
-        run: npm ci
+        run: |
+          npm install --no-audit --no-fund
+          CAP_VERSION=$(node -p "require('./node_modules/@capacitor/core/package.json').version")
+          echo "Capacitor core version: $CAP_VERSION"
+          npm install --no-save --no-audit --no-fund "@capacitor/android@$CAP_VERSION"
 
       - name: Build Web App
         run: npm run build
 
-      - name: Initialize / Sync Capacitor Android
+      - name: Create Android Project
         run: |
           if [ ! -d "android" ]; then
             npx cap add android
           fi
-          # Copy custom native Kotlin plugin files to the generated android project
-          PLUGIN_DIR="android/app/src/main/java/com/omnidrop/app/plugin"
-          mkdir -p "$PLUGIN_DIR"
-          cp -r app/android-native/*.kt "$PLUGIN_DIR/" || true
 
-          # Merge permissions and activity/service configurations into AndroidManifest.xml
-          MANIFEST="android/app/src/main/AndroidManifest.xml"
-          if [ -f "$MANIFEST" ]; then
-            # Ensure SYSTEM_ALERT_WINDOW and foreground service permissions
-            sed -i '/<\/manifest>/i \    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />' "$MANIFEST"
-          fi
+      - name: Add Native Kotlin Plugin
+        run: |
+          PKG_DIR="android/app/src/main/java/com/omnidrop/app"
+          mkdir -p "$PKG_DIR/plugin"
+          cp app/android-native/*.kt "$PKG_DIR/plugin/"
 
-          npx cap sync android
+          # Replace MainActivity so it registers our plugin
+          rm -f "$PKG_DIR/MainActivity.java" "$PKG_DIR/MainActivity.kt"
+          cat > "$PKG_DIR/MainActivity.java" <<'JAVA'
+          package com.omnidrop.app;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+          import com.omnidrop.app.plugin.VideoDownloaderPlugin;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(VideoDownloaderPlugin.class);
+                  super.onCreate(savedInstanceState);
+              }
+          }
+          JAVA
+          sed -i 's/^          //' "$PKG_DIR/MainActivity.java"
+
+      - name: Patch Manifest and Enable Kotlin
+        run: |
+          python3 - <<'PY'
+          import re
+
+          # ---- AndroidManifest.xml ----
+          p = "android/app/src/main/AndroidManifest.xml"
+          s = open(p).read()
+          perms = (
+              '    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />\n'
+              '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n'
+              '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />\n'
+              '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n'
+          )
+          comps = (
+              '        <service android:name="com.omnidrop.app.plugin.FloatingBubbleService" android:enabled="true" android:exported="false" android:foregroundServiceType="specialUse">\n'
+              '            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="floating_quick_download_bubble" />\n'
+              '        </service>\n'
+              '        <activity android:name="com.omnidrop.app.plugin.ClipboardBridgeActivity" android:theme="@android:style/Theme.Translucent.NoTitleBar" android:excludeFromRecents="true" android:launchMode="singleTask" android:exported="false" />\n'
+              '        <activity android:name="com.omnidrop.app.plugin.ShareActivity" android:exported="true" android:theme="@android:style/Theme.Translucent.NoTitleBar">\n'
+              '            <intent-filter>\n'
+              '                <action android:name="android.intent.action.SEND" />\n'
+              '                <category android:name="android.intent.category.DEFAULT" />\n'
+              '                <data android:mimeType="text/plain" />\n'
+              '            </intent-filter>\n'
+              '        </activity>\n'
+          )
+          if "FloatingBubbleService" not in s:
+              s = s.replace("<application", perms + "    <application", 1)
+              s = s.replace("</application>", comps + "    </application>", 1)
+          open(p, "w").write(s)
+
+          # ---- Kotlin support in Gradle ----
+          p = "android/build.gradle"
+          s = open(p).read()
+          if "kotlin-gradle-plugin" not in s:
+              s = re.sub(
+                  r"(classpath ['\"]com\.android\.tools\.build:gradle:[^'\"]+['\"])",
+                  r"\1\n        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.25'",
+                  s, count=1)
+          open(p, "w").write(s)
+
+          p = "android/app/build.gradle"
+          s = open(p).read()
+          if "kotlin-android" not in s:
+              s = s.replace("apply plugin: 'com.android.application'",
+                            "apply plugin: 'com.android.application'\napply plugin: 'kotlin-android'", 1)
+              s = re.sub(r"android\s*\{", "android {\n    kotlinOptions { jvmTarget = '21' }", s, count=1)
+          open(p, "w").write(s)
+          print("Patched manifest and gradle")
+          PY
+
+      - name: Sync Capacitor
+        run: npx cap sync android
 
       - name: Make Gradle Wrapper Executable
-        run: chmod +x android/gradlew || true
+        run: chmod +x android/gradlew
 
       - name: Build Debug APK with Gradle
         run: |
