@@ -6,6 +6,7 @@ import {VitePWA} from 'vite-plugin-pwa';
 
 export default defineConfig(() => {
   return {
+    base: process.env.VITE_BASE_URL || '/',
     plugins: [
       react(),
       tailwindcss(),
@@ -13,38 +14,38 @@ export default defineConfig(() => {
         registerType: 'autoUpdate',
         includeAssets: ['icon.svg', 'pwa-192x192.png', 'pwa-512x512.png', 'apple-touch-icon.png'],
         manifest: {
-          id: '/',
+          id: './',
           name: 'OmniDrop - Video Downloader',
           short_name: 'OmniDrop',
           description: 'Download full quality videos with no watermark from TikTok, YouTube, Instagram, and Facebook.',
           theme_color: '#090d16',
           background_color: '#090d16',
           display: 'standalone',
-          start_url: '/',
-          scope: '/',
+          start_url: './',
+          scope: './',
           orientation: 'portrait',
           icons: [
             {
-              src: '/pwa-192x192.png',
+              src: 'pwa-192x192.png',
               sizes: '192x192',
               type: 'image/png',
               purpose: 'any',
             },
             {
-              src: '/pwa-512x512.png',
+              src: 'pwa-512x512.png',
               sizes: '512x512',
               type: 'image/png',
               purpose: 'any',
             },
             {
-              src: '/pwa-maskable-512x512.png',
+              src: 'pwa-maskable-512x512.png',
               sizes: '512x512',
               type: 'image/png',
               purpose: 'maskable',
             },
           ],
           share_target: {
-            action: '/',
+            action: './',
             method: 'GET',
             enctype: 'application/x-www-form-urlencoded',
             params: {
