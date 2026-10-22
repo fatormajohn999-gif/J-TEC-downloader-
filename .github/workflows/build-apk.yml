@@ -5,6 +5,9 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-android:
     name: Build Android APK
@@ -18,6 +21,21 @@ jobs:
         with:
           distribution: "temurin"
           java-version: "21"
+
+      - name: Ensure Persistent Signing Key
+        run: |
+          mkdir -p signing
+          if [ ! -f signing/omnidrop-debug.keystore ]; then
+            keytool -genkeypair -v -keystore signing/omnidrop-debug.keystore \
+              -storepass omnidrop123 -keypass omnidrop123 -alias omnidrop \
+              -keyalg RSA -keysize 2048 -validity 36500 \
+              -dname "CN=OmniDrop, O=OmniDrop, C=SL"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add signing/omnidrop-debug.keystore
+            git commit -m "Add persistent signing key for OmniDrop APK updates"
+            git push
+          fi
 
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
@@ -78,12 +96,15 @@ jobs:
               '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n'
               '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />\n'
               '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n'
+              '    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />\n'
+              '    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />\n'
           )
           comps = (
               '        <service android:name="com.omnidrop.app.plugin.FloatingBubbleService" android:enabled="true" android:exported="false" android:foregroundServiceType="specialUse">\n'
               '            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="floating_quick_download_bubble" />\n'
               '        </service>\n'
               '        <activity android:name="com.omnidrop.app.plugin.ClipboardBridgeActivity" android:theme="@android:style/Theme.Translucent.NoTitleBar" android:excludeFromRecents="true" android:launchMode="singleTask" android:exported="false" />\n'
+              '        <activity android:name="com.omnidrop.app.plugin.VideoPlayerActivity" android:exported="false" android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize" />\n'
               '        <activity android:name="com.omnidrop.app.plugin.ShareActivity" android:exported="true" android:theme="@android:style/Theme.Translucent.NoTitleBar">\n'
               '            <intent-filter>\n'
               '                <action android:name="android.intent.action.SEND" />\n'
@@ -113,6 +134,8 @@ jobs:
               s = s.replace("apply plugin: 'com.android.application'",
                             "apply plugin: 'com.android.application'\napply plugin: 'kotlin-android'", 1)
               s = re.sub(r"android\s*\{", "android {\n    kotlinOptions { jvmTarget = '21' }", s, count=1)
+          if "omnidrop-debug.keystore" not in s:
+              s = re.sub(r"android\s*\{", "android {\n    signingConfigs {\n        debug {\n            storeFile file(System.getenv('GITHUB_WORKSPACE') + '/signing/omnidrop-debug.keystore')\n            storePassword 'omnidrop123'\n            keyAlias 'omnidrop'\n            keyPassword 'omnidrop123'\n        }\n    }", s, count=1)
           open(p, "w").write(s)
           print("Patched manifest and gradle")
           PY
