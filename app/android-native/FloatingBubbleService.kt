@@ -72,13 +72,13 @@ class FloatingBubbleService : Service() {
         // Create bubble view programmatically
         val bubble = ImageView(this).apply {
             val size = (56 * resources.displayMetrics.density).toInt()
-            val shape = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
+            val circle = GradientDrawable().apply {
+                this.shape = GradientDrawable.OVAL
                 colors = intArrayOf(Color.parseColor("#6366F1"), Color.parseColor("#A855F7"))
                 gradientType = GradientDrawable.LINEAR_GRADIENT
                 setStroke(4, Color.WHITE)
             }
-            background = shape
+            background = circle
             setImageResource(android.R.drawable.stat_sys_download)
             setColorFilter(Color.WHITE)
             setPadding(24, 24, 24, 24)
