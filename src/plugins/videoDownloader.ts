@@ -9,6 +9,12 @@ export interface VideoDownloaderPlugin {
   dismissPersistentNotification(): Promise<void>;
   showDownloadNotification(options: { title: string; message: string; filePath?: string }): Promise<void>;
   getLastSharedUrl(): Promise<{ url: string }>;
+  saveNativeSettings(options: {
+    backendUrl: string;
+    apiKey?: string;
+    defaultQuality?: string;
+    autoDownload?: boolean;
+  }): Promise<{ saved: boolean }>;
   downloadAndSave(options: {
     url: string;
     quality: string;
@@ -60,6 +66,9 @@ const VideoDownloaderWeb: VideoDownloaderPlugin = {
   },
   async getLastSharedUrl() {
     return { url: '' };
+  },
+  async saveNativeSettings() {
+    return { saved: true };
   },
   async downloadAndSave() {
     throw new Error('downloadAndSave native method is only available on Android platform.');

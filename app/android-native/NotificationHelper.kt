@@ -26,8 +26,8 @@ object NotificationHelper {
                 "OmniDrop Quick Actions",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Quick clipboard capture and floating controls"
-                setShowBadge(false)
+                this.description = "Quick clipboard capture and floating controls"
+                this.setShowBadge(false)
             }
 
             val downloadChannel = NotificationChannel(
@@ -35,8 +35,8 @@ object NotificationHelper {
                 "OmniDrop Downloads",
                 NotificationManager.IMPORTANCE_DEFAULT
             ).apply {
-                description = "Notifications for finished video downloads"
-                enableVibration(true)
+                this.description = "Notifications for finished video downloads"
+                this.enableVibration(true)
             }
 
             manager.createNotificationChannel(persistentChannel)
@@ -104,8 +104,8 @@ object NotificationHelper {
 
         val openIntent = if (!filePath.isNullOrBlank()) {
             Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(Uri.parse(filePath), "video/*")
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                this.setDataAndType(Uri.parse(filePath), "video/*")
+                this.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
             }
         } else {
             val mainClass = try {

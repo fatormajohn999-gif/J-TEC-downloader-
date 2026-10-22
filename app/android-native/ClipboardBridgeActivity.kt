@@ -25,27 +25,39 @@ class ClipboardBridgeActivity : Activity() {
 
             if (clip != null && clip.itemCount > 0) {
                 val text = clip.getItemAt(0).coerceToText(this)?.toString()?.trim() ?: ""
-                if (text.startsWith("http://") || text.startsWith("https://")) {
+                val supported = FloatingBubbleService.extractSupportedUrl(text)
+                if (supported != null) {
+                    extractedUrl = supported
+                } else if (text.startsWith("http://") || text.startsWith("https://")) {
                     extractedUrl = text
                 }
             }
 
             if (extractedUrl.isNotBlank()) {
                 Toast.makeText(this, "OmniDrop: Grabbed link from clipboard!", Toast.LENGTH_SHORT).show()
-                
-                // 1. Notify running Capacitor plugin if active
+
+                // 1. If FloatingBubbleService is active, feed directly
+                if (FloatingBubbleService.instance != null) {
+                    FloatingBubbleService.instance?.handleSharedUrl(extractedUrl)
+                }
+
+                // 2. Notify running Capacitor plugin if active
                 VideoDownloaderPlugin.instance?.notifyUrlReceived(extractedUrl)
 
-                // 2. Open or bring MainActivity to front with the URL extra
-                val mainClass = Class.forName("com.omnidrop.app.MainActivity")
-                val openAppIntent = Intent(this, mainClass).apply {
-                    action = Intent.ACTION_VIEW
-                    putExtra("url_to_download", extractedUrl)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                // 3. Open or bring MainActivity to front with the URL extra
+                try {
+                    val mainClass = Class.forName("com.omnidrop.app.MainActivity")
+                    val openAppIntent = Intent(this, mainClass).apply {
+                        this.action = Intent.ACTION_VIEW
+                        this.putExtra("url_to_download", extractedUrl)
+                        this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                    }
+                    startActivity(openAppIntent)
+                } catch (e: Exception) {
+                    e.printStackTrace()
                 }
-                startActivity(openAppIntent)
             } else {
-                Toast.makeText(this, "No video URL found in clipboard", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "No supported video URL found in clipboard", Toast.LENGTH_SHORT).show()
             }
         } catch (e: Exception) {
             e.printStackTrace()

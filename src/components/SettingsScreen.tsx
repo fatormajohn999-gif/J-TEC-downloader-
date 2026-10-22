@@ -53,6 +53,12 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       persistentNotificationEnabled: isPersistentActive,
     };
     onUpdateSettings(updated);
+    VideoDownloader.saveNativeSettings({
+      backendUrl: backendUrl.trim(),
+      apiKey: apiKey.trim(),
+      defaultQuality,
+      autoDownload: true,
+    }).catch(() => {});
     setSavedNotification(true);
     setTimeout(() => setSavedNotification(false), 2500);
     onRefreshHealth();

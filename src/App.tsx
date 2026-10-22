@@ -58,8 +58,23 @@ export default function App() {
     setSettings(newSettings);
     try {
       localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(newSettings));
+      VideoDownloader.saveNativeSettings({
+        backendUrl: newSettings.backendUrl,
+        apiKey: newSettings.apiKey,
+        defaultQuality: newSettings.defaultQuality,
+        autoDownload: true,
+      }).catch(() => {});
     } catch {}
   };
+
+  useEffect(() => {
+    VideoDownloader.saveNativeSettings({
+      backendUrl: settings.backendUrl,
+      apiKey: settings.apiKey,
+      defaultQuality: settings.defaultQuality,
+      autoDownload: true,
+    }).catch(() => {});
+  }, []);
 
   // Persist history
   const handleDownloadCompleted = (item: {

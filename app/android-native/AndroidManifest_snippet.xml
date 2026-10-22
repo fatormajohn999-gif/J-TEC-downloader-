@@ -19,7 +19,9 @@ inside the <manifest> and <application> tags.
     android:name="com.omnidrop.app.plugin.FloatingBubbleService"
     android:enabled="true"
     android:exported="false"
-    android:foregroundServiceType="specialUse" />
+    android:foregroundServiceType="specialUse">
+    <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="floating_quick_download_bubble" />
+</service>
 
 <!-- Transparent Clipboard Bridge Activity -->
 <activity

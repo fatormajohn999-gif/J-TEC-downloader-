@@ -61,18 +61,44 @@ class VideoDownloaderPlugin : Plugin() {
     }
 
     fun notifyUrlReceived(url: String) {
-        val ret = JSObject()
-        ret.put("url", url)
+        val ret = JSObject().apply {
+            this.put("url", url)
+        }
         notifyListeners("onUrlReceived", ret, true)
     }
 
     @PluginMethod
+    fun saveNativeSettings(call: PluginCall) {
+        val backendUrl = call.getString("backendUrl") ?: ""
+        val apiKey = call.getString("apiKey") ?: ""
+        val defaultQuality = call.getString("defaultQuality") ?: "best"
+        val autoDownload = call.getBoolean("autoDownload", true) ?: true
+
+        val prefs = context.getSharedPreferences("omnidrop_native_prefs", Context.MODE_PRIVATE)
+        prefs.edit().apply {
+            this.putString("backend_url", backendUrl)
+            this.putString("api_key", apiKey)
+            this.putString("default_quality", defaultQuality)
+            this.putBoolean("auto_download", autoDownload)
+            this.apply()
+        }
+
+        FloatingBubbleService.instance?.updateSettings(backendUrl, apiKey, defaultQuality, autoDownload)
+
+        val result = JSObject().apply {
+            this.put("saved", true)
+        }
+        call.resolve(result)
+    }
+
+    @PluginMethod
     fun hasOverlayPermission(call: PluginCall) {
-        val result = JSObject()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            result.put("granted", Settings.canDrawOverlays(context))
-        } else {
-            result.put("granted", true)
+        val result = JSObject().apply {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                this.put("granted", Settings.canDrawOverlays(context))
+            } else {
+                this.put("granted", true)
+            }
         }
         call.resolve(result)
     }
@@ -88,8 +114,9 @@ class VideoDownloaderPlugin : Plugin() {
                 activity.startActivity(intent)
             }
         }
-        val result = JSObject()
-        result.put("requested", true)
+        val result = JSObject().apply {
+            this.put("requested", true)
+        }
         call.resolve(result)
     }
 
@@ -108,8 +135,9 @@ class VideoDownloaderPlugin : Plugin() {
             ctx.startService(serviceIntent)
         }
 
-        val res = JSObject()
-        res.put("status", "running")
+        val res = JSObject().apply {
+            this.put("status", "running")
+        }
         call.resolve(res)
     }
 
@@ -119,8 +147,9 @@ class VideoDownloaderPlugin : Plugin() {
         val serviceIntent = Intent(ctx, FloatingBubbleService::class.java)
         ctx.stopService(serviceIntent)
 
-        val res = JSObject()
-        res.put("status", "stopped")
+        val res = JSObject().apply {
+            this.put("status", "stopped")
+        }
         call.resolve(res)
     }
 
@@ -149,8 +178,9 @@ class VideoDownloaderPlugin : Plugin() {
 
     @PluginMethod
     fun getLastSharedUrl(call: PluginCall) {
-        val result = JSObject()
-        result.put("url", lastReceivedUrl ?: "")
+        val result = JSObject().apply {
+            this.put("url", lastReceivedUrl ?: "")
+        }
         lastReceivedUrl = null
         call.resolve(result)
     }
@@ -206,23 +236,23 @@ class VideoDownloaderPlugin : Plugin() {
                 reportProgress(10, "Connecting to download server...")
 
                 val urlObj = URL(endpoint)
-                connection = urlObj.openConnection() as HttpURLConnection
-                connection.requestMethod = "POST"
-                connection.connectTimeout = 30000
-                connection.readTimeout = 180000
-                connection.doInput = true
-                connection.doOutput = true
-                connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-                connection.setRequestProperty("Accept", "*/*")
-
-                if (!apiKey.isNullOrBlank()) {
-                    connection.setRequestProperty("x-api-key", apiKey.trim())
+                connection = (urlObj.openConnection() as HttpURLConnection).apply {
+                    this.requestMethod = "POST"
+                    this.connectTimeout = 30000
+                    this.readTimeout = 180000
+                    this.doInput = true
+                    this.doOutput = true
+                    this.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                    this.setRequestProperty("Accept", "*/*")
+                    if (!apiKey.isNullOrBlank()) {
+                        this.setRequestProperty("x-api-key", apiKey.trim())
+                    }
                 }
 
                 // Write request JSON body
                 val jsonPayload = JSONObject().apply {
-                    put("url", videoUrl)
-                    put("quality", quality)
+                    this.put("url", videoUrl)
+                    this.put("quality", quality)
                 }
                 connection.outputStream.use { os ->
                     os.write(jsonPayload.toString().toByteArray(Charsets.UTF_8))
@@ -252,13 +282,13 @@ class VideoDownloaderPlugin : Plugin() {
 
                 val resolver = context.contentResolver
                 val contentValues = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                    put(MediaStore.MediaColumns.MIME_TYPE, mediaType)
+                    this.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    this.put(MediaStore.MediaColumns.MIME_TYPE, mediaType)
 
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                         val relativeFolder = if (isAudio) "Music/OmniDrop" else "Movies/OmniDrop"
-                        put(MediaStore.MediaColumns.RELATIVE_PATH, relativeFolder)
-                        put(MediaStore.MediaColumns.IS_PENDING, 1)
+                        this.put(MediaStore.MediaColumns.RELATIVE_PATH, relativeFolder)
+                        this.put(MediaStore.MediaColumns.IS_PENDING, 1)
                     }
                 }
 
@@ -318,7 +348,7 @@ class VideoDownloaderPlugin : Plugin() {
                 // Mark file as complete on Android 10+
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     val updateValues = ContentValues().apply {
-                        put(MediaStore.MediaColumns.IS_PENDING, 0)
+                        this.put(MediaStore.MediaColumns.IS_PENDING, 0)
                     }
                     resolver.update(targetUri, updateValues, null, null)
                 }
@@ -334,8 +364,8 @@ class VideoDownloaderPlugin : Plugin() {
                 )
 
                 val res = JSObject().apply {
-                    put("fileName", fileName)
-                    put("uri", targetUri.toString())
+                    this.put("fileName", fileName)
+                    this.put("uri", targetUri.toString())
                 }
                 call.resolve(res)
 
@@ -357,8 +387,8 @@ class VideoDownloaderPlugin : Plugin() {
 
     private fun reportProgress(percent: Int, statusText: String) {
         val progressObj = JSObject().apply {
-            put("percent", percent)
-            put("statusText", statusText)
+            this.put("percent", percent)
+            this.put("statusText", statusText)
         }
         notifyListeners("onDownloadProgress", progressObj, true)
     }
