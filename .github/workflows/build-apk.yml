@@ -19,17 +19,17 @@ jobs:
           distribution: "temurin"
           java-version: "21"
 
-      - name: Setup Node.js 20
+      - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install Node Dependencies
         run: |
-          npm install --no-audit --no-fund
+          npm install --no-audit --no-fund --legacy-peer-deps
           CAP_VERSION=$(node -p "require('./node_modules/@capacitor/core/package.json').version")
           echo "Capacitor core version: $CAP_VERSION"
-          npm install --no-save --no-audit --no-fund "@capacitor/android@$CAP_VERSION"
+          npm install --no-save --no-audit --no-fund --legacy-peer-deps "@capacitor/android@$CAP_VERSION"
 
       - name: Build Web App
         run: npm run build
