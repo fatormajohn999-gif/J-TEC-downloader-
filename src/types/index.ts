@@ -22,6 +22,8 @@ export interface DownloadHistoryItem {
   platform: PlatformType;
   downloadedAt: number;
   fileName?: string;
+  savedAt?: number;
+  fileUri?: string;
 }
 
 export interface AppSettings {

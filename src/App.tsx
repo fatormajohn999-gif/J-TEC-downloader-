@@ -76,6 +76,80 @@ export default function App() {
     }).catch(() => {});
   }, []);
 
+  const mergeNativeItems = useCallback((nativeItems: DownloadHistoryItem[]) => {
+    if (!nativeItems || nativeItems.length === 0) return;
+    setHistory((prev) => {
+      const merged = [...prev];
+      for (const n of nativeItems) {
+        const nTime = n.savedAt || n.downloadedAt || Date.now();
+        const exists = merged.some((m) => {
+          if (m.id && n.id && m.id === n.id) return true;
+          const mTime = m.savedAt || m.downloadedAt;
+          return m.url === n.url && Math.abs(mTime - nTime) < 3000;
+        });
+        if (!exists) {
+          merged.push({
+            ...n,
+            id: n.id || Math.random().toString(36).substring(2, 9),
+            downloadedAt: nTime,
+            savedAt: nTime,
+          });
+        }
+      }
+      merged.sort((a, b) => (b.downloadedAt || 0) - (a.downloadedAt || 0));
+      const capped = merged.slice(0, 200);
+      try {
+        localStorage.setItem(STORAGE_KEY_HISTORY, JSON.stringify(capped));
+      } catch {}
+      return capped;
+    });
+  }, []);
+
+  const syncNativeHistory = useCallback(async () => {
+    try {
+      const res = await VideoDownloader.getNativeHistory();
+      if (res && res.history && res.history.length > 0) {
+        mergeNativeItems(res.history);
+      }
+    } catch {}
+  }, [mergeNativeItems]);
+
+  // Sync native history on mount
+  useEffect(() => {
+    syncNativeHistory();
+  }, [syncNativeHistory]);
+
+  // Sync native history when coming to foreground
+  useEffect(() => {
+    const handleFocus = () => syncNativeHistory();
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') syncNativeHistory();
+    };
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [syncNativeHistory]);
+
+  // Listen to nativeDownloadFinished event
+  useEffect(() => {
+    let handle: any = null;
+    (async () => {
+      try {
+        handle = await VideoDownloader.addListener('nativeDownloadFinished', (entry: any) => {
+          if (entry && entry.url) {
+            mergeNativeItems([entry]);
+          }
+        });
+      } catch {}
+    })();
+    return () => {
+      if (handle && handle.remove) handle.remove();
+    };
+  }, [mergeNativeItems]);
+
   // Persist history
   const handleDownloadCompleted = (item: {
     url: string;
@@ -91,8 +165,9 @@ export default function App() {
       ...item,
       id: Math.random().toString(36).substring(2, 9),
       downloadedAt: Date.now(),
+      savedAt: Date.now(),
     };
-    const updated = [newItem, ...history.filter((h) => h.url !== item.url)].slice(0, 50);
+    const updated = [newItem, ...history.filter((h) => h.url !== item.url)].slice(0, 200);
     setHistory(updated);
     try {
       localStorage.setItem(STORAGE_KEY_HISTORY, JSON.stringify(updated));
@@ -112,6 +187,7 @@ export default function App() {
       setHistory([]);
       try {
         localStorage.removeItem(STORAGE_KEY_HISTORY);
+        VideoDownloader.clearNativeHistory().catch(() => {});
       } catch {}
     }
   };

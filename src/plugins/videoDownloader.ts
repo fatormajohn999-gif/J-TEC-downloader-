@@ -1,4 +1,5 @@
 import { registerPlugin, PluginListenerHandle } from '@capacitor/core';
+import { DownloadHistoryItem } from '../types';
 
 export interface VideoDownloaderPlugin {
   hasOverlayPermission(): Promise<{ granted: boolean }>;
@@ -22,6 +23,8 @@ export interface VideoDownloaderPlugin {
     backendUrl: string;
     apiKey?: string;
   }): Promise<{ fileName: string }>;
+  getNativeHistory(): Promise<{ history: DownloadHistoryItem[] }>;
+  clearNativeHistory(): Promise<{ cleared: boolean }>;
   addListener(
     eventName: 'onUrlReceived',
     listenerFunc: (data: { url: string }) => void
@@ -29,6 +32,10 @@ export interface VideoDownloaderPlugin {
   addListener(
     eventName: 'onDownloadProgress',
     listenerFunc: (data: { percent: number; statusText: string }) => void
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'nativeDownloadFinished',
+    listenerFunc: (entry: DownloadHistoryItem) => void
   ): Promise<PluginListenerHandle>;
 }
 
@@ -72,6 +79,12 @@ const VideoDownloaderWeb: VideoDownloaderPlugin = {
   },
   async downloadAndSave() {
     throw new Error('downloadAndSave native method is only available on Android platform.');
+  },
+  async getNativeHistory() {
+    return { history: [] };
+  },
+  async clearNativeHistory() {
+    return { cleared: true };
   },
   async addListener() {
     return {
