@@ -28,15 +28,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: "npm"
 
       - name: Install Dependencies
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       - name: Build Web App
         env:
-          # Ensure relative/repo base path for GitHub Pages hosting
-          VITE_BASE_URL: ./${{ github.event.repository.name }}/
+          VITE_BASE_URL: /${{ github.event.repository.name }}/
         run: npm run build
 
       - name: Setup Pages
