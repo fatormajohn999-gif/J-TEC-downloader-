@@ -103,7 +103,7 @@ jobs:
           if "kotlin-gradle-plugin" not in s:
               s = re.sub(
                   r"(classpath ['\"]com\.android\.tools\.build:gradle:[^'\"]+['\"])",
-                  r"\1\n        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.25'",
+                  r"\1\n        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.0'",
                   s, count=1)
           open(p, "w").write(s)
 
@@ -126,7 +126,13 @@ jobs:
       - name: Build Debug APK with Gradle
         run: |
           cd android
-          ./gradlew assembleDebug --stacktrace
+          ./gradlew assembleDebug --console=plain > ../gradle-build.log 2>&1 || {
+            echo "=========== KEY ERRORS ==========="
+            grep -nE "^e: |error:|What went wrong|Execution failed|Caused by|Could not|Unresolved|incompatible" -A3 ../gradle-build.log | head -80
+            echo "=========== LAST 40 LINES ==========="
+            tail -40 ../gradle-build.log
+            exit 1
+          }
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
