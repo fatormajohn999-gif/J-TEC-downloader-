@@ -1,4 +1,6 @@
+import { Capacitor } from '@capacitor/core';
 import { AppSettings, VideoInfo, PlatformType } from '../types';
+import { VideoDownloader } from '../plugins/videoDownloader';
 
 export const SUPPORTED_DOMAINS = [
   'tiktok.com',
@@ -40,6 +42,11 @@ export function cleanBackendUrl(rawUrl: string): string {
 }
 
 export async function checkServerHealth(settings: AppSettings): Promise<{ ok: boolean; latencyMs: number; error?: string }> {
+  const isNative = Capacitor.isNativePlatform();
+  if (isNative && (!settings.backendUrl || !settings.backendUrl.trim())) {
+    return { ok: false, latencyMs: 0, error: 'Configure Render URL in Settings' };
+  }
+
   const base = cleanBackendUrl(settings.backendUrl);
   const targetUrl = base ? `${base}/health` : '/api/health';
   const start = performance.now();
@@ -75,6 +82,11 @@ export async function wakeUpServerUntilReady(
   settings: AppSettings,
   onAttempt?: (count: number) => void
 ): Promise<boolean> {
+  const isNative = Capacitor.isNativePlatform();
+  if (isNative && (!settings.backendUrl || !settings.backendUrl.trim())) {
+    return false;
+  }
+
   const maxAttempts = 24; // 24 * 2.5s ~ 60s max
   let attempts = 0;
 
@@ -91,6 +103,13 @@ export async function wakeUpServerUntilReady(
 }
 
 export async function fetchVideoInfo(url: string, settings: AppSettings): Promise<VideoInfo> {
+  const isNative = Capacitor.isNativePlatform();
+
+  // On native platforms, require Backend URL to be set
+  if (isNative && (!settings.backendUrl || !settings.backendUrl.trim())) {
+    throw new Error('Please set your Render Backend URL in Settings before inspecting links on mobile.');
+  }
+
   const base = cleanBackendUrl(settings.backendUrl);
   const targetUrl = base ? `${base}/info` : '/api/info';
 
@@ -152,6 +171,42 @@ export async function downloadVideoFile(
   settings: AppSettings,
   onProgress?: (percent: number, statusText: string) => void
 ): Promise<string> {
+  const isNative = Capacitor.isNativePlatform();
+
+  // 1. Native Capacitor platform: Stream straight to gallery via MediaStore Kotlin plugin
+  if (isNative) {
+    if (!settings.backendUrl || !settings.backendUrl.trim()) {
+      throw new Error('Please set your Render Backend URL in Settings before downloading on mobile.');
+    }
+
+    const cleanUrl = cleanBackendUrl(settings.backendUrl);
+    let progressHandle: any = null;
+
+    try {
+      if (onProgress) {
+        progressHandle = await VideoDownloader.addListener('onDownloadProgress', (data) => {
+          onProgress(data.percent, data.statusText);
+        });
+      }
+
+      const res = await VideoDownloader.downloadAndSave({
+        url: url.trim(),
+        quality,
+        title,
+        backendUrl: cleanUrl,
+        apiKey: settings.apiKey || '',
+      });
+
+      if (onProgress) onProgress(100, 'Saved to phone gallery!');
+      return res.fileName;
+    } finally {
+      if (progressHandle && typeof progressHandle.remove === 'function') {
+        progressHandle.remove();
+      }
+    }
+  }
+
+  // 2. Web / PWA platform: Browser stream and anchor download
   const base = cleanBackendUrl(settings.backendUrl);
   const targetUrl = base ? `${base}/download` : '/api/download';
 
@@ -218,12 +273,10 @@ export async function downloadVideoFile(
 
     if (onProgress) onProgress(98, 'Saving file to device...');
 
-    // Determine filename
     const sanitizedTitle = title.replace(/[^a-zA-Z0-9_\-]/g, '_').substring(0, 50) || 'OmniDrop_video';
     const ext = quality === 'audio' ? '.mp3' : '.mp4';
     const fileName = `${sanitizedTitle}${ext}`;
 
-    // Browser file download trigger
     const blobUrl = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = blobUrl;

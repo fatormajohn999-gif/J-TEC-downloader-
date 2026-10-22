@@ -218,6 +218,7 @@ export default function App() {
               setIsWakingServer(false);
               refreshHealth();
             }}
+            onOpenSettings={() => setCurrentTab('settings')}
           />
         )}
 

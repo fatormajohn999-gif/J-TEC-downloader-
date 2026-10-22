@@ -13,6 +13,7 @@ import {
   Music,
   Share2,
 } from 'lucide-react';
+import { Capacitor } from '@capacitor/core';
 import { VideoInfo, AppSettings, PlatformType } from '../types';
 import { isSupportedUrl, fetchVideoInfo, downloadVideoFile, wakeUpServerUntilReady } from '../services/api';
 import { VideoDownloader } from '../plugins/videoDownloader';
@@ -33,6 +34,7 @@ interface HomeScreenProps {
   onClearPendingUrl?: () => void;
   onWakeServerStart: () => void;
   onWakeServerEnd: () => void;
+  onOpenSettings?: () => void;
 }
 
 export const HomeScreen: React.FC<HomeScreenProps> = ({
@@ -42,7 +44,10 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   onClearPendingUrl,
   onWakeServerStart,
   onWakeServerEnd,
+  onOpenSettings,
 }) => {
+  const isNative = Capacitor.isNativePlatform();
+  const isBackendMissingOnNative = isNative && (!settings.backendUrl || !settings.backendUrl.trim());
   const [inputUrl, setInputUrl] = useState<string>('');
   const [isLoadingInfo, setIsLoadingInfo] = useState<boolean>(false);
   const [videoInfo, setVideoInfo] = useState<VideoInfo | null>(null);
@@ -104,6 +109,11 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 
     if (!isSupportedUrl(url)) {
       setErrorMessage('Unsupported link. Please paste a URL from TikTok, YouTube, Instagram, or Facebook.');
+      return;
+    }
+
+    if (isBackendMissingOnNative) {
+      setErrorMessage('Please set your Render Backend URL in Settings instead of calling /api.');
       return;
     }
 
@@ -212,6 +222,29 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           <span>Full Quality • No Watermark • Direct Save</span>
         </div>
       </div>
+
+      {/* Native Render URL Required Notice */}
+      {isBackendMissingOnNative && (
+        <div className="p-4 rounded-2xl bg-amber-950/70 border border-amber-600/60 shadow-xl text-amber-200 space-y-2.5 animate-fade-in">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+            <h4 className="text-xs font-bold text-white tracking-wide">
+              Render Backend URL Required on Mobile
+            </h4>
+          </div>
+          <p className="text-xs text-amber-200/90 leading-relaxed">
+            Running on native device. Please set your Render Backend URL in <strong>Settings</strong> instead of calling local <code>/api</code>.
+          </p>
+          {onOpenSettings && (
+            <button
+              onClick={onOpenSettings}
+              className="py-1.5 px-3.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs transition active:scale-95"
+            >
+              Open Settings
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Main Input Box Card */}
       <div className="rounded-2xl bg-gradient-to-b from-slate-900 to-slate-900/80 border border-slate-800 p-4 shadow-xl">

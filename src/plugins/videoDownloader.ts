@@ -9,9 +9,20 @@ export interface VideoDownloaderPlugin {
   dismissPersistentNotification(): Promise<void>;
   showDownloadNotification(options: { title: string; message: string; filePath?: string }): Promise<void>;
   getLastSharedUrl(): Promise<{ url: string }>;
+  downloadAndSave(options: {
+    url: string;
+    quality: string;
+    title: string;
+    backendUrl: string;
+    apiKey?: string;
+  }): Promise<{ fileName: string }>;
   addListener(
     eventName: 'onUrlReceived',
     listenerFunc: (data: { url: string }) => void
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'onDownloadProgress',
+    listenerFunc: (data: { percent: number; statusText: string }) => void
   ): Promise<PluginListenerHandle>;
 }
 
@@ -49,6 +60,9 @@ const VideoDownloaderWeb: VideoDownloaderPlugin = {
   },
   async getLastSharedUrl() {
     return { url: '' };
+  },
+  async downloadAndSave() {
+    throw new Error('downloadAndSave native method is only available on Android platform.');
   },
   async addListener() {
     return {
