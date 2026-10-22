@@ -1,20 +1,25 @@
 package com.omnidrop.app.plugin
 
 import android.app.Activity
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.Settings
+import android.util.Base64
+import android.util.Size
 import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
 import com.getcapacitor.Plugin
 import com.getcapacitor.PluginCall
 import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
+import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.HttpURLConnection
@@ -44,6 +49,27 @@ class VideoDownloaderPlugin : Plugin() {
                     val idMatch = item.optString("id") == entry.optString("id")
                     val urlMatch = (item.optString("url") + item.optLong("savedAt")) == (entry.optString("url") + entry.optLong("savedAt"))
                     if (!idMatch && !urlMatch) {
+                        newArray.put(item)
+                    }
+                }
+                prefs.edit().apply {
+                    this.putString(PREF_HISTORY_KEY, newArray.toString())
+                    this.apply()
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+
+        fun removeHistoryByUri(context: Context, uriStr: String) {
+            try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val jsonStr = prefs.getString(PREF_HISTORY_KEY, "[]") ?: "[]"
+                val existing = JSONArray(jsonStr)
+                val newArray = JSONArray()
+                for (i in 0 until existing.length()) {
+                    val item = existing.getJSONObject(i)
+                    if (item.optString("fileUri") != uriStr) {
                         newArray.put(item)
                     }
                 }
@@ -370,11 +396,12 @@ class VideoDownloaderPlugin : Plugin() {
                 val isAudio = quality.equals("audio", ignoreCase = true)
                 val ext = if (isAudio) ".mp3" else ".mp4"
                 val mediaType = if (isAudio) "audio/mpeg" else "video/mp4"
-                val safeTitle = finalTitle.replace("[^a-zA-Z0-9_\\-\\s]".toRegex(), "_")
+                val cleanTitle = finalTitle.replace("[\\\\/:*?\"<>|\\r\\n]".toRegex(), "_")
                     .trim()
-                    .take(50)
+                    .take(70)
                     .ifBlank { "OmniDrop_video" }
-                val fileName = "${safeTitle}_${System.currentTimeMillis()}$ext"
+                val cleanPlatform = platform.replace("[^a-zA-Z0-9]".toRegex(), "").lowercase().ifBlank { "video" }
+                val fileName = "$cleanTitle [$cleanPlatform]$ext"
 
                 val urlObj = URL(endpoint)
                 connection = (urlObj.openConnection() as HttpURLConnection).apply {
@@ -544,5 +571,250 @@ class VideoDownloaderPlugin : Plugin() {
             this.put("statusText", statusText)
         }
         notifyListeners("onDownloadProgress", progressObj, true)
+    }
+
+    @PluginMethod
+    fun hasVideoPermission(call: PluginCall) {
+        val perm = if (Build.VERSION.SDK_INT >= 33) {
+            "android.permission.READ_MEDIA_VIDEO"
+        } else {
+            android.Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+        val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            androidx.core.content.ContextCompat.checkSelfPermission(context, perm) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+        val res = JSObject().apply {
+            this.put("granted", granted)
+        }
+        call.resolve(res)
+    }
+
+    @PluginMethod
+    fun requestVideoPermission(call: PluginCall) {
+        val perm = if (Build.VERSION.SDK_INT >= 33) {
+            "android.permission.READ_MEDIA_VIDEO"
+        } else {
+            android.Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val granted = androidx.core.content.ContextCompat.checkSelfPermission(context, perm) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                androidx.core.app.ActivityCompat.requestPermissions(activity, arrayOf(perm), 992)
+            }
+        }
+        val res = JSObject().apply {
+            this.put("requested", true)
+        }
+        call.resolve(res)
+    }
+
+    @PluginMethod
+    fun getVideoLibrary(call: PluginCall) {
+        Thread {
+            try {
+                val historyJsonStr = getHistoryJson(context)
+                val historyArray = JSONArray(historyJsonStr)
+                val historyByUri = HashMap<String, JSONObject>()
+                val historyByName = HashMap<String, JSONObject>()
+
+                for (i in 0 until historyArray.length()) {
+                    val item = historyArray.getJSONObject(i)
+                    val uri = item.optString("fileUri")
+                    val name = item.optString("fileName")
+                    if (uri.isNotBlank()) historyByUri[uri] = item
+                    if (name.isNotBlank()) historyByName[name] = item
+                }
+
+                val collectionUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+                } else {
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                }
+
+                val projectionList = mutableListOf(
+                    MediaStore.Video.Media._ID,
+                    MediaStore.Video.Media.DISPLAY_NAME,
+                    MediaStore.Video.Media.SIZE,
+                    MediaStore.Video.Media.DURATION,
+                    MediaStore.Video.Media.DATE_ADDED
+                )
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    projectionList.add(MediaStore.Video.Media.RELATIVE_PATH)
+                }
+                projectionList.add(MediaStore.Video.Media.DATA)
+
+                val projection = projectionList.toTypedArray()
+                val selection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    "${MediaStore.Video.Media.RELATIVE_PATH} LIKE ? OR ${MediaStore.Video.Media.DATA} LIKE ?"
+                } else {
+                    "${MediaStore.Video.Media.DATA} LIKE ?"
+                }
+                val selectionArgs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    arrayOf("%Movies/OmniDrop%", "%/Movies/OmniDrop/%")
+                } else {
+                    arrayOf("%/Movies/OmniDrop/%")
+                }
+                val sortOrder = "${MediaStore.Video.Media.DATE_ADDED} DESC"
+
+                val videosArray = JSArray()
+                val cursor = context.contentResolver.query(collectionUri, projection, selection, selectionArgs, sortOrder)
+
+                cursor?.use { c ->
+                    val idCol = c.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+                    val nameCol = c.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
+                    val sizeCol = c.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)
+                    val durCol = c.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
+                    val dateCol = c.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_ADDED)
+
+                    while (c.moveToNext()) {
+                        val idVal = c.getLong(idCol)
+                        val displayName = c.getString(nameCol) ?: "video.mp4"
+                        val sizeBytes = c.getLong(sizeCol)
+                        val durationMs = c.getLong(durCol)
+                        val dateAddedSec = c.getLong(dateCol)
+                        val dateAddedMs = dateAddedSec * 1000L
+
+                        val contentUri = ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, idVal)
+                        val uriStr = contentUri.toString()
+
+                        val historyEntry = historyByUri[uriStr] ?: historyByName[displayName]
+
+                        val rawBaseName = displayName.substringBeforeLast(".")
+                        var platform = historyEntry?.optString("platform") ?: ""
+                        if (platform.isBlank()) {
+                            val lower = displayName.lowercase()
+                            platform = when {
+                                lower.contains("tiktok") -> "tiktok"
+                                lower.contains("youtube") || lower.contains("youtu") -> "youtube"
+                                lower.contains("instagram") -> "instagram"
+                                lower.contains("facebook") || lower.contains("fb") -> "facebook"
+                                else -> "video"
+                            }
+                        }
+
+                        var title = historyEntry?.optString("title") ?: ""
+                        if (title.isBlank()) {
+                            val clean = rawBaseName.replace("\\[$platform\\]".toRegex(RegexOption.IGNORE_CASE), "")
+                                .replace("\\[[^\\]]+\\]".toRegex(), "")
+                                .replace("_", " ")
+                                .trim()
+                            title = if (clean.isNotBlank()) clean else rawBaseName
+                        }
+
+                        var thumbBase64 = ""
+                        try {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                val bm = context.contentResolver.loadThumbnail(contentUri, Size(320, 180), null)
+                                val baos = ByteArrayOutputStream()
+                                bm.compress(Bitmap.CompressFormat.JPEG, 70, baos)
+                                val bytes = baos.toByteArray()
+                                thumbBase64 = "data:image/jpeg;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+                            }
+                        } catch (_: Exception) {}
+
+                        if (thumbBase64.isBlank() && historyEntry != null) {
+                            thumbBase64 = historyEntry.optString("thumbnail", "")
+                        }
+
+                        val vObj = JSObject().apply {
+                            this.put("id", idVal.toString())
+                            this.put("uri", uriStr)
+                            this.put("title", title)
+                            this.put("platform", platform)
+                            this.put("size", sizeBytes)
+                            this.put("durationMs", durationMs)
+                            this.put("dateAdded", dateAddedMs)
+                            this.put("thumbnail", thumbBase64)
+                        }
+                        videosArray.put(vObj)
+                    }
+                }
+
+                val ret = JSObject().apply {
+                    this.put("videos", videosArray)
+                }
+                call.resolve(ret)
+            } catch (e: Exception) {
+                call.reject("Failed to query video library: ${e.message ?: "Unknown error"}")
+            }
+        }.start()
+    }
+
+    @PluginMethod
+    fun deleteVideo(call: PluginCall) {
+        val uriStr = call.getString("uri")
+        if (uriStr.isNullOrBlank()) {
+            call.reject("Missing required parameter: uri")
+            return
+        }
+        Thread {
+            try {
+                val uri = Uri.parse(uriStr)
+                val rows = context.contentResolver.delete(uri, null, null)
+                removeHistoryByUri(context, uriStr)
+                val ret = JSObject().apply {
+                    this.put("deleted", rows > 0)
+                }
+                call.resolve(ret)
+            } catch (e: Exception) {
+                call.reject("Failed to delete video: ${e.message ?: "Unknown error"}")
+            }
+        }.start()
+    }
+
+    @PluginMethod
+    fun playVideo(call: PluginCall) {
+        val uriStr = call.getString("uri")
+        val title = call.getString("title") ?: "OmniDrop Video"
+        if (uriStr.isNullOrBlank()) {
+            call.reject("Missing required parameter: uri")
+            return
+        }
+        try {
+            val intent = Intent(context, VideoPlayerActivity::class.java).apply {
+                this.action = Intent.ACTION_VIEW
+                this.data = Uri.parse(uriStr)
+                this.putExtra("video_title", title)
+                this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(intent)
+            val ret = JSObject().apply {
+                this.put("started", true)
+            }
+            call.resolve(ret)
+        } catch (e: Exception) {
+            call.reject("Failed to launch VideoPlayerActivity: ${e.message ?: "Unknown error"}")
+        }
+    }
+
+    @PluginMethod
+    fun shareVideo(call: PluginCall) {
+        val uriStr = call.getString("uri")
+        val title = call.getString("title") ?: "OmniDrop Video"
+        if (uriStr.isNullOrBlank()) {
+            call.reject("Missing required parameter: uri")
+            return
+        }
+        try {
+            val uri = Uri.parse(uriStr)
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                this.type = "video/*"
+                this.putExtra(Intent.EXTRA_STREAM, uri)
+                this.putExtra(Intent.EXTRA_SUBJECT, title)
+                this.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = Intent.createChooser(shareIntent, "Share video").apply {
+                this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(chooser)
+            val ret = JSObject().apply {
+                this.put("shared", true)
+            }
+            call.resolve(ret)
+        } catch (e: Exception) {
+            call.reject("Failed to share video: ${e.message ?: "Unknown error"}")
+        }
     }
 }

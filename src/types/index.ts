@@ -11,6 +11,17 @@ export interface VideoInfo {
   url: string;
 }
 
+export interface VideoLibraryItem {
+  id: string;
+  uri: string;
+  title: string;
+  platform: PlatformType;
+  size: number;
+  durationMs: number;
+  dateAdded: number;
+  thumbnail: string;
+}
+
 export interface DownloadHistoryItem {
   id: string;
   url: string;

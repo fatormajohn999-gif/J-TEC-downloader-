@@ -7,7 +7,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { Header } from './components/Header';
 import { BottomNav, NavTab } from './components/BottomNav';
 import { HomeScreen } from './components/HomeScreen';
-import { HistoryScreen } from './components/HistoryScreen';
+import { VideosScreen } from './components/VideosScreen';
 import { SettingsScreen } from './components/SettingsScreen';
 import { ServerWakingBanner } from './components/ServerWakingBanner';
 import { ClipboardPromptModal } from './components/ClipboardPromptModal';
@@ -313,16 +313,8 @@ export default function App() {
           />
         )}
 
-        {currentTab === 'history' && (
-          <HistoryScreen
-            history={history}
-            onReDownload={(url) => {
-              setPendingUrl(url);
-              setCurrentTab('home');
-            }}
-            onDeleteItem={handleDeleteHistoryItem}
-            onClearAll={handleClearHistory}
-          />
+        {currentTab === 'videos' && (
+          <VideosScreen />
         )}
 
         {currentTab === 'settings' && (
@@ -349,7 +341,7 @@ export default function App() {
       <BottomNav
         currentTab={currentTab}
         onSelectTab={setCurrentTab}
-        historyCount={history.length}
+        videoCount={history.length}
       />
     </div>
   );

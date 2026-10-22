@@ -1,9 +1,15 @@
 import { registerPlugin, PluginListenerHandle } from '@capacitor/core';
-import { DownloadHistoryItem } from '../types';
+import { DownloadHistoryItem, VideoLibraryItem } from '../types';
 
 export interface VideoDownloaderPlugin {
   hasOverlayPermission(): Promise<{ granted: boolean }>;
   requestOverlayPermission(): Promise<{ requested: boolean }>;
+  hasVideoPermission(): Promise<{ granted: boolean }>;
+  requestVideoPermission(): Promise<{ requested: boolean }>;
+  getVideoLibrary(): Promise<{ videos: VideoLibraryItem[] }>;
+  deleteVideo(options: { uri: string }): Promise<{ deleted: boolean }>;
+  playVideo(options: { uri: string; title: string }): Promise<{ started: boolean }>;
+  shareVideo(options: { uri: string; title?: string }): Promise<{ shared: boolean }>;
   startBubble(): Promise<{ status: string }>;
   stopBubble(): Promise<{ status: string }>;
   showPersistentNotification(options?: { title?: string; message?: string }): Promise<void>;
@@ -46,6 +52,35 @@ const VideoDownloaderWeb: VideoDownloaderPlugin = {
   },
   async requestOverlayPermission() {
     return { requested: false };
+  },
+  async hasVideoPermission() {
+    return { granted: true };
+  },
+  async requestVideoPermission() {
+    return { requested: true };
+  },
+  async getVideoLibrary() {
+    return { videos: [] };
+  },
+  async deleteVideo() {
+    return { deleted: true };
+  },
+  async playVideo() {
+    return { started: false };
+  },
+  async shareVideo(options) {
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: options.title || 'OmniDrop Video',
+          url: options.uri,
+        });
+        return { shared: true };
+      } catch {
+        return { shared: false };
+      }
+    }
+    return { shared: false };
   },
   async startBubble() {
     return { status: 'unsupported_web' };
@@ -96,3 +131,4 @@ const VideoDownloaderWeb: VideoDownloaderPlugin = {
 export const VideoDownloader = registerPlugin<VideoDownloaderPlugin>('VideoDownloader', {
   web: () => VideoDownloaderWeb,
 });
+

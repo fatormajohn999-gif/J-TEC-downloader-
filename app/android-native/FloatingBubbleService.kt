@@ -929,14 +929,24 @@ class FloatingBubbleService : Service() {
             isCompact = true,
             onClick = {
                 if (fileUri.isNotBlank()) {
-                    val intent = Intent(Intent.ACTION_VIEW).apply {
-                        this.setDataAndType(Uri.parse(fileUri), "video/*")
-                        this.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-                    }
                     try {
-                        startActivity(intent)
+                        val playerIntent = Intent(this@FloatingBubbleService, VideoPlayerActivity::class.java).apply {
+                            this.action = Intent.ACTION_VIEW
+                            this.data = Uri.parse(fileUri)
+                            this.putExtra("video_title", title)
+                            this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        startActivity(playerIntent)
                     } catch (_: Exception) {
-                        openGalleryFolder()
+                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                            this.setDataAndType(Uri.parse(fileUri), "video/*")
+                            this.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        try {
+                            startActivity(intent)
+                        } catch (_: Exception) {
+                            openGalleryFolder()
+                        }
                     }
                 } else {
                     openGalleryFolder()
@@ -1379,11 +1389,12 @@ class FloatingBubbleService : Service() {
                 val isAudio = defaultQuality.equals("audio", ignoreCase = true)
                 val ext = if (isAudio) ".mp3" else ".mp4"
                 val mediaType = if (isAudio) "audio/mpeg" else "video/mp4"
-                val safeTitle = title.replace("[^a-zA-Z0-9_\\-\\s]".toRegex(), "_")
+                val cleanTitle = title.replace("[\\\\/:*?\"<>|\\r\\n]".toRegex(), "_")
                     .trim()
-                    .take(50)
+                    .take(70)
                     .ifBlank { "OmniDrop_video" }
-                val fileName = "${safeTitle}_${System.currentTimeMillis()}$ext"
+                val cleanPlatform = platform.replace("[^a-zA-Z0-9]".toRegex(), "").lowercase().ifBlank { "video" }
+                val fileName = "$cleanTitle [$cleanPlatform]$ext"
 
                 val resolver = contentResolver
                 val contentValues = ContentValues().apply {
@@ -1517,14 +1528,24 @@ class FloatingBubbleService : Service() {
     private fun openFinishedVideo() {
         val uriStr = lastFinishedFileUri
         if (!uriStr.isNullOrBlank()) {
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                this.setDataAndType(Uri.parse(uriStr), "video/*")
-                this.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
             try {
-                startActivity(intent)
+                val playerIntent = Intent(this, VideoPlayerActivity::class.java).apply {
+                    this.action = Intent.ACTION_VIEW
+                    this.data = Uri.parse(uriStr)
+                    this.putExtra("video_title", "OmniDrop Video")
+                    this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                startActivity(playerIntent)
             } catch (_: Exception) {
-                openGalleryFolder()
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    this.setDataAndType(Uri.parse(uriStr), "video/*")
+                    this.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                try {
+                    startActivity(intent)
+                } catch (_: Exception) {
+                    openGalleryFolder()
+                }
             }
         }
     }
