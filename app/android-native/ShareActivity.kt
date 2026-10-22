@@ -27,7 +27,7 @@ class ShareActivity : Activity() {
 
                 val mainClass = Class.forName("com.omnidrop.app.MainActivity")
                 val launchIntent = Intent(this, mainClass).apply {
-                    action = Intent.ACTION_SEND
+                    this.action = Intent.ACTION_SEND
                     putExtra(Intent.EXTRA_TEXT, targetUrl)
                     putExtra("url_to_download", targetUrl)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
