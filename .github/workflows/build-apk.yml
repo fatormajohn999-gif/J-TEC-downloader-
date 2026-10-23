@@ -140,6 +140,26 @@ jobs:
           print("Patched manifest and gradle")
           PY
 
+      - name: Generate Custom App Icon
+        run: |
+          if [ -f assets/icon-foreground.svg ] && [ -f assets/icon-background.svg ]; then
+            npm install --no-save --no-audit --no-fund --legacy-peer-deps sharp @capacitor/assets
+            node - <<'JS'
+          const sharp = require('sharp');
+          (async () => {
+            const bg = await sharp('assets/icon-background.svg', { density: 400 }).resize(1024, 1024).png().toBuffer();
+            const fg = await sharp('assets/icon-foreground.svg', { density: 400 }).resize(1024, 1024).png().toBuffer();
+            await sharp(bg).composite([{ input: fg }]).png().toFile('assets/icon-only.png');
+            await sharp(fg).png().toFile('assets/icon-foreground.png');
+            await sharp(bg).png().toFile('assets/icon-background.png');
+            console.log('Icon source images created');
+          })().catch((e) => { console.error(e); process.exit(1); });
+          JS
+            npx capacitor-assets generate --android
+          else
+            echo "No custom icon found in assets/, using the default icon"
+          fi
+
       - name: Sync Capacitor
         run: npx cap sync android
 
