@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="omniBgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#131C2E" />
+      <stop offset="35%" stop-color="#0E1624" />
+      <stop offset="70%" stop-color="#090E17" />
+      <stop offset="100%" stop-color="#04060A" />
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" fill="url(#omniBgGrad)" />
+</svg>

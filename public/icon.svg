@@ -1,38 +1,173 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
   <defs>
-    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#0f172a" />
-      <stop offset="50%" stop-color="#1e1b4b" />
-      <stop offset="100%" stop-color="#090d16" />
+    <!-- Dark Gunmetal-to-Navy Background Gradient -->
+    <linearGradient id="favBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#131C2E" />
+      <stop offset="35%" stop-color="#0E1624" />
+      <stop offset="70%" stop-color="#090E17" />
+      <stop offset="100%" stop-color="#04060A" />
     </linearGradient>
-    <linearGradient id="glowGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#6366f1" />
-      <stop offset="50%" stop-color="#a855f7" />
-      <stop offset="100%" stop-color="#ec4899" />
-    </linearGradient>
-    <linearGradient id="arrowGrad" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" stop-color="#38bdf8" />
-      <stop offset="100%" stop-color="#6366f1" />
-    </linearGradient>
-    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
-      <feGaussianBlur stdDeviation="16" result="blur" />
+
+    <!-- Cyan to Neon Purple Neon Glow Filters -->
+    <filter id="fgGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="12" result="blur" />
       <feComposite in="SourceGraphic" in2="blur" operator="over" />
     </filter>
+    <filter id="softAura" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="24" result="blur" />
+    </filter>
+
+    <!-- Arrow Gradient: Cyber Purple at top into Radiant Cyan at tip -->
+    <linearGradient id="arrowGradient" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#C084FC" />
+      <stop offset="28%" stop-color="#9333EA" />
+      <stop offset="68%" stop-color="#00F0FF" />
+      <stop offset="100%" stop-color="#38BDF8" />
+    </linearGradient>
+
+    <!-- Inner Glow Gradient for Arrow Core -->
+    <linearGradient id="arrowCore" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#F3E8FF" />
+      <stop offset="40%" stop-color="#E9D5FF" />
+      <stop offset="80%" stop-color="#A5F3FC" />
+      <stop offset="100%" stop-color="#FFFFFF" />
+    </linearGradient>
+
+    <!-- Metallic Machine Receptacle Gradient -->
+    <linearGradient id="metalTray" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1E293B" />
+      <stop offset="50%" stop-color="#0F172A" />
+      <stop offset="100%" stop-color="#020617" />
+    </linearGradient>
+
+    <!-- Tray Glowing Rim Gradient -->
+    <linearGradient id="trayRim" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#9333EA" />
+      <stop offset="50%" stop-color="#00F0FF" />
+      <stop offset="100%" stop-color="#9333EA" />
+    </linearGradient>
+
+    <!-- Energy Plasma Arc Gradient -->
+    <radialGradient id="plasmaAura" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#00F0FF" stop-opacity="0.45" />
+      <stop offset="60%" stop-color="#9333EA" stop-opacity="0.2" />
+      <stop offset="100%" stop-color="#000000" stop-opacity="0" />
+    </radialGradient>
   </defs>
 
-  <!-- Background -->
-  <rect width="512" height="512" rx="128" fill="url(#bgGrad)" />
-  <rect width="504" height="504" x="4" y="4" rx="124" fill="none" stroke="url(#glowGrad)" stroke-width="6" opacity="0.4" />
+  <!-- Gunmetal Base -->
+  <rect width="1024" height="1024" rx="220" fill="url(#favBg)" />
 
-  <!-- Glowing subtle circular ring -->
-  <circle cx="256" cy="256" r="170" fill="none" stroke="url(#glowGrad)" stroke-width="4" opacity="0.25" />
+  <!-- Ambient Energy Aura in Center Receptacle -->
+  <circle cx="512" cy="520" r="230" fill="url(#plasmaAura)" filter="url(#softAura)" />
 
-  <!-- Center Download Emblem -->
-  <g filter="url(#glow)">
-    <!-- Down Arrow -->
-    <path d="M256 140 L256 310" stroke="url(#arrowGrad)" stroke-width="28" stroke-linecap="round" />
-    <path d="M185 245 L256 316 L327 245" fill="none" stroke="url(#arrowGrad)" stroke-width="28" stroke-linecap="round" stroke-linejoin="round" />
-    <!-- Bottom Tray -->
-    <path d="M160 340 L160 366 C160 376 168 384 178 384 L334 384 C344 384 352 376 352 366 L352 340" fill="none" stroke="url(#glowGrad)" stroke-width="28" stroke-linecap="round" stroke-linejoin="round" />
-  </g>
+  <!-- Metallic Receptacle Tray -->
+  <path
+    d="M 320 640
+       L 370 640
+       L 390 660
+       L 634 660
+       L 654 640
+       L 704 640
+       L 730 670
+       L 730 710
+       L 700 742
+       L 324 742
+       L 294 710
+       L 294 670
+       Z"
+    fill="url(#metalTray)"
+    stroke="#22334A"
+    stroke-width="5"
+  />
+
+  <path
+    d="M 324 734
+       L 700 734"
+    stroke="url(#trayRim)"
+    stroke-width="3"
+    stroke-linecap="round"
+    filter="url(#fgGlow)"
+  />
+
+  <circle cx="320" cy="690" r="6" fill="#0B1320" stroke="#00F0FF" stroke-width="2" />
+  <circle cx="704" cy="690" r="6" fill="#0B1320" stroke="#C084FC" stroke-width="2" />
+
+  <path
+    d="M 374 675
+       L 650 675
+       L 666 710
+       L 358 710
+       Z"
+    fill="#050B14"
+    stroke="#00F0FF"
+    stroke-width="2.5"
+    stroke-opacity="0.8"
+  />
+
+  <line x1="432" y1="684" x2="432" y2="702" stroke="#00F0FF" stroke-width="2" stroke-opacity="0.6" />
+  <line x1="512" y1="680" x2="512" y2="706" stroke="#00F0FF" stroke-width="3" filter="url(#fgGlow)" />
+  <line x1="592" y1="684" x2="592" y2="702" stroke="#00F0FF" stroke-width="2" stroke-opacity="0.6" />
+
+  <rect x="345" y="650" width="4" height="6" fill="#00F0FF" opacity="0.8" />
+  <rect x="355" y="650" width="4" height="6" fill="#00F0FF" opacity="0.8" />
+  <rect x="665" y="650" width="4" height="6" fill="#C084FC" opacity="0.8" />
+  <rect x="675" y="650" width="4" height="6" fill="#C084FC" opacity="0.8" />
+
+  <ellipse cx="512" cy="700" rx="90" ry="12" fill="#00F0FF" opacity="0.25" filter="url(#fgGlow)" />
+
+  <!-- Glowing Cyber Arrow Body -->
+  <path
+    d="M 464 268
+       L 560 268
+       L 560 452
+       L 660 452
+       L 512 636
+       L 364 452
+       L 464 452
+       Z"
+    fill="url(#arrowGradient)"
+    opacity="0.35"
+    filter="url(#fgGlow)"
+  />
+
+  <path
+    d="M 464 270
+       L 560 270
+       L 560 450
+       L 656 450
+       L 512 630
+       L 368 450
+       L 464 450
+       Z"
+    fill="url(#arrowGradient)"
+    stroke="#00F0FF"
+    stroke-width="4.5"
+    stroke-linejoin="round"
+    filter="url(#fgGlow)"
+  />
+
+  <path
+    d="M 482 288
+       L 542 288
+       L 542 466
+       L 620 466
+       L 512 600
+       L 404 466
+       L 482 466
+       Z"
+    fill="none"
+    stroke="url(#arrowCore)"
+    stroke-width="3"
+    opacity="0.85"
+  />
+
+  <rect x="492" y="322" width="40" height="6" rx="2" fill="#080E18" stroke="#00F0FF" stroke-width="1.5" />
+  <rect x="492" y="352" width="40" height="6" rx="2" fill="#080E18" stroke="#00F0FF" stroke-width="1.5" />
+  <rect x="492" y="382" width="40" height="6" rx="2" fill="#080E18" stroke="#00F0FF" stroke-width="1.5" />
+  <rect x="492" y="412" width="40" height="6" rx="2" fill="#080E18" stroke="#00F0FF" stroke-width="1.5" />
+
+  <circle cx="512" cy="632" r="7" fill="#FFFFFF" filter="url(#fgGlow)" />
+  <circle cx="512" cy="656" r="4" fill="#00F0FF" filter="url(#fgGlow)" />
+  <circle cx="512" cy="672" r="2.5" fill="#C084FC" filter="url(#fgGlow)" />
 </svg>
