@@ -10,7 +10,18 @@ export interface VideoDownloaderPlugin {
   deleteVideo(options: { uri: string }): Promise<{ deleted: boolean }>;
   renameVideo(options: { uri: string; newTitle: string; newPlatform: string }): Promise<{ success: boolean; title: string; platform: string }>;
   checkDuplicate(options: { url: string }): Promise<{ exists: boolean; uri?: string; title?: string; fileName?: string }>;
-  playVideo(options: { uri: string; title: string }): Promise<{ started: boolean }>;
+  playVideo(options: {
+    uri: string;
+    title: string;
+    playlist?: Array<{
+      uri: string;
+      title: string;
+      thumbnail?: string;
+      durationMs?: number;
+      platform?: string;
+    }>;
+    initialIndex?: number;
+  }): Promise<{ started: boolean }>;
   shareVideo(options: { uri: string; title?: string }): Promise<{ shared: boolean }>;
   startBubble(): Promise<{ status: string }>;
   stopBubble(): Promise<{ status: string }>;

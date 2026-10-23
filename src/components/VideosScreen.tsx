@@ -127,9 +127,19 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
 
   const handlePlay = async (video: VideoLibraryItem) => {
     try {
+      const initialIndex = filteredVideos.findIndex((v) => v.uri === video.uri);
+      const playlist = filteredVideos.map((v) => ({
+        uri: v.uri,
+        title: v.title,
+        thumbnail: v.thumbnail,
+        durationMs: v.durationMs,
+        platform: v.platform,
+      }));
       await VideoDownloader.playVideo({
         uri: video.uri,
         title: video.title,
+        playlist,
+        initialIndex: initialIndex >= 0 ? initialIndex : 0,
       });
     } catch (e) {
       console.error('Play error', e);

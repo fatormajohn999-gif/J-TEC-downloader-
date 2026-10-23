@@ -1072,6 +1072,10 @@ class VideoDownloaderPlugin : Plugin() {
     fun playVideo(call: PluginCall) {
         val uriStr = call.getString("uri")
         val title = call.getString("title") ?: "OmniDrop Video"
+        val initialIndex = call.getInt("initialIndex", 0) ?: 0
+        val playlistArray = call.getArray("playlist")
+        val playlistJson = playlistArray?.toString() ?: ""
+
         if (uriStr.isNullOrBlank()) {
             call.reject("Missing required parameter: uri")
             return
@@ -1081,6 +1085,10 @@ class VideoDownloaderPlugin : Plugin() {
                 this.action = Intent.ACTION_VIEW
                 this.data = Uri.parse(uriStr)
                 this.putExtra("video_title", title)
+                this.putExtra("current_index", initialIndex)
+                if (playlistJson.isNotBlank()) {
+                    this.putExtra("playlist_json", playlistJson)
+                }
                 this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             context.startActivity(intent)

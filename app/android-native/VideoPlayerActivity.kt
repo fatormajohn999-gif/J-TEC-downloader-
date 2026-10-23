@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.pm.ActivityInfo
 import android.content.res.ColorStateList
 import android.content.res.Configuration
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -15,6 +16,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Base64
 import android.util.TypedValue
 import android.view.GestureDetector
 import android.view.Gravity
@@ -23,37 +25,58 @@ import android.view.View
 import android.view.WindowManager
 import android.view.animation.AlphaAnimation
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.VideoView
 import java.util.Locale
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * Modern In-App Hardware Video Player.
  * Built with pure Android SDK (VideoView + Canvas/Drawables).
  * Features:
- * - Clear picture: unobstructed central viewport.
- * - Modern HUD: sleek top bar + bottom controls bar with gradient fade overlays.
- * - 3s auto-hide with immersive full-screen sticky system bars.
- * - Double-tap left/right gesture skip (-10s / +10s) with glowing animated ripple indicators.
- * - Styled seekbar with target time tooltip during drag.
- * - Auto-orientation from video aspect ratio + seamless manual rotate lock.
+ * - Playlist support: seamlessly browse filtered library clips.
+ * - Swipe left/right gestures for next/previous video with smooth slide animations.
+ * - Flash HUD banner ("X / Y - Title") and thumbnail placeholder during loading.
+ * - Single-time "SWIPE FOR NEXT" onboarding hint.
+ * - Autoplay & Repeat modes: OFF, ONE, ALL with cycling mechanical button & LED indicator.
+ * - Unobstructed central picture with auto-hiding dark robotic HUD controls.
+ * - Target time tooltip above seekbar during drag.
+ * - Double-tap left/right 10s skip ripple indicators.
+ * - Auto-rotation from video aspect ratio + manual orientation lock.
  * - Persistent per-video playback resumption saved in SharedPreferences.
  */
 class VideoPlayerActivity : Activity() {
 
     companion object {
         private const val PREFS_PLAYBACK = "omnidrop_playback_positions"
+        private const val PREFS_PLAYER_UI = "omnidrop_player_prefs"
+        private const val KEY_SWIPE_HINT_SHOWN = "swipe_hint_shown"
     }
 
+    data class PlaylistItem(
+        val uri: String,
+        val title: String,
+        val thumbnail: String? = null,
+        val platform: String? = null
+    )
+
+    private val playlist = ArrayList<PlaylistItem>()
+    private var currentIndex = 0
+
     private lateinit var rootContainer: FrameLayout
+    private lateinit var videoContentContainer: FrameLayout
     private lateinit var videoView: VideoView
+    private lateinit var thumbnailImageView: ImageView
     private lateinit var hudOverlay: FrameLayout
     private lateinit var topBarLayout: LinearLayout
     private lateinit var bottomBarLayout: LinearLayout
 
     private lateinit var titleTextView: TextView
+    private lateinit var playlistCounterTextView: TextView
     private lateinit var playPauseButton: TextView
     private lateinit var skipBackwardButton: TextView
     private lateinit var skipForwardButton: TextView
@@ -63,11 +86,16 @@ class VideoPlayerActivity : Activity() {
     private lateinit var seekTooltipTextView: TextView
     private lateinit var speedButton: TextView
     private lateinit var rotateButton: TextView
+    private lateinit var repeatButton: LinearLayout
+    private lateinit var repeatLabelTextView: TextView
+    private lateinit var repeatLedView: View
 
-    // Feedback overlays for gestures
+    // Feedback overlays for gestures & cues
     private lateinit var leftRippleView: TextView
     private lateinit var rightRippleView: TextView
     private lateinit var centerFlashView: TextView
+    private lateinit var titleFlashBannerView: TextView
+    private lateinit var swipeHintOverlay: LinearLayout
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var mediaPlayer: MediaPlayer? = null
@@ -78,12 +106,26 @@ class VideoPlayerActivity : Activity() {
     private val speedOptions = floatArrayOf(0.5f, 1.0f, 1.5f, 2.0f)
     private val speedLabels = arrayOf("0.5x", "1.0x", "1.5x", "2.0x")
 
-    private var videoUri: Uri? = null
-    private var videoTitle: String = "OmniDrop Video"
+    // Repeat modes: "off", "one", "all"
+    private var currentRepeatMode = "off"
+    private var autoPlayNext = true
+
+    private var currentVideoUri: Uri? = null
+    private var currentVideoTitle: String = "OmniDrop Video"
     private lateinit var gestureDetector: GestureDetector
 
     private val hideControlsRunnable = Runnable {
         hideControls()
+    }
+
+    private val hideTitleFlashRunnable = Runnable {
+        titleFlashBannerView.animate().alpha(0f).setDuration(300).withEndAction {
+            titleFlashBannerView.visibility = View.GONE
+        }.start()
+    }
+
+    private val hideSwipeHintRunnable = Runnable {
+        dismissSwipeHint()
     }
 
     private val updateProgressRunnable = object : Runnable {
@@ -106,18 +148,62 @@ class VideoPlayerActivity : Activity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        val uriExtra = intent.data ?: intent.getStringExtra("video_uri")?.let { Uri.parse(it) }
-        videoUri = uriExtra
-        videoTitle = intent.getStringExtra("video_title") ?: "OmniDrop Video"
+        parseIntentData()
+        loadNativeSettings()
 
         if (savedInstanceState != null) {
             currentSpeedIndex = savedInstanceState.getInt("saved_speed", 1)
             isOrientationLockedByUser = savedInstanceState.getBoolean("orient_locked", false)
+            currentIndex = savedInstanceState.getInt("saved_index", currentIndex)
+            currentRepeatMode = savedInstanceState.getString("saved_repeat", currentRepeatMode) ?: "off"
         }
 
         buildPlayerUI()
         setupGestures()
-        setupVideoView()
+        loadVideoAtCurrentIndex(animate = false, slideLeft = true)
+        checkAndShowSwipeHint()
+    }
+
+    private fun parseIntentData() {
+        val initialUri = intent.data ?: intent.getStringExtra("video_uri")?.let { Uri.parse(it) }
+        val initialTitle = intent.getStringExtra("video_title") ?: "OmniDrop Video"
+        val playlistJson = intent.getStringExtra("playlist_json") ?: ""
+        val targetIndex = intent.getIntExtra("current_index", 0)
+
+        playlist.clear()
+        if (playlistJson.isNotBlank()) {
+            try {
+                val array = JSONArray(playlistJson)
+                for (i in 0 until array.length()) {
+                    val item = array.getJSONObject(i)
+                    val uri = item.optString("uri", "")
+                    val title = item.optString("title", "Video ${i + 1}")
+                    val thumb = item.optString("thumbnail", "")
+                    val platform = item.optString("platform", "Other")
+                    if (uri.isNotBlank()) {
+                        playlist.add(PlaylistItem(uri, title, thumb, platform))
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+
+        if (playlist.isEmpty() && initialUri != null) {
+            playlist.add(PlaylistItem(initialUri.toString(), initialTitle))
+        }
+
+        currentIndex = if (playlist.isNotEmpty()) {
+            targetIndex.coerceIn(0, playlist.size - 1)
+        } else {
+            0
+        }
+    }
+
+    private fun loadNativeSettings() {
+        val prefs = getSharedPreferences(VideoDownloaderPlugin.PREFS_NAME, Context.MODE_PRIVATE)
+        autoPlayNext = prefs.getBoolean("auto_play_next", true)
+        currentRepeatMode = prefs.getString("repeat_mode", "off") ?: "off"
     }
 
     private fun dp(value: Int): Int {
@@ -133,7 +219,17 @@ class VideoPlayerActivity : Activity() {
             this.setBackgroundColor(Color.BLACK)
         }
 
-        // 1. VideoView centered
+        // 1. Video Container (VideoView + Thumbnail placeholder for smooth slide animations)
+        videoContentContainer = FrameLayout(this).apply {
+            val lp = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ).apply {
+                this.gravity = Gravity.CENTER
+            }
+            this.layoutParams = lp
+        }
+
         videoView = VideoView(this).apply {
             val lp = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -143,9 +239,24 @@ class VideoPlayerActivity : Activity() {
             }
             this.layoutParams = lp
         }
-        rootContainer.addView(videoView)
+        videoContentContainer.addView(videoView)
 
-        // 2. Gesture overlay layer (transparent touch interceptor)
+        thumbnailImageView = ImageView(this).apply {
+            val lp = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ).apply {
+                this.gravity = Gravity.CENTER
+            }
+            this.layoutParams = lp
+            this.scaleType = ImageView.ScaleType.FIT_CENTER
+            this.visibility = View.GONE
+        }
+        videoContentContainer.addView(thumbnailImageView)
+
+        rootContainer.addView(videoContentContainer)
+
+        // 2. Gesture touch overlay
         val touchOverlay = View(this).apply {
             this.layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -154,8 +265,8 @@ class VideoPlayerActivity : Activity() {
         }
         rootContainer.addView(touchOverlay)
 
-        // 3. Gesture feedback indicators (ripples)
-        buildRippleViews()
+        // 3. Gesture feedback indicators (ripples + center flash + title flash + swipe hint)
+        buildGestureOverlays()
 
         // 4. Modern HUD Overlay (Top bar + Bottom bar)
         hudOverlay = FrameLayout(this).apply {
@@ -174,7 +285,7 @@ class VideoPlayerActivity : Activity() {
         scheduleControlsAutoHide()
     }
 
-    private fun buildRippleViews() {
+    private fun buildGestureOverlays() {
         val pillBg = GradientDrawable().apply {
             this.shape = GradientDrawable.RECTANGLE
             this.cornerRadius = dp(20).toFloat()
@@ -251,6 +362,108 @@ class VideoPlayerActivity : Activity() {
             this.layoutParams = lp
         }
         rootContainer.addView(centerFlashView)
+
+        // Title Flash Banner (smooth HUD cue on video transition: "2 / 14 - <title>")
+        titleFlashBannerView = TextView(this).apply {
+            this.setTextColor(Color.parseColor("#00F0FF"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            this.typeface = Typeface.MONOSPACE
+            this.gravity = Gravity.CENTER
+            this.setPadding(dp(16), dp(8), dp(16), dp(8))
+            this.background = GradientDrawable().apply {
+                this.shape = GradientDrawable.RECTANGLE
+                this.cornerRadius = dp(8).toFloat()
+                this.setColor(Color.parseColor("#E6080B10"))
+                this.setStroke(dp(1), Color.parseColor("#00F0FF"))
+            }
+            this.visibility = View.GONE
+            val lp = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                this.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                this.topMargin = dp(76)
+            }
+            this.layoutParams = lp
+        }
+        rootContainer.addView(titleFlashBannerView)
+
+        // First-Time "SWIPE FOR NEXT" Onboarding Hint
+        swipeHintOverlay = LinearLayout(this).apply {
+            this.orientation = LinearLayout.HORIZONTAL
+            this.gravity = Gravity.CENTER_VERTICAL
+            this.setPadding(dp(14), dp(8), dp(14), dp(8))
+            this.background = GradientDrawable().apply {
+                this.shape = GradientDrawable.RECTANGLE
+                this.cornerRadius = dp(20).toFloat()
+                this.setColor(Color.parseColor("#DD080B10"))
+                this.setStroke(dp(1), Color.parseColor("#38BDF8"))
+            }
+            this.visibility = View.GONE
+            val lp = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                this.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                this.bottomMargin = dp(120)
+            }
+            this.layoutParams = lp
+        }
+
+        val hintIcon = TextView(this).apply {
+            this.text = "⇄"
+            this.setTextColor(Color.parseColor("#00F0FF"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            this.typeface = Typeface.DEFAULT_BOLD
+            val iconLp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                this.rightMargin = dp(8)
+            }
+            this.layoutParams = iconLp
+        }
+        swipeHintOverlay.addView(hintIcon)
+
+        val hintText = TextView(this).apply {
+            this.text = "SWIPE FOR NEXT // PREV"
+            this.setTextColor(Color.WHITE)
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            this.typeface = Typeface.MONOSPACE
+            this.layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+        swipeHintOverlay.addView(hintText)
+
+        rootContainer.addView(swipeHintOverlay)
+    }
+
+    private fun checkAndShowSwipeHint() {
+        val prefs = getSharedPreferences(PREFS_PLAYER_UI, Context.MODE_PRIVATE)
+        val shown = prefs.getBoolean(KEY_SWIPE_HINT_SHOWN, false)
+        if (!shown && playlist.size > 1) {
+            swipeHintOverlay.visibility = View.VISIBLE
+            swipeHintOverlay.alpha = 0f
+            swipeHintOverlay.animate().alpha(1f).setDuration(400).start()
+            mainHandler.postDelayed(hideSwipeHintRunnable, 4000)
+        }
+    }
+
+    private fun dismissSwipeHint() {
+        mainHandler.removeCallbacks(hideSwipeHintRunnable)
+        if (swipeHintOverlay.visibility == View.VISIBLE) {
+            swipeHintOverlay.animate().alpha(0f).setDuration(300).withEndAction {
+                swipeHintOverlay.visibility = View.GONE
+            }.start()
+            getSharedPreferences(PREFS_PLAYER_UI, Context.MODE_PRIVATE)
+                .edit()
+                .apply {
+                    this.putBoolean(KEY_SWIPE_HINT_SHOWN, true)
+                    this.apply()
+                }
+        }
     }
 
     private fun setupGestures() {
@@ -275,6 +488,30 @@ class VideoPlayerActivity : Activity() {
                 }
                 resetAutoHideTimer()
                 return true
+            }
+
+            override fun onFling(
+                e1: MotionEvent?,
+                e2: MotionEvent,
+                velocityX: Float,
+                velocityY: Float
+            ): Boolean {
+                if (e1 == null) return false
+                val diffX = e2.x - e1.x
+                val diffY = e2.y - e1.y
+                if (Math.abs(diffX) > Math.abs(diffY) && Math.abs(diffX) > dp(50) && Math.abs(velocityX) > 350) {
+                    dismissSwipeHint()
+                    if (diffX < 0) {
+                        // Swiped Left -> Play Next Video
+                        playNextVideo(userInitiated = true)
+                        return true
+                    } else {
+                        // Swiped Right -> Play Previous Video
+                        playPreviousVideo(userInitiated = true)
+                        return true
+                    }
+                }
+                return false
             }
         })
 
@@ -303,6 +540,14 @@ class VideoPlayerActivity : Activity() {
         }
         centerFlashView.startAnimation(anim)
         mainHandler.postDelayed({ centerFlashView.visibility = View.GONE }, 500)
+    }
+
+    private fun flashTitleBanner(text: String) {
+        mainHandler.removeCallbacks(hideTitleFlashRunnable)
+        titleFlashBannerView.text = text
+        titleFlashBannerView.visibility = View.VISIBLE
+        titleFlashBannerView.alpha = 1f
+        mainHandler.postDelayed(hideTitleFlashRunnable, 1800)
     }
 
     private fun buildTopBar() {
@@ -353,7 +598,7 @@ class VideoPlayerActivity : Activity() {
 
         // Video Title
         titleTextView = TextView(this).apply {
-            this.text = videoTitle
+            this.text = currentVideoTitle
             this.setTextColor(Color.WHITE)
             this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             this.typeface = Typeface.DEFAULT_BOLD
@@ -363,6 +608,29 @@ class VideoPlayerActivity : Activity() {
             this.layoutParams = titleLp
         }
         topBarLayout.addView(titleTextView)
+
+        // Playlist Position Badge (e.g. "1 / 8")
+        playlistCounterTextView = TextView(this).apply {
+            this.text = if (playlist.isNotEmpty()) "${currentIndex + 1}/${playlist.size}" else "1/1"
+            this.setTextColor(Color.parseColor("#94A3B8"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            this.typeface = Typeface.MONOSPACE
+            this.setPadding(dp(8), dp(4), dp(8), dp(4))
+            this.background = GradientDrawable().apply {
+                this.shape = GradientDrawable.RECTANGLE
+                this.cornerRadius = dp(4).toFloat()
+                this.setColor(Color.parseColor("#2200F0FF"))
+                this.setStroke(dp(1), Color.parseColor("#3300F0FF"))
+            }
+            val counterLp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                this.leftMargin = dp(8)
+            }
+            this.layoutParams = counterLp
+        }
+        topBarLayout.addView(playlistCounterTextView)
 
         hudOverlay.addView(topBarLayout)
     }
@@ -472,7 +740,7 @@ class VideoPlayerActivity : Activity() {
         seekRow.addView(totalTimeTextView)
         bottomBarLayout.addView(seekRow)
 
-        // Bottom Controls Row: -10s, Play/Pause, +10s, Speed, Rotate
+        // Bottom Controls Row: -10s, Play/Pause, +10s, Repeat, Speed, Rotate
         val controlsRow = LinearLayout(this).apply {
             this.orientation = LinearLayout.HORIZONTAL
             this.gravity = Gravity.CENTER_VERTICAL
@@ -492,13 +760,13 @@ class VideoPlayerActivity : Activity() {
             this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             this.typeface = Typeface.MONOSPACE
             this.gravity = Gravity.CENTER
-            this.setPadding(dp(12), dp(6), dp(12), dp(6))
+            this.setPadding(dp(10), dp(6), dp(10), dp(6))
             this.background = createMechanicalButtonBackground(false)
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                this.rightMargin = dp(8)
+                this.rightMargin = dp(6)
             }
             this.layoutParams = lp
             this.setOnClickListener {
@@ -517,13 +785,13 @@ class VideoPlayerActivity : Activity() {
             this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             this.typeface = Typeface.DEFAULT_BOLD
             this.gravity = Gravity.CENTER
-            this.setPadding(dp(16), dp(6), dp(16), dp(6))
+            this.setPadding(dp(14), dp(6), dp(14), dp(6))
             this.background = createMechanicalButtonBackground(false)
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                this.rightMargin = dp(8)
+                this.rightMargin = dp(6)
             }
             this.layoutParams = lp
             this.setOnClickListener {
@@ -540,12 +808,14 @@ class VideoPlayerActivity : Activity() {
             this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             this.typeface = Typeface.MONOSPACE
             this.gravity = Gravity.CENTER
-            this.setPadding(dp(12), dp(6), dp(12), dp(6))
+            this.setPadding(dp(10), dp(6), dp(10), dp(6))
             this.background = createMechanicalButtonBackground(false)
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            )
+            ).apply {
+                this.rightMargin = dp(6)
+            }
             this.layoutParams = lp
             this.setOnClickListener {
                 resetAutoHideTimer()
@@ -563,20 +833,65 @@ class VideoPlayerActivity : Activity() {
         }
         controlsRow.addView(spacer)
 
+        // Repeat button with LED (Cycles Repeat Off / One / All)
+        repeatButton = LinearLayout(this).apply {
+            this.orientation = LinearLayout.HORIZONTAL
+            this.gravity = Gravity.CENTER_VERTICAL
+            this.setPadding(dp(8), dp(6), dp(8), dp(6))
+            this.background = createMechanicalButtonBackground(false)
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                this.rightMargin = dp(6)
+            }
+            this.layoutParams = lp
+            this.setOnClickListener {
+                resetAutoHideTimer()
+                cycleRepeatMode()
+            }
+        }
+
+        repeatLedView = View(this).apply {
+            val ledLp = LinearLayout.LayoutParams(dp(6), dp(6)).apply {
+                this.rightMargin = dp(5)
+            }
+            this.layoutParams = ledLp
+            this.background = GradientDrawable().apply {
+                this.shape = GradientDrawable.OVAL
+                this.setColor(Color.parseColor("#64748B"))
+            }
+        }
+        repeatButton.addView(repeatLedView)
+
+        repeatLabelTextView = TextView(this).apply {
+            this.text = "OFF"
+            this.setTextColor(Color.parseColor("#94A3B8"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            this.typeface = Typeface.MONOSPACE
+            this.layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+        repeatButton.addView(repeatLabelTextView)
+        controlsRow.addView(repeatButton)
+        updateRepeatButtonUI()
+
         // Speed button
         speedButton = TextView(this).apply {
             this.text = speedLabels[currentSpeedIndex]
             this.setTextColor(Color.parseColor("#F59E0B"))
-            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
             this.typeface = Typeface.MONOSPACE
             this.gravity = Gravity.CENTER
-            this.setPadding(dp(10), dp(6), dp(10), dp(6))
+            this.setPadding(dp(8), dp(6), dp(8), dp(6))
             this.background = createMechanicalButtonBackground(true)
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                this.rightMargin = dp(8)
+                this.rightMargin = dp(6)
             }
             this.layoutParams = lp
             this.setOnClickListener {
@@ -588,12 +903,12 @@ class VideoPlayerActivity : Activity() {
 
         // Rotate button
         rotateButton = TextView(this).apply {
-            this.text = "[ ⛶ ROTATE ]"
+            this.text = "⛶ ROT"
             this.setTextColor(Color.parseColor("#00F0FF"))
-            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
             this.typeface = Typeface.MONOSPACE
             this.gravity = Gravity.CENTER
-            this.setPadding(dp(10), dp(6), dp(10), dp(6))
+            this.setPadding(dp(8), dp(6), dp(8), dp(6))
             this.background = createMechanicalButtonBackground(false)
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -611,13 +926,90 @@ class VideoPlayerActivity : Activity() {
         hudOverlay.addView(bottomBarLayout)
     }
 
-    private fun setupVideoView() {
-        if (videoUri == null) {
+    private fun cycleRepeatMode() {
+        currentRepeatMode = when (currentRepeatMode) {
+            "off" -> "one"
+            "one" -> "all"
+            else -> "off"
+        }
+        updateRepeatButtonUI()
+
+        // Sync to native settings
+        getSharedPreferences(VideoDownloaderPlugin.PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .apply {
+                this.putString("repeat_mode", currentRepeatMode)
+                this.apply()
+            }
+    }
+
+    private fun updateRepeatButtonUI() {
+        when (currentRepeatMode) {
+            "one" -> {
+                repeatLabelTextView.text = "ONE"
+                repeatLabelTextView.setTextColor(Color.parseColor("#00F0FF"))
+                (repeatLedView.background as? GradientDrawable)?.setColor(Color.parseColor("#00F0FF"))
+            }
+            "all" -> {
+                repeatLabelTextView.text = "ALL"
+                repeatLabelTextView.setTextColor(Color.parseColor("#10B981"))
+                (repeatLedView.background as? GradientDrawable)?.setColor(Color.parseColor("#10B981"))
+            }
+            else -> {
+                repeatLabelTextView.text = "OFF"
+                repeatLabelTextView.setTextColor(Color.parseColor("#94A3B8"))
+                (repeatLedView.background as? GradientDrawable)?.setColor(Color.parseColor("#64748B"))
+            }
+        }
+    }
+
+    private fun loadVideoAtCurrentIndex(animate: Boolean = false, slideLeft: Boolean = true) {
+        if (playlist.isEmpty()) {
             finish()
             return
         }
 
-        videoView.setVideoURI(videoUri)
+        saveCurrentPlaybackPosition()
+
+        val item = playlist[currentIndex]
+        currentVideoUri = Uri.parse(item.uri)
+        currentVideoTitle = item.title
+
+        titleTextView.text = currentVideoTitle
+        playlistCounterTextView.text = "${currentIndex + 1}/${playlist.size}"
+
+        if (animate) {
+            val width = rootContainer.width.toFloat().coerceAtLeast(600f)
+            val exitTranslation = if (slideLeft) -width else width
+            val enterTranslation = if (slideLeft) width else -width
+
+            videoContentContainer.animate()
+                .translationX(exitTranslation)
+                .alpha(0.3f)
+                .setDuration(160)
+                .withEndAction {
+                    prepareAndStartVideo(item)
+                    videoContentContainer.translationX = enterTranslation
+                    videoContentContainer.animate()
+                        .translationX(0f)
+                        .alpha(1f)
+                        .setDuration(220)
+                        .start()
+                }
+                .start()
+        } else {
+            prepareAndStartVideo(item)
+        }
+
+        flashTitleBanner("${currentIndex + 1} / ${playlist.size} - $currentVideoTitle")
+    }
+
+    private fun prepareAndStartVideo(item: PlaylistItem) {
+        // Show thumbnail placeholder while video loads
+        loadThumbnailIntoPlaceholder(item.thumbnail)
+
+        videoView.stopPlayback()
+        videoView.setVideoURI(Uri.parse(item.uri))
 
         videoView.setOnPreparedListener { mp ->
             mediaPlayer = mp
@@ -629,7 +1021,7 @@ class VideoPlayerActivity : Activity() {
                 totalTimeTextView.text = formatTime(duration)
             }
 
-            // Auto orientation from video aspect ratio if not locked by user
+            // Auto orientation from video aspect ratio if not manually locked
             val width = mp.videoWidth
             val height = mp.videoHeight
             if (width > 0 && height > 0 && !isOrientationLockedByUser) {
@@ -641,7 +1033,7 @@ class VideoPlayerActivity : Activity() {
             }
 
             // Restore saved playback position
-            val uriStr = videoUri?.toString() ?: ""
+            val uriStr = item.uri
             if (uriStr.isNotBlank()) {
                 val prefs = getSharedPreferences(PREFS_PLAYBACK, Context.MODE_PRIVATE)
                 val savedPos = prefs.getInt(uriStr, 0)
@@ -652,27 +1044,119 @@ class VideoPlayerActivity : Activity() {
 
             videoView.start()
             playPauseButton.text = "❚❚"
+
+            // Hide thumbnail placeholder once playback starts
+            thumbnailImageView.animate().alpha(0f).setDuration(250).withEndAction {
+                thumbnailImageView.visibility = View.GONE
+            }.start()
+
             mainHandler.post(updateProgressRunnable)
         }
 
         videoView.setOnCompletionListener {
-            playPauseButton.text = "▶"
-            showControls()
-
-            // Clear saved playback position when playback reaches the end
-            val uriStr = videoUri?.toString() ?: ""
-            if (uriStr.isNotBlank()) {
-                val prefs = getSharedPreferences(PREFS_PLAYBACK, Context.MODE_PRIVATE)
-                prefs.edit().apply {
-                    this.remove(uriStr)
-                    this.apply()
-                }
-            }
+            handleVideoCompletion()
         }
 
         videoView.setOnErrorListener { _, _, _ ->
             showControls()
+            thumbnailImageView.visibility = View.GONE
             false
+        }
+    }
+
+    private fun loadThumbnailIntoPlaceholder(thumbStr: String?) {
+        if (thumbStr.isNullOrBlank()) {
+            thumbnailImageView.setImageDrawable(null)
+            thumbnailImageView.visibility = View.GONE
+            return
+        }
+
+        thumbnailImageView.alpha = 1f
+        thumbnailImageView.visibility = View.VISIBLE
+
+        Thread {
+            try {
+                val cleanBase64 = if (thumbStr.contains(",")) {
+                    thumbStr.substringAfter(",")
+                } else {
+                    thumbStr
+                }
+                val decoded = Base64.decode(cleanBase64, Base64.DEFAULT)
+                val bmp = BitmapFactory.decodeByteArray(decoded, 0, decoded.size)
+                if (bmp != null) {
+                    mainHandler.post {
+                        thumbnailImageView.setImageBitmap(bmp)
+                    }
+                }
+            } catch (_: Exception) {}
+        }.start()
+    }
+
+    private fun handleVideoCompletion() {
+        // Clear saved position as video reached completion
+        currentVideoUri?.toString()?.let { uriStr ->
+            if (uriStr.isNotBlank()) {
+                getSharedPreferences(PREFS_PLAYBACK, Context.MODE_PRIVATE)
+                    .edit()
+                    .apply {
+                        this.remove(uriStr)
+                        this.apply()
+                    }
+            }
+        }
+
+        when (currentRepeatMode) {
+            "one" -> {
+                // Repeat single clip
+                videoView.seekTo(0)
+                videoView.start()
+                playPauseButton.text = "❚❚"
+            }
+            "all" -> {
+                if (currentIndex < playlist.size - 1) {
+                    playNextVideo(userInitiated = false)
+                } else {
+                    // Loop back to first video in playlist
+                    currentIndex = 0
+                    loadVideoAtCurrentIndex(animate = true, slideLeft = true)
+                }
+            }
+            else -> {
+                // Repeat Mode OFF: check autoPlayNext
+                if (autoPlayNext && currentIndex < playlist.size - 1) {
+                    playNextVideo(userInitiated = false)
+                } else {
+                    // Stop and show replay button
+                    playPauseButton.text = "▶"
+                    showControls()
+                }
+            }
+        }
+    }
+
+    private fun playNextVideo(userInitiated: Boolean) {
+        if (playlist.isEmpty()) return
+        if (currentIndex < playlist.size - 1) {
+            currentIndex++
+            loadVideoAtCurrentIndex(animate = true, slideLeft = true)
+        } else if (userInitiated || currentRepeatMode == "all") {
+            currentIndex = 0
+            loadVideoAtCurrentIndex(animate = true, slideLeft = true)
+        } else {
+            // Reached end of playlist without repeat
+            showControls()
+            flashTitleBanner("END OF PLAYLIST")
+        }
+    }
+
+    private fun playPreviousVideo(userInitiated: Boolean) {
+        if (playlist.isEmpty()) return
+        if (currentIndex > 0) {
+            currentIndex--
+            loadVideoAtCurrentIndex(animate = true, slideLeft = false)
+        } else if (userInitiated) {
+            currentIndex = playlist.size - 1
+            loadVideoAtCurrentIndex(animate = true, slideLeft = false)
         }
     }
 
@@ -682,6 +1166,12 @@ class VideoPlayerActivity : Activity() {
             playPauseButton.text = "▶"
             flashCenterIcon("▶")
         } else {
+            // If near completion, restart
+            val total = videoView.duration
+            val current = videoView.currentPosition
+            if (total > 0 && current >= total - 500) {
+                videoView.seekTo(0)
+            }
             videoView.start()
             playPauseButton.text = "❚❚"
             flashCenterIcon("❚❚")
@@ -721,7 +1211,6 @@ class VideoPlayerActivity : Activity() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        // Configuration handled seamlessly without activity recreation
     }
 
     private fun toggleControls() {
@@ -796,7 +1285,7 @@ class VideoPlayerActivity : Activity() {
     }
 
     private fun saveCurrentPlaybackPosition() {
-        val uriStr = videoUri?.toString() ?: ""
+        val uriStr = currentVideoUri?.toString() ?: ""
         if (uriStr.isNotBlank()) {
             val current = videoView.currentPosition
             val total = videoView.duration
@@ -844,6 +1333,7 @@ class VideoPlayerActivity : Activity() {
         }
         mainHandler.removeCallbacks(updateProgressRunnable)
         mainHandler.removeCallbacks(hideControlsRunnable)
+        mainHandler.removeCallbacks(hideTitleFlashRunnable)
     }
 
     override fun onResume() {
@@ -859,6 +1349,8 @@ class VideoPlayerActivity : Activity() {
         super.onSaveInstanceState(outState)
         outState.putInt("saved_speed", currentSpeedIndex)
         outState.putBoolean("orient_locked", isOrientationLockedByUser)
+        outState.putInt("saved_index", currentIndex)
+        outState.putString("saved_repeat", currentRepeatMode)
     }
 
     override fun onDestroy() {
