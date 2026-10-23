@@ -92,7 +92,7 @@ class FloatingBubbleService : Service() {
             try {
                 val host = Uri.parse(raw).host?.lowercase() ?: return null
                 val isSupported = SUPPORTED_DOMAINS.any { d -> host == d || host.endsWith(".$d") }
-                return if (isSupported) raw else null
+                return if (isSupported) VideoDownloaderPlugin.normalizeUrl(raw) else null
             } catch (e: Exception) {
                 return null
             }
@@ -1237,34 +1237,115 @@ class FloatingBubbleService : Service() {
     }
 
     // -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // 4. AUTO-DOWNLOAD & MEDIASTORE PIPELINE
     // -------------------------------------------------------------------------
-    private fun triggerLinkProcessing(url: String, isManual: Boolean) {
+    private fun triggerLinkProcessing(url: String, isManual: Boolean, force: Boolean = false) {
         val supportedUrl = extractSupportedUrl(url)
         if (supportedUrl == null) {
-            Toast.makeText(this, "Supported: TikTok, YouTube, Instagram, Facebook", Toast.LENGTH_SHORT).show()
+            if (isManual) {
+                Toast.makeText(this, "Supported: TikTok, YouTube, Instagram, Facebook", Toast.LENGTH_SHORT).show()
+            }
             return
         }
 
-        if (isDownloading) {
-            Toast.makeText(this, "Download already in progress...", Toast.LENGTH_SHORT).show()
+        val normUrl = VideoDownloaderPlugin.normalizeUrl(supportedUrl)
+
+        if (VideoDownloaderPlugin.inFlightDownloads.containsKey(normUrl) || isDownloading) {
+            if (isManual) {
+                Toast.makeText(this, "Download already in progress...", Toast.LENGTH_SHORT).show()
+            }
             return
         }
 
-        val lastTime = recentDownloads[supportedUrl] ?: 0L
-        if (!isManual && (System.currentTimeMillis() - lastTime < 120_000L)) {
+        // Duplicate check before downloading: check if already downloaded & file still exists
+        if (!force) {
+            val dup = VideoDownloaderPlugin.checkDuplicateDownload(this, normUrl)
+            if (dup != null) {
+                showAlreadyDownloadedUI(dup, normUrl)
+                return
+            }
+        }
+
+        val lastTime = recentDownloads[normUrl] ?: 0L
+        if (!isManual && !force && (System.currentTimeMillis() - lastTime < 120_000L)) {
             return
         }
 
-        startBackgroundDownload(supportedUrl)
+        startBackgroundDownload(normUrl, force)
     }
 
-    private fun startBackgroundDownload(videoUrl: String) {
+    private fun showAlreadyDownloadedUI(dup: JSONObject, normUrl: String) {
+        val density = resources.displayMetrics.density
+        val title = dup.optString("title", "Video")
+        val fileUri = dup.optString("fileUri", "")
+
+        progressContainer?.visibility = View.VISIBLE
+        progressStatusText?.text = "Already downloaded: $title"
+        progressSpeedText?.text = "SAVED"
+        segmentedProgressBar?.setProgress(100)
+
+        val row = finishedActionsLayout ?: return
+        row.removeAllViews()
+        row.visibility = View.VISIBLE
+
+        val playBtn = createMechanicalButton(
+            text = "PLAY",
+            density = density,
+            isGreen = true,
+            onClick = {
+                if (fileUri.isNotBlank()) {
+                    try {
+                        val intent = Intent(this@FloatingBubbleService, VideoPlayerActivity::class.java).apply {
+                            this.action = Intent.ACTION_VIEW
+                            this.data = Uri.parse(fileUri)
+                            this.putExtra("video_title", title)
+                            this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        startActivity(intent)
+                    } catch (_: Exception) {
+                        openGalleryFolder()
+                    }
+                } else {
+                    openGalleryFolder()
+                }
+            }
+        )
+
+        val dlAgainBtn = createMechanicalButton(
+            text = "DOWNLOAD AGAIN",
+            density = density,
+            onClick = {
+                startBackgroundDownload(normUrl, force = true)
+            }
+        )
+
+        val closeBtn = createMechanicalButton(
+            text = "CLOSE",
+            density = density,
+            onClick = {
+                progressContainer?.visibility = View.GONE
+                row.visibility = View.GONE
+            }
+        )
+
+        row.addView(playBtn)
+        row.addView(dlAgainBtn)
+        row.addView(closeBtn)
+    }
+
+    private fun startBackgroundDownload(videoUrl: String, force: Boolean = false) {
         if (backendUrl.isBlank()) {
             Toast.makeText(this, "Set Render Backend URL in OmniDrop Settings", Toast.LENGTH_LONG).show()
             progressContainer?.visibility = View.VISIBLE
             progressStatusText?.text = "Server URL missing in Settings."
             segmentedProgressBar?.setProgress(0)
+            return
+        }
+
+        val normalizedUrl = VideoDownloaderPlugin.normalizeUrl(videoUrl)
+        if (VideoDownloaderPlugin.inFlightDownloads.putIfAbsent(normalizedUrl, true) != null) {
+            Toast.makeText(this, "Download already in progress...", Toast.LENGTH_SHORT).show()
             return
         }
 
@@ -1319,10 +1400,10 @@ class FloatingBubbleService : Service() {
                     progressStatusText?.text = "Extracting video metadata..."
                 }
 
-                var title = "video"
+                var title = ""
                 var thumbnail = ""
                 var uploader = "Creator"
-                var platform = "video"
+                var platform = ""
 
                 try {
                     val infoEndpoint = "${backendUrl.removeSuffix("/")}/info"
@@ -1334,7 +1415,7 @@ class FloatingBubbleService : Service() {
                         this.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
                         if (apiKey.isNotBlank()) this.setRequestProperty("x-api-key", apiKey)
                     }
-                    val iPayload = JSONObject().apply { this.put("url", videoUrl) }
+                    val iPayload = JSONObject().apply { this.put("url", normalizedUrl) }
                     iConn.outputStream.use { os ->
                         os.write(iPayload.toString().toByteArray(Charsets.UTF_8))
                         os.flush()
@@ -1342,13 +1423,21 @@ class FloatingBubbleService : Service() {
                     if (iConn.responseCode == HttpURLConnection.HTTP_OK) {
                         val resp = iConn.inputStream.bufferedReader().use { it.readText() }
                         val json = JSONObject(resp)
-                        title = json.optString("title", "video")
+                        title = json.optString("title", "")
                         thumbnail = json.optString("thumbnail", "")
                         uploader = json.optString("uploader", "Creator")
-                        platform = json.optString("platform", "video")
+                        platform = json.optString("platform", "")
                     }
                     iConn.disconnect()
                 } catch (_: Exception) {}
+
+                val cleanPlatform = VideoDownloaderPlugin.cleanPlatformName(platform, normalizedUrl)
+                val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US)
+                val dateStr = sdf.format(java.util.Date())
+
+                if (title.isBlank() || title.equals("video", ignoreCase = true) || title.startsWith("OmniDrop", ignoreCase = true)) {
+                    title = "$cleanPlatform video - $dateStr"
+                }
 
                 // Step 3: Stream download to MediaStore
                 mainHandler.post {
@@ -1368,7 +1457,7 @@ class FloatingBubbleService : Service() {
                 }
 
                 val payload = JSONObject().apply {
-                    this.put("url", videoUrl)
+                    this.put("url", normalizedUrl)
                     this.put("quality", defaultQuality)
                 }
                 conn.outputStream.use { os ->
@@ -1389,11 +1478,12 @@ class FloatingBubbleService : Service() {
                 val isAudio = defaultQuality.equals("audio", ignoreCase = true)
                 val ext = if (isAudio) ".mp3" else ".mp4"
                 val mediaType = if (isAudio) "audio/mpeg" else "video/mp4"
-                val cleanTitle = title.replace("[\\\\/:*?\"<>|\\r\\n]".toRegex(), "_")
+                val cleanTitle = title
+                    .replace("[\\\\/:*?\"<>|\\r\\n]".toRegex(), "_")
+                    .replace("\\s+".toRegex(), " ")
                     .trim()
-                    .take(70)
-                    .ifBlank { "OmniDrop_video" }
-                val cleanPlatform = platform.replace("[^a-zA-Z0-9]".toRegex(), "").lowercase().ifBlank { "video" }
+                    .take(80)
+                    .ifBlank { "$cleanPlatform video - $dateStr" }
                 val fileName = "$cleanTitle [$cleanPlatform]$ext"
 
                 val resolver = contentResolver
@@ -1448,7 +1538,7 @@ class FloatingBubbleService : Service() {
                     val diff = now - lastProgressUpdate
                     if (diff >= 300) {
                         val speedMbPerSec = (bytesSinceLastSample.toDouble() / (1024 * 1024)) / (diff / 1000.0)
-                        val totalMb = String.format("%.1f", bytesCopied / (1024.0 * 1024.0))
+                        val totalMb = String.format(java.util.Locale.US, "%.1f", bytesCopied / (1024.0 * 1024.0))
                         val pct = if (totalBytes > 0) ((bytesCopied * 100) / totalBytes).toInt().coerceIn(1, 99) else 50
 
                         lastProgressUpdate = now
@@ -1457,7 +1547,7 @@ class FloatingBubbleService : Service() {
                         mainHandler.post {
                             segmentedProgressBar?.setProgress(pct)
                             progressStatusText?.text = "$totalMb MB ($pct%)"
-                            progressSpeedText?.text = String.format("DN %.1f MB/s", speedMbPerSec)
+                            progressSpeedText?.text = String.format(java.util.Locale.US, "DN %.1f MB/s", speedMbPerSec)
                         }
                     }
                 }
@@ -1471,17 +1561,30 @@ class FloatingBubbleService : Service() {
                 }
 
                 val savedTimestamp = System.currentTimeMillis()
-                recentDownloads[videoUrl] = savedTimestamp
+                recentDownloads[normalizedUrl] = savedTimestamp
                 lastFinishedFileUri = targetUri.toString()
+
+                // Save to metadata store (keyed by fileName)
+                val metaObj = JSONObject().apply {
+                    this.put("title", title)
+                    this.put("platform", cleanPlatform)
+                    this.put("uploader", uploader)
+                    this.put("thumbnailUrl", thumbnail)
+                    this.put("sourceUrl", normalizedUrl)
+                    this.put("downloadTime", savedTimestamp)
+                    this.put("fileName", fileName)
+                    this.put("fileUri", targetUri.toString())
+                }
+                VideoDownloaderPlugin.saveVideoMetadata(this, fileName, metaObj)
 
                 // Save to native history
                 val historyEntry = JSONObject().apply {
                     this.put("id", "dl_$savedTimestamp")
-                    this.put("url", videoUrl)
+                    this.put("url", normalizedUrl)
                     this.put("title", title)
                     this.put("thumbnail", thumbnail)
                     this.put("uploader", uploader)
-                    this.put("platform", platform)
+                    this.put("platform", cleanPlatform)
                     this.put("quality", defaultQuality)
                     this.put("savedAt", savedTimestamp)
                     this.put("fileName", fileName)
@@ -1504,7 +1607,30 @@ class FloatingBubbleService : Service() {
                     segmentedProgressBar?.setProgress(100)
                     progressStatusText?.text = "Saved to ${if (isAudio) "Music/OmniDrop" else "Movies/OmniDrop"}"
                     progressSpeedText?.text = "READY"
-                    finishedActionsLayout?.visibility = View.VISIBLE
+
+                    // Reset finished buttons
+                    val row = finishedActionsLayout
+                    if (row != null) {
+                        row.removeAllViews()
+                        row.visibility = View.VISIBLE
+                        val openBtn = createMechanicalButton(
+                            text = "OPEN VIDEO",
+                            density = resources.displayMetrics.density,
+                            isGreen = true,
+                            onClick = { openFinishedVideo() }
+                        )
+                        val dismissBtn = createMechanicalButton(
+                            text = "CLOSE",
+                            density = resources.displayMetrics.density,
+                            onClick = {
+                                progressContainer?.visibility = View.GONE
+                                row.visibility = View.GONE
+                            }
+                        )
+                        row.addView(openBtn)
+                        row.addView(dismissBtn)
+                    }
+
                     linkEditText?.setText("")
                     refreshRecentDownloadsUI()
                 }
@@ -1518,6 +1644,7 @@ class FloatingBubbleService : Service() {
                     isDownloading = false
                 }
             } finally {
+                VideoDownloaderPlugin.inFlightDownloads.remove(normalizedUrl)
                 try { input?.close() } catch (_: Exception) {}
                 try { output?.close() } catch (_: Exception) {}
                 conn?.disconnect()

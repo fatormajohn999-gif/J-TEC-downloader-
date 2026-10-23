@@ -23,13 +23,58 @@ export function isSupportedUrl(url: string): boolean {
   }
 }
 
+export function normalizeUrl(rawUrl: string): string {
+  if (!rawUrl || typeof rawUrl !== 'string') return '';
+  const trimmed = rawUrl.trim();
+  try {
+    const parsed = new URL(trimmed);
+    const host = parsed.hostname.toLowerCase();
+
+    // YouTube: preserve only ?v= for /watch
+    if (host === 'youtube.com' || host.endsWith('.youtube.com')) {
+      if (parsed.pathname === '/watch') {
+        const v = parsed.searchParams.get('v');
+        return v ? `https://${parsed.host}/watch?v=${v}` : `https://${parsed.host}${parsed.pathname}`;
+      }
+      return `https://${parsed.host}${parsed.pathname.replace(/\/+$/, '')}`;
+    }
+
+    if (host === 'youtu.be') {
+      return `https://youtu.be${parsed.pathname.replace(/\/+$/, '')}`;
+    }
+
+    // TikTok: remove everything after ?
+    if (host === 'tiktok.com' || host.endsWith('.tiktok.com')) {
+      return `https://${parsed.host}${parsed.pathname.replace(/\/+$/, '')}`;
+    }
+
+    // Instagram: remove everything after ?
+    if (host === 'instagram.com' || host.endsWith('.instagram.com')) {
+      return `https://${parsed.host}${parsed.pathname.replace(/\/+$/, '')}`;
+    }
+
+    // Facebook: remove tracking query params except ?v= for /watch
+    if (host === 'facebook.com' || host.endsWith('.facebook.com') || host === 'fb.watch') {
+      if (parsed.pathname.includes('/watch') && parsed.searchParams.has('v')) {
+        const v = parsed.searchParams.get('v');
+        return `https://${parsed.host}/watch?v=${v}`;
+      }
+      return `https://${parsed.host}${parsed.pathname.replace(/\/+$/, '')}`;
+    }
+
+    return trimmed;
+  } catch {
+    return trimmed;
+  }
+}
+
 export function detectPlatform(url: string): PlatformType {
   const lower = url.toLowerCase();
   if (lower.includes('tiktok.')) return 'tiktok';
   if (lower.includes('youtube.') || lower.includes('youtu.be')) return 'youtube';
   if (lower.includes('instagram.')) return 'instagram';
   if (lower.includes('facebook.') || lower.includes('fb.watch')) return 'facebook';
-  return 'video';
+  return 'other';
 }
 
 export function cleanBackendUrl(rawUrl: string): string {
@@ -110,6 +155,7 @@ export async function fetchVideoInfo(url: string, settings: AppSettings): Promis
     throw new Error('Please set your Render Backend URL in Settings before inspecting links on mobile.');
   }
 
+  const normalized = normalizeUrl(url);
   const base = cleanBackendUrl(settings.backendUrl);
   const targetUrl = base ? `${base}/info` : '/api/info';
 
@@ -127,7 +173,7 @@ export async function fetchVideoInfo(url: string, settings: AppSettings): Promis
     const res = await fetch(targetUrl, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ url: url.trim() }),
+      body: JSON.stringify({ url: normalized }),
       signal: controller.signal,
     });
     clearTimeout(timeoutId);
@@ -146,15 +192,18 @@ export async function fetchVideoInfo(url: string, settings: AppSettings): Promis
     }
 
     const data = await res.json();
+    let rawPlatform = data.platform || detectPlatform(normalized);
+    if (rawPlatform === 'video') rawPlatform = 'other';
+
     return {
       title: data.title || 'Untitled Video',
       thumbnail: data.thumbnail || '',
       duration: data.duration || 0,
       uploader: data.uploader || 'Creator',
       qualities: data.qualities && data.qualities.length > 0 ? data.qualities : ['best', 'audio'],
-      platform: data.platform || detectPlatform(url),
+      platform: rawPlatform,
       id: data.id,
-      url: url.trim(),
+      url: normalized,
     };
   } catch (err: any) {
     if (err.name === 'AbortError') {
@@ -172,6 +221,7 @@ export async function downloadVideoFile(
   onProgress?: (percent: number, statusText: string) => void
 ): Promise<string> {
   const isNative = Capacitor.isNativePlatform();
+  const normalized = normalizeUrl(url);
 
   // 1. Native Capacitor platform: Stream straight to gallery via MediaStore Kotlin plugin
   if (isNative) {
@@ -190,7 +240,7 @@ export async function downloadVideoFile(
       }
 
       const res = await VideoDownloader.downloadAndSave({
-        url: url.trim(),
+        url: normalized,
         quality,
         title,
         backendUrl: cleanUrl,
@@ -226,7 +276,7 @@ export async function downloadVideoFile(
     const res = await fetch(targetUrl, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ url: url.trim(), quality }),
+      body: JSON.stringify({ url: normalized, quality }),
       signal: controller.signal,
     });
     clearTimeout(timeoutId);

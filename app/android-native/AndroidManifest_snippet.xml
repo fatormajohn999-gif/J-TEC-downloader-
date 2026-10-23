@@ -9,6 +9,7 @@ inside the <manifest> and <application> tags.
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+<uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
 <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
 <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
 
@@ -22,6 +23,13 @@ inside the <manifest> and <application> tags.
     android:foregroundServiceType="specialUse">
     <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="floating_quick_download_bubble" />
 </service>
+
+<!-- In-App Hardware Video Player -->
+<activity
+    android:name="com.omnidrop.app.plugin.VideoPlayerActivity"
+    android:exported="false"
+    android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+    android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
 
 <!-- Transparent Clipboard Bridge Activity -->
 <activity

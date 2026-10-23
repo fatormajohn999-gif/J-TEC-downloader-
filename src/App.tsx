@@ -9,6 +9,7 @@ import { BottomNav, NavTab } from './components/BottomNav';
 import { HomeScreen } from './components/HomeScreen';
 import { VideosScreen } from './components/VideosScreen';
 import { SettingsScreen } from './components/SettingsScreen';
+import { AboutScreen } from './components/AboutScreen';
 import { ServerWakingBanner } from './components/ServerWakingBanner';
 import { ClipboardPromptModal } from './components/ClipboardPromptModal';
 import { AppSettings, DownloadHistoryItem, PlatformType } from './types';
@@ -25,6 +26,11 @@ const DEFAULT_SETTINGS: AppSettings = {
   floatingBubbleEnabled: false,
   persistentNotificationEnabled: false,
   autoDetectClipboard: true,
+  autoDownloadOnPaste: false,
+  autoPlayNext: true,
+  repeatMode: 'off',
+  floatingSide: 'right',
+  floatingShowMs: true,
 };
 
 export default function App() {
@@ -63,6 +69,11 @@ export default function App() {
         apiKey: newSettings.apiKey,
         defaultQuality: newSettings.defaultQuality,
         autoDownload: true,
+        autoDownloadOnPaste: newSettings.autoDownloadOnPaste,
+        autoPlayNext: newSettings.autoPlayNext,
+        repeatMode: newSettings.repeatMode,
+        floatingSide: newSettings.floatingSide,
+        floatingShowMs: newSettings.floatingShowMs,
       }).catch(() => {});
     } catch {}
   };
@@ -73,6 +84,11 @@ export default function App() {
       apiKey: settings.apiKey,
       defaultQuality: settings.defaultQuality,
       autoDownload: true,
+      autoDownloadOnPaste: settings.autoDownloadOnPaste,
+      autoPlayNext: settings.autoPlayNext,
+      repeatMode: settings.repeatMode,
+      floatingSide: settings.floatingSide,
+      floatingShowMs: settings.floatingShowMs,
     }).catch(() => {});
   }, []);
 
@@ -174,24 +190,6 @@ export default function App() {
     } catch {}
   };
 
-  const handleDeleteHistoryItem = (id: string) => {
-    const updated = history.filter((h) => h.id !== id);
-    setHistory(updated);
-    try {
-      localStorage.setItem(STORAGE_KEY_HISTORY, JSON.stringify(updated));
-    } catch {}
-  };
-
-  const handleClearHistory = () => {
-    if (confirm('Clear all download history?')) {
-      setHistory([]);
-      try {
-        localStorage.removeItem(STORAGE_KEY_HISTORY);
-        VideoDownloader.clearNativeHistory().catch(() => {});
-      } catch {}
-    }
-  };
-
   // Health check
   const refreshHealth = useCallback(async () => {
     setServerStatus('checking');
@@ -216,9 +214,7 @@ export default function App() {
     const params = new URLSearchParams(window.location.search);
     const sharedText = params.get('text') || params.get('url') || '';
     if (sharedText) {
-      // Clean query from browser bar
       window.history.replaceState({}, document.title, window.location.pathname);
-      // Extract URL if text has words
       const match = sharedText.match(/(https?:\/\/[^\s]+)/i);
       const urlToUse = match ? match[1] : sharedText;
       if (isSupportedUrl(urlToUse)) {
@@ -246,7 +242,7 @@ export default function App() {
           }
         });
       } catch {
-        // Plugin might be running on web
+        // Safe on web
       }
     })();
 
@@ -270,7 +266,7 @@ export default function App() {
         }
       }
     } catch {
-      // Clipboard read permission might not be granted; silent pass
+      // Safe pass
     }
   }, [settings.autoDetectClipboard, pendingUrl, detectedClipboardUrl]);
 
@@ -281,7 +277,7 @@ export default function App() {
   }, [checkClipboardForLink]);
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased">
+    <div className="min-h-screen bg-[#080B10] bg-grid-machine text-slate-100 flex flex-col font-sans antialiased selection:bg-cyan-500/30 selection:text-cyan-200">
       {/* Top Header */}
       <Header
         serverStatus={serverStatus}
@@ -310,6 +306,9 @@ export default function App() {
               refreshHealth();
             }}
             onOpenSettings={() => setCurrentTab('settings')}
+            recentDownloads={history}
+            serverStatus={serverStatus}
+            serverLatency={serverLatency}
           />
         )}
 
@@ -324,6 +323,10 @@ export default function App() {
             onRefreshHealth={refreshHealth}
           />
         )}
+
+        {currentTab === 'about' && (
+          <AboutScreen />
+        )}
       </main>
 
       {/* Auto-detected clipboard link modal prompt */}
@@ -337,7 +340,7 @@ export default function App() {
         onDismiss={() => setDetectedClipboardUrl('')}
       />
 
-      {/* Modern Bottom Navigation */}
+      {/* 4-Tab Bottom Navigation (Download, Videos, Settings, About) */}
       <BottomNav
         currentTab={currentTab}
         onSelectTab={setCurrentTab}

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Clipboard,
   Download,
@@ -7,15 +7,16 @@ import {
   Sparkles,
   CheckCircle2,
   Trash2,
-  ExternalLink,
-  ShieldCheck,
-  Video,
+  Play,
+  RotateCcw,
+  Check,
+  Film,
   Music,
-  Share2,
+  ExternalLink,
 } from 'lucide-react';
 import { Capacitor } from '@capacitor/core';
-import { VideoInfo, AppSettings, PlatformType } from '../types';
-import { isSupportedUrl, fetchVideoInfo, downloadVideoFile, wakeUpServerUntilReady } from '../services/api';
+import { VideoInfo, AppSettings, PlatformType, DownloadHistoryItem } from '../types';
+import { isSupportedUrl, fetchVideoInfo, downloadVideoFile, wakeUpServerUntilReady, normalizeUrl } from '../services/api';
 import { VideoDownloader } from '../plugins/videoDownloader';
 
 interface HomeScreenProps {
@@ -35,7 +36,17 @@ interface HomeScreenProps {
   onWakeServerStart: () => void;
   onWakeServerEnd: () => void;
   onOpenSettings?: () => void;
+  recentDownloads?: DownloadHistoryItem[];
+  serverStatus?: 'connected' | 'checking' | 'offline';
+  serverLatency?: number | null;
 }
+
+const QUALITY_OPTIONS = [
+  { id: 'best', label: 'BEST' },
+  { id: '1080p', label: '1080P' },
+  { id: '720p', label: '720P' },
+  { id: 'audio', label: 'MP3' },
+];
 
 export const HomeScreen: React.FC<HomeScreenProps> = ({
   settings,
@@ -45,6 +56,9 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   onWakeServerStart,
   onWakeServerEnd,
   onOpenSettings,
+  recentDownloads = [],
+  serverStatus = 'connected',
+  serverLatency = null,
 }) => {
   const isNative = Capacitor.isNativePlatform();
   const isBackendMissingOnNative = isNative && (!settings.backendUrl || !settings.backendUrl.trim());
@@ -58,8 +72,15 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
+  const [duplicateDialog, setDuplicateDialog] = useState<{
+    open: boolean;
+    uri: string;
+    title: string;
+    fileName: string;
+  } | null>(null);
+
   // Sync if pendingUrl was passed from Share Target or Clipboard detector
-  React.useEffect(() => {
+  useEffect(() => {
     if (pendingUrl) {
       setInputUrl(pendingUrl);
       inspectUrl(pendingUrl);
@@ -83,9 +104,10 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     try {
       const text = await navigator.clipboard.readText();
       if (text) {
-        setInputUrl(text.trim());
-        if (isSupportedUrl(text.trim())) {
-          inspectUrl(text.trim());
+        const cleaned = normalizeUrl(text.trim());
+        setInputUrl(cleaned);
+        if (isSupportedUrl(cleaned)) {
+          inspectUrl(cleaned);
         }
       }
     } catch {
@@ -98,14 +120,17 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     setVideoInfo(null);
     setErrorMessage(null);
     setSuccessMessage(null);
+    setDuplicateDialog(null);
   };
 
   const inspectUrl = async (targetUrl?: string) => {
-    const url = (targetUrl || inputUrl).trim();
+    const raw = (targetUrl || inputUrl).trim();
+    const url = normalizeUrl(raw);
     if (!url) {
-      setErrorMessage('Please paste or type a video link.');
+      setErrorMessage('Please paste or enter a video link.');
       return;
     }
+    setInputUrl(url);
 
     if (!isSupportedUrl(url)) {
       setErrorMessage('Unsupported link. Please paste a URL from TikTok, YouTube, Instagram, or Facebook.');
@@ -113,36 +138,25 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
 
     if (isBackendMissingOnNative) {
-      setErrorMessage('Please set your Render Backend URL in Settings instead of calling /api.');
+      setErrorMessage('Please set your Render Backend URL in Settings before downloading on mobile.');
       return;
     }
 
     setErrorMessage(null);
     setSuccessMessage(null);
+    setDuplicateDialog(null);
     setIsLoadingInfo(true);
 
     try {
       const info = await fetchVideoInfo(url, settings);
       setVideoInfo(info);
-      // Auto-select quality if available
-      if (settings.defaultQuality && info.qualities.includes(settings.defaultQuality)) {
-        setSelectedQuality(settings.defaultQuality);
-      } else if (info.qualities.includes('1080p')) {
-        setSelectedQuality('1080p');
-      } else if (info.qualities.includes('720p')) {
-        setSelectedQuality('720p');
-      } else {
-        setSelectedQuality(info.qualities[0] || 'best');
-      }
     } catch (err: any) {
       const msg = err.message || 'Could not inspect video';
-      // If server took too long, attempt automatic wake-up
       if (msg.includes('waking up') || msg.includes('timeout') || msg.includes('Failed to fetch')) {
         onWakeServerStart();
         const wokeUp = await wakeUpServerUntilReady(settings);
         onWakeServerEnd();
         if (wokeUp) {
-          // Retry
           try {
             const retryInfo = await fetchVideoInfo(url, settings);
             setVideoInfo(retryInfo);
@@ -162,20 +176,49 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
   };
 
-  const handleStartDownload = async () => {
-    if (!videoInfo) return;
+  const handleStartDownload = async (force: boolean = false) => {
+    const targetUrl = videoInfo ? videoInfo.url : normalizeUrl(inputUrl.trim());
+    if (!targetUrl) {
+      setErrorMessage('Please paste or inspect a video URL first.');
+      return;
+    }
+
+    // Check duplicate before starting download
+    if (!force && isNative) {
+      try {
+        const dup = await VideoDownloader.checkDuplicate({ url: targetUrl });
+        if (dup && dup.exists) {
+          setDuplicateDialog({
+            open: true,
+            uri: dup.uri || '',
+            title: dup.title || (videoInfo ? videoInfo.title : 'Downloaded Video'),
+            fileName: dup.fileName || '',
+          });
+          return;
+        }
+      } catch (e) {
+        console.warn('Duplicate check skipped:', e);
+      }
+    }
 
     setIsDownloading(true);
-    setDownloadProgress(5);
+    setDownloadProgress(10);
     setDownloadStatusText('Connecting to downloader...');
     setErrorMessage(null);
     setSuccessMessage(null);
+    setDuplicateDialog(null);
+
+    const titleToUse = videoInfo?.title || 'video';
+    const uploaderToUse = videoInfo?.uploader || 'Creator';
+    const thumbToUse = videoInfo?.thumbnail || '';
+    const durationToUse = videoInfo?.duration || 0;
+    const platformToUse = videoInfo?.platform || 'other';
 
     try {
       const fileName = await downloadVideoFile(
-        videoInfo.url,
+        targetUrl,
         selectedQuality,
-        videoInfo.title,
+        titleToUse,
         settings,
         (pct, text) => {
           setDownloadProgress(pct);
@@ -183,292 +226,385 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         }
       );
 
-      // Trigger native notification if available
       try {
         await VideoDownloader.showDownloadNotification({
-          title: 'Video Downloaded',
-          message: `${videoInfo.title.substring(0, 40)} saved!`,
+          title: 'Download Completed',
+          message: `${titleToUse.substring(0, 40)} saved to gallery!`,
         });
-      } catch {
-        // Native notification optional
-      }
+      } catch {}
 
-      // Record in history
       onDownloadCompleted({
-        url: videoInfo.url,
-        title: videoInfo.title,
-        thumbnail: videoInfo.thumbnail,
-        uploader: videoInfo.uploader,
-        duration: videoInfo.duration,
+        url: targetUrl,
+        title: titleToUse,
+        thumbnail: thumbToUse,
+        uploader: uploaderToUse,
+        duration: durationToUse,
         quality: selectedQuality,
-        platform: videoInfo.platform,
+        platform: platformToUse,
         fileName,
       });
 
-      setSuccessMessage(`Saved to device: ${fileName}`);
+      setSuccessMessage(`SAVED: ${fileName}`);
     } catch (err: any) {
-      setErrorMessage(err.message || 'Download failed. Please try again.');
+      setErrorMessage(err.message || 'Download failed. Please check network/backend.');
     } finally {
       setIsDownloading(false);
     }
   };
 
-  return (
-    <div className="space-y-5 pb-24">
-      {/* Hero Badge */}
-      <div className="text-center pt-2 pb-1">
-        <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-slate-900 border border-slate-800 text-xs text-slate-300 shadow-inner">
-          <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
-          <span>Full Quality • No Watermark • Direct Save</span>
+  const handlePlayExisting = async (uri: string, title: string) => {
+    try {
+      await VideoDownloader.playVideo({ uri, title });
+    } catch (e: any) {
+      alert(`Play notice: ${e?.message || 'Player available in Android build.'}`);
+    }
+  };
+
+  // Render 16 segmented progress blocks
+  const renderSegmentedProgress = () => {
+    const totalBlocks = 16;
+    const filledBlocks = Math.round((downloadProgress / 100) * totalBlocks);
+
+    return (
+      <div className="space-y-1.5 pt-1">
+        <div className="flex items-center justify-between font-mono text-[11px]">
+          <span className="text-cyan-400 font-bold">{downloadProgress}%</span>
+          <span className="text-slate-400 truncate max-w-[200px]">{downloadStatusText}</span>
+        </div>
+        <div className="grid grid-cols-16 gap-1 p-1 bg-slate-950 rounded-md border border-cyan-500/30">
+          {Array.from({ length: totalBlocks }).map((_, i) => (
+            <div
+              key={i}
+              className={`h-2.5 rounded-xs transition-colors duration-150 ${
+                i < filledBlocks
+                  ? 'bg-cyan-400 led-cyan shadow-[0_0_6px_rgba(0,240,255,0.8)]'
+                  : 'bg-slate-900 border border-slate-800'
+              }`}
+            />
+          ))}
         </div>
       </div>
+    );
+  };
 
-      {/* Native Render URL Required Notice */}
+  return (
+    <div className="space-y-4 pb-28">
+      {/* Backend Required Warning if unconfigured */}
       {isBackendMissingOnNative && (
-        <div className="p-4 rounded-2xl bg-amber-950/70 border border-amber-600/60 shadow-xl text-amber-200 space-y-2.5 animate-fade-in">
+        <div className="machine-surface p-3.5 rounded-xl border border-amber-500/60 text-amber-200 space-y-2">
           <div className="flex items-center gap-2">
-            <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
-            <h4 className="text-xs font-bold text-white tracking-wide">
-              Render Backend URL Required on Mobile
+            <span className="w-2 h-2 rounded-full led-amber" />
+            <h4 className="text-xs font-mono font-bold uppercase tracking-wider text-white">
+              CONFIGURATION REQUIRED // RENDER BACKEND
             </h4>
           </div>
-          <p className="text-xs text-amber-200/90 leading-relaxed">
-            Running on native device. Please set your Render Backend URL in <strong>Settings</strong> instead of calling local <code>/api</code>.
+          <p className="text-xs text-amber-200/90 leading-relaxed font-sans">
+            Please configure your Render Backend URL in Settings before downloading on mobile.
           </p>
           {onOpenSettings && (
             <button
               onClick={onOpenSettings}
-              className="py-1.5 px-3.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs transition active:scale-95"
+              className="machine-btn px-3 py-1 rounded-lg text-xs font-mono font-bold text-cyan-300"
             >
-              Open Settings
+              GOTO // SETTINGS
             </button>
           )}
         </div>
       )}
 
-      {/* Main Input Box Card */}
-      <div className="rounded-2xl bg-gradient-to-b from-slate-900 to-slate-900/80 border border-slate-800 p-4 shadow-xl">
-        <label className="block text-xs font-medium text-slate-400 mb-2">
-          Paste Social Video Link
-        </label>
-        <div className="relative">
-          <textarea
-            rows={2}
-            value={inputUrl}
-            onChange={(e) => setInputUrl(e.target.value)}
-            placeholder="https://www.tiktok.com/@... or youtube.com/watch?v=..."
-            className="w-full rounded-xl bg-slate-950 border border-slate-800 p-3 pr-20 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 resize-none transition"
-          />
-
-          <div className="absolute right-2 top-2 flex flex-col gap-1.5">
-            {inputUrl ? (
-              <button
-                onClick={handleClear}
-                className="p-1.5 rounded-lg bg-slate-800 text-slate-400 hover:text-white transition"
-                title="Clear input"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-              </button>
-            ) : (
-              <button
-                onClick={handlePaste}
-                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 hover:bg-indigo-600/50 text-[11px] font-medium transition active:scale-95"
-              >
-                <Clipboard className="w-3 h-3" />
-                Paste
-              </button>
-            )}
+      {/* Duplicate Alert Dialog */}
+      {duplicateDialog && duplicateDialog.open && (
+        <div className="machine-surface p-4 rounded-xl border border-cyan-400/80 space-y-3 animate-fade-in shadow-[0_0_20px_rgba(0,240,255,0.25)]">
+          <div className="flex items-center gap-2">
+            <span className="w-2.5 h-2.5 rounded-full led-cyan" />
+            <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-white">
+              ALREADY DOWNLOADED // FILE EXISTS
+            </h3>
           </div>
-        </div>
-
-        {/* Action Button */}
-        <div className="mt-3 flex gap-2">
-          <button
-            onClick={() => inspectUrl()}
-            disabled={isLoadingInfo || !inputUrl.trim()}
-            className="flex-1 py-3 px-4 rounded-xl bg-gradient-to-r from-indigo-600 via-purple-600 to-pink-600 hover:from-indigo-500 hover:to-pink-500 disabled:opacity-50 text-white font-medium text-xs flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/25 transition active:scale-98"
-          >
-            {isLoadingInfo ? (
-              <>
-                <Loader2 className="w-4 h-4 animate-spin" />
-                <span>Inspecting Video...</span>
-              </>
-            ) : (
-              <>
-                <Download className="w-4 h-4" />
-                <span>Fetch Video & Qualities</span>
-              </>
-            )}
-          </button>
-        </div>
-
-        {/* Supported Platforms Pills */}
-        <div className="mt-4 pt-3 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-400">
-          <span className="text-slate-400">Supported:</span>
-          <div className="flex items-center gap-2 font-medium">
-            <span className="px-2 py-0.5 rounded-md bg-slate-800/90 text-slate-300">TikTok</span>
-            <span className="px-2 py-0.5 rounded-md bg-slate-800/90 text-slate-300">YouTube</span>
-            <span className="px-2 py-0.5 rounded-md bg-slate-800/90 text-slate-300">Instagram</span>
-            <span className="px-2 py-0.5 rounded-md bg-slate-800/90 text-slate-300">Facebook</span>
+          <p className="text-xs text-slate-300 font-sans">
+            This video was already downloaded and is stored in your gallery:
+          </p>
+          <div className="font-mono text-[11px] text-cyan-300 p-2 rounded bg-slate-950 border border-slate-800 truncate">
+            {duplicateDialog.fileName || duplicateDialog.title}
           </div>
-        </div>
-      </div>
-
-      {/* Error Message Toast */}
-      {errorMessage && (
-        <div className="p-3.5 rounded-xl bg-rose-950/70 border border-rose-800/80 flex items-start gap-2.5 text-xs text-rose-200 animate-shake">
-          <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-          <div className="flex-1">
-            <p className="font-medium">{errorMessage}</p>
+          <div className="flex items-center gap-2 pt-1">
+            <button
+              onClick={() => handlePlayExisting(duplicateDialog.uri, duplicateDialog.title)}
+              className="machine-btn-primary flex-1 py-2 rounded-lg font-mono text-xs uppercase flex items-center justify-center gap-1.5"
+            >
+              <Play className="w-3.5 h-3.5 fill-current" />
+              <span>PLAY NOW</span>
+            </button>
+            <button
+              onClick={() => handleStartDownload(true)}
+              className="machine-btn flex-1 py-2 rounded-lg font-mono text-xs text-slate-300 uppercase flex items-center justify-center gap-1.5"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>DOWNLOAD AGAIN</span>
+            </button>
           </div>
         </div>
       )}
 
-      {/* Success Message Toast */}
-      {successMessage && (
-        <div className="p-3.5 rounded-xl bg-emerald-950/70 border border-emerald-800/80 flex items-center gap-2.5 text-xs text-emerald-200">
-          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-          <p className="font-medium flex-1">{successMessage}</p>
+      {/* HERO CARD: PASTE LINK // INGESTION UNIT */}
+      <div className="machine-surface rounded-xl p-4 space-y-3.5">
+        <div className="flex items-center justify-between pb-2 border-b border-cyan-500/20">
+          <div className="flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full led-cyan" />
+            <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-white">
+              PASTE LINK // INGESTION UNIT
+            </h3>
+          </div>
+          <span className="font-mono text-[10px] text-slate-400 uppercase">TIKTOK • YT • IG • FB</span>
         </div>
-      )}
 
-      {/* Video Preview Card */}
-      {videoInfo && (
-        <div className="rounded-2xl bg-slate-900 border border-slate-800 p-4 shadow-2xl space-y-4 animate-fade-in">
-          {/* Thumbnail & Badges */}
-          <div className="relative aspect-video rounded-xl overflow-hidden bg-slate-950 border border-slate-800 group">
-            {videoInfo.thumbnail ? (
-              <img
-                src={videoInfo.thumbnail}
-                alt={videoInfo.title}
-                className="w-full h-full object-cover"
-                loading="lazy"
+        {/* Input & Paste Key */}
+        <div className="space-y-2.5">
+          <div className="flex items-center gap-2">
+            <div className="relative flex-1">
+              <input
+                type="text"
+                value={inputUrl}
+                onChange={(e) => setInputUrl(e.target.value)}
+                placeholder="https://tiktok.com/@... or youtu.be/..."
+                className="w-full rounded-lg bg-slate-950 border border-slate-800 focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400 px-3 py-2.5 text-xs font-mono text-slate-200 placeholder:text-slate-600 outline-none transition"
               />
-            ) : (
-              <div className="w-full h-full flex items-center justify-center text-slate-600">
-                <Video className="w-12 h-12" />
-              </div>
-            )}
-
-            {/* Duration pill */}
-            {videoInfo.duration > 0 && (
-              <div className="absolute bottom-2 right-2 px-2 py-0.5 rounded-md bg-black/80 backdrop-blur-md text-[11px] font-mono text-white">
-                {formatDuration(videoInfo.duration)}
-              </div>
-            )}
-
-            {/* Platform & Watermark Badge */}
-            <div className="absolute top-2 left-2 flex items-center gap-1.5">
-              <span className="px-2 py-0.5 rounded-md bg-indigo-600/90 text-white font-semibold text-[10px] uppercase tracking-wide backdrop-blur-md">
-                {videoInfo.platform}
-              </span>
-              {videoInfo.platform === 'tiktok' && (
-                <span className="px-2 py-0.5 rounded-md bg-emerald-600/90 text-white font-medium text-[10px] flex items-center gap-1 backdrop-blur-md">
-                  <ShieldCheck className="w-3 h-3" />
-                  No Watermark
-                </span>
+              {inputUrl && (
+                <button
+                  onClick={handleClear}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 font-mono text-xs"
+                >
+                  CLEAR
+                </button>
               )}
             </div>
+
+            {/* Big Mechanical Paste Key */}
+            <button
+              onClick={handlePaste}
+              className="machine-btn px-3.5 py-2.5 rounded-lg flex items-center gap-1.5 text-xs font-mono font-bold text-cyan-300 shrink-0"
+              title="Paste link from clipboard"
+            >
+              <Clipboard className="w-3.5 h-3.5 text-cyan-400" />
+              <span>PASTE</span>
+            </button>
           </div>
 
-          {/* Details */}
+          {/* Quality Selector Segmented Switch */}
           <div>
-            <h3 className="font-semibold text-sm text-white line-clamp-2 leading-snug">
-              {videoInfo.title}
-            </h3>
-            <p className="text-xs text-slate-400 mt-1 flex items-center gap-1.5">
-              <span>By {videoInfo.uploader}</span>
-            </p>
-          </div>
-
-          {/* Quality Picker */}
-          <div>
-            <label className="block text-xs font-medium text-slate-400 mb-2">
-              Select Output Quality:
-            </label>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-              {videoInfo.qualities.map((q) => {
-                const isAudio = q === 'audio';
-                const isSelected = selectedQuality === q;
+            <div className="text-[10px] font-mono text-slate-400 mb-1 uppercase tracking-wider">
+              STREAM QUALITY // ENCODE
+            </div>
+            <div className="grid grid-cols-4 gap-1 p-1 bg-slate-950 rounded-lg border border-slate-800">
+              {QUALITY_OPTIONS.map((q) => {
+                const isSelected = selectedQuality === q.id;
                 return (
                   <button
-                    key={q}
-                    type="button"
-                    onClick={() => setSelectedQuality(q)}
-                    className={`py-2 px-3 rounded-xl border text-xs font-medium flex items-center justify-center gap-1.5 transition active:scale-95 ${
+                    key={q.id}
+                    onClick={() => setSelectedQuality(q.id)}
+                    className={`py-1.5 rounded text-center font-mono text-xs font-bold transition-all ${
                       isSelected
-                        ? 'bg-indigo-600 border-indigo-500 text-white shadow-md shadow-indigo-600/30'
-                        : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
+                        ? 'machine-btn-primary text-slate-950 shadow-[0_0_10px_rgba(0,240,255,0.5)]'
+                        : 'text-slate-400 hover:text-slate-200'
                     }`}
                   >
-                    {isAudio ? <Music className="w-3.5 h-3.5" /> : <Video className="w-3.5 h-3.5" />}
-                    <span>{isAudio ? 'MP3 Audio' : q.toUpperCase()}</span>
+                    {q.label}
                   </button>
                 );
               })}
             </div>
           </div>
 
-          {/* Download Progress Bar */}
-          {isDownloading && (
-            <div className="space-y-1.5 p-3 rounded-xl bg-slate-950 border border-slate-800">
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-slate-300 font-medium flex items-center gap-1.5">
-                  <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-400" />
-                  {downloadStatusText}
-                </span>
-                <span className="font-mono text-indigo-400 font-semibold">{downloadProgress}%</span>
-              </div>
-              <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
-                <div
-                  className="h-full bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 transition-all duration-300"
-                  style={{ width: `${downloadProgress}%` }}
-                />
-              </div>
-            </div>
-          )}
-
-          {/* Download Button */}
+          {/* Download Action Key */}
           <button
-            onClick={handleStartDownload}
-            disabled={isDownloading}
-            className="w-full py-3.5 px-4 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-50 text-white font-semibold text-xs flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/25 transition active:scale-98"
+            onClick={() => {
+              if (!videoInfo && inputUrl.trim()) {
+                inspectUrl();
+              } else {
+                handleStartDownload();
+              }
+            }}
+            disabled={isLoadingInfo || isDownloading}
+            className="machine-btn-primary w-full py-3 rounded-lg flex items-center justify-center gap-2 text-xs uppercase tracking-wider font-mono disabled:opacity-50"
           >
-            {isDownloading ? (
+            {isLoadingInfo ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
-                <span>Downloading Media...</span>
+                <span>INSPECTING STREAM...</span>
+              </>
+            ) : isDownloading ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>DOWNLOADING...</span>
               </>
             ) : (
               <>
                 <Download className="w-4 h-4" />
-                <span>Save Video to Phone</span>
+                <span>{videoInfo ? 'DOWNLOAD VIDEO FILE' : 'INSPECT & DOWNLOAD'}</span>
               </>
             )}
           </button>
         </div>
+
+        {/* Status Feedback Messages */}
+        {errorMessage && (
+          <div className="p-3 rounded-lg bg-rose-950/40 border border-rose-500/50 flex items-start gap-2 text-xs text-rose-200 font-mono animate-fade-in">
+            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+            <span className="leading-snug">{errorMessage}</span>
+          </div>
+        )}
+
+        {successMessage && (
+          <div className="p-3 rounded-lg bg-emerald-950/40 border border-emerald-500/50 flex items-start gap-2 text-xs text-emerald-200 font-mono animate-fade-in">
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+            <span className="leading-snug">{successMessage}</span>
+          </div>
+        )}
+      </div>
+
+      {/* POST-FETCH VIDEO CARD WITH "NO WATERMARK" LED BADGE */}
+      {videoInfo && (
+        <div className="machine-surface rounded-xl p-4 space-y-3 animate-fade-in">
+          <div className="flex items-center justify-between pb-2 border-b border-cyan-500/20">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full led-emerald" />
+              <h4 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
+                VIDEO TARGET LOCATED
+              </h4>
+            </div>
+
+            {/* "NO WATERMARK" LED BADGE */}
+            <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-emerald-950/80 border border-emerald-500/40 font-mono text-[10px] text-emerald-300 font-bold">
+              <span className="w-1.5 h-1.5 rounded-full led-emerald" />
+              <span>NO WATERMARK</span>
+            </div>
+          </div>
+
+          <div className="flex gap-3">
+            {/* Thumbnail */}
+            <div className="relative w-24 h-24 rounded-lg overflow-hidden bg-slate-950 border border-slate-800 shrink-0">
+              {videoInfo.thumbnail ? (
+                <img
+                  src={videoInfo.thumbnail}
+                  alt={videoInfo.title}
+                  className="w-full h-full object-cover"
+                />
+              ) : (
+                <div className="w-full h-full flex items-center justify-center text-slate-600">
+                  <Film className="w-8 h-8" />
+                </div>
+              )}
+              {videoInfo.duration > 0 && (
+                <span className="absolute bottom-1 right-1 px-1 py-0.2 rounded bg-black/80 font-mono text-[9px] text-white">
+                  {formatDuration(videoInfo.duration)}
+                </span>
+              )}
+            </div>
+
+            {/* Info details */}
+            <div className="flex-1 min-w-0 space-y-1">
+              <h5 className="font-mono font-bold text-xs text-white line-clamp-2 leading-snug">
+                {videoInfo.title}
+              </h5>
+              <p className="font-mono text-[11px] text-cyan-400 truncate">
+                @{videoInfo.uploader || 'Creator'}
+              </p>
+              <div className="flex items-center gap-2 pt-1 font-mono text-[10px] text-slate-400">
+                <span className="uppercase px-1.5 py-0.2 rounded bg-slate-950 border border-slate-800 text-slate-300">
+                  {videoInfo.platform}
+                </span>
+                <span>{selectedQuality.toUpperCase()}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Segmented Progress Blocks when downloading */}
+          {isDownloading && renderSegmentedProgress()}
+        </div>
       )}
 
-      {/* Feature Highlights Grid */}
-      <div className="grid grid-cols-2 gap-3 pt-2">
-        <div className="p-3.5 rounded-xl bg-slate-900/60 border border-slate-800/80 space-y-1">
-          <div className="text-indigo-400 mb-1">
-            <ShieldCheck className="w-5 h-5" />
+      {/* RECENT DOWNLOADS (LAST 3) WITH PLAY BUTTONS */}
+      {recentDownloads && recentDownloads.length > 0 && (
+        <div className="machine-surface rounded-xl p-3.5 space-y-2.5">
+          <div className="flex items-center justify-between pb-1 border-b border-slate-800">
+            <span className="font-mono text-xs font-bold text-slate-300 uppercase tracking-wider">
+              RECENT DOWNLOADS // QUICK PLAY
+            </span>
+            <span className="font-mono text-[10px] text-slate-500">LAST 3</span>
           </div>
-          <h4 className="text-xs font-semibold text-white">Clean Watermark Removal</h4>
-          <p className="text-[11px] text-slate-400 leading-tight">
-            Original high-bitrate video streams extracted directly without visual logos.
-          </p>
+
+          <div className="space-y-2">
+            {recentDownloads.slice(0, 3).map((item) => (
+              <div
+                key={item.id}
+                className="p-2 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-between gap-2.5"
+              >
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-10 h-10 rounded bg-slate-900 border border-slate-800 overflow-hidden shrink-0">
+                    {item.thumbnail ? (
+                      <img src={item.thumbnail} alt="" className="w-full h-full object-cover" />
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center text-slate-600">
+                        <Film className="w-4 h-4" />
+                      </div>
+                    )}
+                  </div>
+                  <div className="min-w-0">
+                    <h6 className="font-mono text-xs text-white truncate max-w-[200px]">
+                      {item.title}
+                    </h6>
+                    <div className="font-mono text-[10px] text-slate-400 flex items-center gap-2">
+                      <span className="text-cyan-400 uppercase">{item.platform}</span>
+                      <span>•</span>
+                      <span>{item.quality.toUpperCase()}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <button
+                  onClick={() => handlePlayExisting(item.fileUri || item.url, item.title)}
+                  className="machine-btn px-2.5 py-1.5 rounded-md font-mono text-[11px] text-cyan-300 flex items-center gap-1 shrink-0"
+                >
+                  <Play className="w-3 h-3 fill-current text-cyan-400" />
+                  <span>PLAY</span>
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* BOTTOM STATUS STRIP: SERVER LED & NET MS */}
+      <div className="machine-surface rounded-lg px-3 py-2 flex items-center justify-between text-xs font-mono">
+        <div className="flex items-center gap-2">
+          <span
+            className={`w-2 h-2 rounded-full ${
+              serverStatus === 'connected'
+                ? serverLatency && serverLatency > 3000
+                  ? 'led-amber'
+                  : 'led-emerald'
+                : serverStatus === 'checking'
+                ? 'led-amber'
+                : 'led-rose'
+            }`}
+          />
+          <span className="text-slate-300">
+            SERVER:{' '}
+            {serverStatus === 'connected'
+              ? serverLatency && serverLatency > 3000
+                ? 'SLEEPING'
+                : 'ONLINE'
+              : serverStatus === 'checking'
+              ? 'PINGING'
+              : 'OFFLINE'}
+          </span>
         </div>
 
-        <div className="p-3.5 rounded-xl bg-slate-900/60 border border-slate-800/80 space-y-1">
-          <div className="text-purple-400 mb-1">
-            <Share2 className="w-5 h-5" />
-          </div>
-          <h4 className="text-xs font-semibold text-white">Direct Android Share</h4>
-          <p className="text-[11px] text-slate-400 leading-tight">
-            Tap &ldquo;Share&rdquo; in TikTok, YouTube or IG to auto-launch OmniDrop.
-          </p>
+        <div className="text-slate-400">
+          NET:{' '}
+          <span className="text-cyan-400 font-bold">
+            {serverLatency !== null ? `${serverLatency}ms` : '--'}
+          </span>
         </div>
       </div>
     </div>

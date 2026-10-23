@@ -1,1 +1,83 @@
 @import "tailwindcss";
+
+@layer utilities {
+  /* Subtle robotic machine grid background */
+  .bg-grid-machine {
+    background-size: 24px 24px;
+    background-image: 
+      linear-gradient(to right, rgba(0, 240, 255, 0.04) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(0, 240, 255, 0.04) 1px, transparent 1px);
+  }
+
+  /* Robotic machine panels */
+  .machine-surface {
+    background: linear-gradient(180deg, #0d121c 0%, #080b11 100%);
+    border: 1px solid rgba(0, 240, 255, 0.18);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  }
+
+  .machine-surface-subtle {
+    background: linear-gradient(180deg, #090e17 0%, #05080f 100%);
+    border: 1px solid rgba(0, 240, 255, 0.12);
+  }
+
+  /* Bevelled mechanical buttons with pressed tactile animation */
+  .machine-btn {
+    background: linear-gradient(180deg, #172133 0%, #0d1421 100%);
+    border: 1px solid rgba(0, 240, 255, 0.28);
+    box-shadow: 0 3px 0 #05080f, 0 5px 12px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+    transition: all 0.08s ease-in-out;
+    cursor: pointer;
+    user-select: none;
+  }
+  .machine-btn:active {
+    transform: translateY(2px);
+    box-shadow: 0 1px 0 #05080f, 0 2px 4px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  }
+
+  .machine-btn-primary {
+    background: linear-gradient(180deg, #00e5ff 0%, #0099bb 100%);
+    border: 1px solid #00f0ff;
+    box-shadow: 0 3px 0 #005063, 0 0 14px rgba(0, 240, 255, 0.45);
+    color: #030810;
+    font-weight: 700;
+    transition: all 0.08s ease-in-out;
+  }
+  .machine-btn-primary:active {
+    transform: translateY(2px);
+    box-shadow: 0 1px 0 #005063, 0 0 6px rgba(0, 240, 255, 0.5);
+  }
+
+  .machine-btn-danger {
+    background: linear-gradient(180deg, #3d1219 0%, #200a0e 100%);
+    border: 1px solid rgba(244, 63, 94, 0.4);
+    box-shadow: 0 3px 0 #120406, 0 4px 10px rgba(0, 0, 0, 0.5);
+    color: #fca5a5;
+  }
+  .machine-btn-danger:active {
+    transform: translateY(2px);
+    box-shadow: 0 1px 0 #120406;
+  }
+
+  /* LED Glows */
+  .led-cyan {
+    background-color: #00f0ff;
+    box-shadow: 0 0 8px #00f0ff, 0 0 2px #00f0ff;
+  }
+  .led-emerald {
+    background-color: #10b981;
+    box-shadow: 0 0 8px #10b981, 0 0 2px #10b981;
+  }
+  .led-amber {
+    background-color: #f59e0b;
+    box-shadow: 0 0 8px #f59e0b, 0 0 2px #f59e0b;
+  }
+  .led-rose {
+    background-color: #f43f5e;
+    box-shadow: 0 0 8px #f43f5e, 0 0 2px #f43f5e;
+  }
+  .led-off {
+    background-color: #27354a;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.8);
+  }
+}

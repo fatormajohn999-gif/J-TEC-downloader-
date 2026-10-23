@@ -1,4 +1,4 @@
-export type PlatformType = 'tiktok' | 'youtube' | 'instagram' | 'facebook' | 'video';
+export type PlatformType = 'tiktok' | 'youtube' | 'instagram' | 'facebook' | 'other' | string;
 
 export interface VideoInfo {
   title: string;
@@ -20,6 +20,8 @@ export interface VideoLibraryItem {
   durationMs: number;
   dateAdded: number;
   thumbnail: string;
+  sourceUrl?: string;
+  fileName?: string;
 }
 
 export interface DownloadHistoryItem {
@@ -44,4 +46,9 @@ export interface AppSettings {
   floatingBubbleEnabled: boolean;
   persistentNotificationEnabled: boolean;
   autoDetectClipboard: boolean;
+  autoDownloadOnPaste?: boolean;
+  autoPlayNext?: boolean;
+  repeatMode?: 'off' | 'one' | 'all';
+  floatingSide?: 'left' | 'right';
+  floatingShowMs?: boolean;
 }

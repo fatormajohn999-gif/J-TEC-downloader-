@@ -24,6 +24,10 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -35,6 +39,157 @@ class VideoDownloaderPlugin : Plugin() {
         var instance: VideoDownloaderPlugin? = null
         const val PREFS_NAME = "omnidrop_native_prefs"
         const val PREF_HISTORY_KEY = "native_download_history"
+        const val PREFS_METADATA_NAME = "omnidrop_video_metadata"
+        const val PREF_METADATA_MAP = "video_metadata_map"
+
+        // In-flight download lock keyed by normalized sourceUrl
+        val inFlightDownloads = ConcurrentHashMap<String, Boolean>()
+
+        fun normalizeUrl(rawUrl: String): String {
+            val trimmed = rawUrl.trim()
+            try {
+                val uri = Uri.parse(trimmed)
+                val host = uri.host?.lowercase() ?: return trimmed
+                val scheme = if (uri.scheme.isNullOrBlank()) "https" else uri.scheme
+
+                if (host.contains("youtube.com")) {
+                    val path = uri.path ?: ""
+                    if (path.contains("/watch")) {
+                        val v = uri.getQueryParameter("v")
+                        return if (!v.isNullOrBlank()) "$scheme://$host$path?v=$v" else "$scheme://$host$path"
+                    }
+                    return "$scheme://$host${path.trimEnd('/')}"
+                }
+                if (host == "youtu.be") {
+                    val path = (uri.path ?: "").trimEnd('/')
+                    return "$scheme://$host$path"
+                }
+                if (host.contains("tiktok.com")) {
+                    val path = (uri.path ?: "").trimEnd('/')
+                    return "$scheme://$host$path"
+                }
+                if (host.contains("instagram.com")) {
+                    val path = (uri.path ?: "").trimEnd('/')
+                    return "$scheme://$host$path"
+                }
+                if (host.contains("facebook.com") || host.contains("fb.watch")) {
+                    val path = uri.path ?: ""
+                    if (path.contains("/watch")) {
+                        val v = uri.getQueryParameter("v")
+                        if (!v.isNullOrBlank()) {
+                            return "$scheme://$host$path?v=$v"
+                        }
+                    }
+                    return "$scheme://$host${path.trimEnd('/')}"
+                }
+                return trimmed
+            } catch (_: Exception) {
+                return trimmed
+            }
+        }
+
+        fun detectPlatformName(url: String): String {
+            val lower = url.lowercase()
+            return when {
+                lower.contains("tiktok") -> "TikTok"
+                lower.contains("youtube") || lower.contains("youtu.be") -> "YouTube"
+                lower.contains("instagram") -> "Instagram"
+                lower.contains("facebook") || lower.contains("fb.watch") -> "Facebook"
+                else -> "Other"
+            }
+        }
+
+        fun cleanPlatformName(rawPlatform: String?, fallbackUrl: String): String {
+            val p = rawPlatform?.trim()?.lowercase() ?: ""
+            return when {
+                p.contains("tiktok") -> "TikTok"
+                p.contains("youtube") || p.contains("youtu") -> "YouTube"
+                p.contains("instagram") -> "Instagram"
+                p.contains("facebook") || p.contains("fb") -> "Facebook"
+                p.isNotBlank() && p != "video" && p != "other" -> {
+                    rawPlatform!!.trim().replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+                }
+                else -> {
+                    val guessed = detectPlatformName(fallbackUrl)
+                    if (guessed != "Other") guessed else "Other"
+                }
+            }
+        }
+
+        fun saveVideoMetadata(context: Context, fileName: String, entry: JSONObject) {
+            try {
+                val prefs = context.getSharedPreferences(PREFS_METADATA_NAME, Context.MODE_PRIVATE)
+                val jsonStr = prefs.getString(PREF_METADATA_MAP, "{}") ?: "{}"
+                val root = JSONObject(jsonStr)
+
+                // Evict if exceeding 500 items
+                if (root.length() >= 500) {
+                    val keys = root.keys()
+                    if (keys.hasNext()) {
+                        root.remove(keys.next())
+                    }
+                }
+
+                root.put(fileName, entry)
+                prefs.edit().apply {
+                    this.putString(PREF_METADATA_MAP, root.toString())
+                    this.apply()
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+
+        fun getMetadataForFileName(context: Context, fileName: String): JSONObject? {
+            try {
+                val prefs = context.getSharedPreferences(PREFS_METADATA_NAME, Context.MODE_PRIVATE)
+                val jsonStr = prefs.getString(PREF_METADATA_MAP, "{}") ?: "{}"
+                val root = JSONObject(jsonStr)
+                if (root.has(fileName)) {
+                    return root.getJSONObject(fileName)
+                }
+            } catch (_: Exception) {}
+            return null
+        }
+
+        fun getAllMetadata(context: Context): JSONObject {
+            try {
+                val prefs = context.getSharedPreferences(PREFS_METADATA_NAME, Context.MODE_PRIVATE)
+                val jsonStr = prefs.getString(PREF_METADATA_MAP, "{}") ?: "{}"
+                return JSONObject(jsonStr)
+            } catch (_: Exception) {
+                return JSONObject()
+            }
+        }
+
+        fun checkDuplicateDownload(context: Context, sourceUrl: String): JSONObject? {
+            val norm = normalizeUrl(sourceUrl)
+            try {
+                val all = getAllMetadata(context)
+                val keys = all.keys()
+                while (keys.hasNext()) {
+                    val fileName = keys.next()
+                    val item = all.getJSONObject(fileName)
+                    val itemUrl = normalizeUrl(item.optString("sourceUrl", item.optString("url", "")))
+                    if (itemUrl.isNotBlank() && itemUrl == norm) {
+                        val uriStr = item.optString("fileUri", "")
+                        if (uriStr.isNotBlank()) {
+                            try {
+                                val uri = Uri.parse(uriStr)
+                                val cursor = context.contentResolver.query(uri, arrayOf(MediaStore.Video.Media._ID), null, null, null)
+                                val exists = cursor?.use { it.count > 0 } ?: false
+                                if (exists) {
+                                    return item.apply {
+                                        this.put("fileName", fileName)
+                                    }
+                                }
+                            } catch (_: Exception) {}
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+            return null
+        }
 
         fun saveHistoryEntry(context: Context, entry: JSONObject) {
             try {
@@ -108,14 +263,16 @@ class VideoDownloaderPlugin : Plugin() {
         if (Intent.ACTION_SEND == action && type != null && "text/plain" == type) {
             val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)
             if (!sharedText.isNullOrBlank()) {
-                lastReceivedUrl = sharedText
-                notifyUrlReceived(sharedText)
+                val normalized = normalizeUrl(sharedText)
+                lastReceivedUrl = normalized
+                notifyUrlReceived(normalized)
             }
         } else if (intent.hasExtra("url_to_download")) {
             val url = intent.getStringExtra("url_to_download")
             if (!url.isNullOrBlank()) {
-                lastReceivedUrl = url
-                notifyUrlReceived(url)
+                val normalized = normalizeUrl(url)
+                lastReceivedUrl = normalized
+                notifyUrlReceived(normalized)
             }
         }
     }
@@ -128,19 +285,6 @@ class VideoDownloaderPlugin : Plugin() {
     }
 
     fun emitNativeDownloadFinished(entry: JSONObject) {
-        val jsObj = JSObject().apply {
-            this.put("id", entry.optString("id"))
-            this.put("url", entry.optString("url"))
-            this.put("title", entry.optString("title"))
-            this.put("thumbnail", entry.optString("thumbnail"))
-            this.put("uploader", entry.optString("uploader"))
-            this.put("platform", entry.optString("platform"))
-            this.put("quality", entry.optString("quality"))
-            this.put("savedAt", entry.optLong("savedAt"))
-            this.put("downloadedAt", entry.optLong("savedAt"))
-            this.put("fileName", entry.optString("fileName"))
-            this.put("fileUri", entry.optString("fileUri"))
-        }
         notifyListeners("nativeDownloadFinished", jsEntryFromObj(entry), true)
     }
 
@@ -158,6 +302,82 @@ class VideoDownloaderPlugin : Plugin() {
             this.put("fileName", entry.optString("fileName"))
             this.put("fileUri", entry.optString("fileUri"))
         }
+    }
+
+    @PluginMethod
+    fun checkDuplicate(call: PluginCall) {
+        val rawUrl = call.getString("url")
+        if (rawUrl.isNullOrBlank()) {
+            val ret = JSObject().apply { this.put("exists", false) }
+            call.resolve(ret)
+            return
+        }
+
+        Thread {
+            val dup = checkDuplicateDownload(context, rawUrl)
+            val res = JSObject().apply {
+                if (dup != null) {
+                    this.put("exists", true)
+                    this.put("uri", dup.optString("fileUri", ""))
+                    this.put("title", dup.optString("title", ""))
+                    this.put("fileName", dup.optString("fileName", ""))
+                } else {
+                    this.put("exists", false)
+                }
+            }
+            call.resolve(res)
+        }.start()
+    }
+
+    @PluginMethod
+    fun renameVideo(call: PluginCall) {
+        val uriStr = call.getString("uri")
+        val newTitle = call.getString("newTitle")?.trim() ?: ""
+        val newPlatform = call.getString("newPlatform")?.trim() ?: "Other"
+
+        if (uriStr.isNullOrBlank() || newTitle.isBlank()) {
+            call.reject("Missing required parameters: uri or newTitle")
+            return
+        }
+
+        Thread {
+            try {
+                val uri = Uri.parse(uriStr)
+                var fileName = ""
+                val cursor = context.contentResolver.query(uri, arrayOf(MediaStore.Video.Media.DISPLAY_NAME), null, null, null)
+                cursor?.use {
+                    if (it.moveToFirst()) {
+                        fileName = it.getString(it.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)) ?: ""
+                    }
+                }
+
+                val all = getAllMetadata(context)
+                val entry = if (fileName.isNotBlank() && all.has(fileName)) {
+                    all.getJSONObject(fileName)
+                } else {
+                    JSONObject().apply {
+                        this.put("fileName", fileName)
+                        this.put("fileUri", uriStr)
+                    }
+                }
+
+                entry.put("title", newTitle)
+                entry.put("platform", newPlatform)
+                entry.put("fileUri", uriStr)
+
+                val key = if (fileName.isNotBlank()) fileName else uriStr
+                saveVideoMetadata(context, key, entry)
+
+                val ret = JSObject().apply {
+                    this.put("success", true)
+                    this.put("title", newTitle)
+                    this.put("platform", newPlatform)
+                }
+                call.resolve(ret)
+            } catch (e: Exception) {
+                call.reject("Failed to rename video: ${e.message}")
+            }
+        }.start()
     }
 
     @PluginMethod
@@ -196,11 +416,29 @@ class VideoDownloaderPlugin : Plugin() {
     }
 
     @PluginMethod
+    fun clearMetadataCache(call: PluginCall) {
+        val prefs = context.getSharedPreferences(PREFS_METADATA_NAME, Context.MODE_PRIVATE)
+        prefs.edit().apply {
+            this.remove(PREF_METADATA_MAP)
+            this.apply()
+        }
+        val res = JSObject().apply {
+            this.put("cleared", true)
+        }
+        call.resolve(res)
+    }
+
+    @PluginMethod
     fun saveNativeSettings(call: PluginCall) {
         val backendUrl = call.getString("backendUrl") ?: ""
         val apiKey = call.getString("apiKey") ?: ""
         val defaultQuality = call.getString("defaultQuality") ?: "best"
         val autoDownload = call.getBoolean("autoDownload", true) ?: true
+        val autoDownloadOnPaste = call.getBoolean("autoDownloadOnPaste", false) ?: false
+        val autoPlayNext = call.getBoolean("autoPlayNext", true) ?: true
+        val repeatMode = call.getString("repeatMode") ?: "off"
+        val floatingSide = call.getString("floatingSide") ?: "right"
+        val floatingShowMs = call.getBoolean("floatingShowMs", true) ?: true
 
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().apply {
@@ -208,6 +446,11 @@ class VideoDownloaderPlugin : Plugin() {
             this.putString("api_key", apiKey)
             this.putString("default_quality", defaultQuality)
             this.putBoolean("auto_download", autoDownload)
+            this.putBoolean("auto_download_on_paste", autoDownloadOnPaste)
+            this.putBoolean("auto_play_next", autoPlayNext)
+            this.putString("repeat_mode", repeatMode)
+            this.putString("floating_side", floatingSide)
+            this.putBoolean("floating_show_ms", floatingShowMs)
             this.apply()
         }
 
@@ -331,6 +574,14 @@ class VideoDownloaderPlugin : Plugin() {
             return
         }
 
+        val normalizedUrl = normalizeUrl(videoUrl)
+
+        // In-flight download lock: prevent 2 concurrent downloads of the same link
+        if (inFlightDownloads.putIfAbsent(normalizedUrl, true) != null) {
+            call.reject("Download already in progress for this video link.")
+            return
+        }
+
         backendUrl = backendUrl.trim().removeSuffix("/")
         val endpoint = if (backendUrl.startsWith("http://") || backendUrl.startsWith("https://")) {
             "$backendUrl/download"
@@ -347,11 +598,11 @@ class VideoDownloaderPlugin : Plugin() {
             try {
                 reportProgress(10, "Fetching video details...")
 
-                // Step 1: Pre-fetch video metadata via /info for accurate history
+                // Step 1: Pre-fetch video metadata via POST /info
                 var finalTitle = rawTitle
                 var thumbnail = ""
                 var uploader = "Creator"
-                var platform = "video"
+                var platform = ""
 
                 try {
                     val infoEndpoint = if (backendUrl.startsWith("http://") || backendUrl.startsWith("https://")) {
@@ -370,7 +621,7 @@ class VideoDownloaderPlugin : Plugin() {
                         }
                     }
                     val iPayload = JSONObject().apply {
-                        this.put("url", videoUrl)
+                        this.put("url", normalizedUrl)
                     }
                     iConn.outputStream.use { os ->
                         os.write(iPayload.toString().toByteArray(Charsets.UTF_8))
@@ -384,11 +635,21 @@ class VideoDownloaderPlugin : Plugin() {
                         }
                         thumbnail = json.optString("thumbnail", "")
                         uploader = json.optString("uploader", "Creator")
-                        platform = json.optString("platform", "video")
+                        platform = json.optString("platform", "")
                     }
                     iConn.disconnect()
                 } catch (_: Exception) {
-                    // Fall back gracefully to provided title
+                    // Fall back gracefully
+                }
+
+                // Clean platform: never use "Video" as platform
+                val cleanPlatform = cleanPlatformName(platform, normalizedUrl)
+
+                // Fallback title if /info failed or had no title: "<platform> video - <date and time>"
+                val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
+                val dateStr = sdf.format(Date())
+                if (finalTitle.isBlank() || finalTitle.equals("video", ignoreCase = true) || finalTitle.startsWith("OmniDrop", ignoreCase = true)) {
+                    finalTitle = "$cleanPlatform video - $dateStr"
                 }
 
                 reportProgress(20, "Connecting to download server...")
@@ -396,11 +657,14 @@ class VideoDownloaderPlugin : Plugin() {
                 val isAudio = quality.equals("audio", ignoreCase = true)
                 val ext = if (isAudio) ".mp3" else ".mp4"
                 val mediaType = if (isAudio) "audio/mpeg" else "video/mp4"
-                val cleanTitle = finalTitle.replace("[\\\\/:*?\"<>|\\r\\n]".toRegex(), "_")
+
+                // Clean filename: remove forbidden characters (\ / : * ? " < > | \r \n), shorten to 80 chars
+                val cleanTitle = finalTitle
+                    .replace("[\\\\/:*?\"<>|\\r\\n]".toRegex(), "_")
+                    .replace("\\s+".toRegex(), " ")
                     .trim()
-                    .take(70)
-                    .ifBlank { "OmniDrop_video" }
-                val cleanPlatform = platform.replace("[^a-zA-Z0-9]".toRegex(), "").lowercase().ifBlank { "video" }
+                    .take(80)
+                    .ifBlank { "$cleanPlatform video - $dateStr" }
                 val fileName = "$cleanTitle [$cleanPlatform]$ext"
 
                 val urlObj = URL(endpoint)
@@ -418,7 +682,7 @@ class VideoDownloaderPlugin : Plugin() {
                 }
 
                 val jsonPayload = JSONObject().apply {
-                    this.put("url", videoUrl)
+                    this.put("url", normalizedUrl)
                     this.put("quality", quality)
                 }
                 connection.outputStream.use { os ->
@@ -506,7 +770,7 @@ class VideoDownloaderPlugin : Plugin() {
                         } else {
                             75
                         }
-                        val mb = String.format("%.1f", bytesCopied / (1024.0 * 1024.0))
+                        val mb = String.format(Locale.US, "%.1f", bytesCopied / (1024.0 * 1024.0))
                         reportProgress(pct, "Saving to gallery: $mb MB...")
                     }
                 }
@@ -528,14 +792,27 @@ class VideoDownloaderPlugin : Plugin() {
                     targetUri.toString()
                 )
 
+                // Save to SharedPreferences metadata store (keyed by fileName, up to 500)
+                val metaObj = JSONObject().apply {
+                    this.put("title", finalTitle)
+                    this.put("platform", cleanPlatform)
+                    this.put("uploader", uploader)
+                    this.put("thumbnailUrl", thumbnail)
+                    this.put("sourceUrl", normalizedUrl)
+                    this.put("downloadTime", System.currentTimeMillis())
+                    this.put("fileName", fileName)
+                    this.put("fileUri", targetUri.toString())
+                }
+                saveVideoMetadata(context, fileName, metaObj)
+
                 // Save to native history and notify listeners
                 val entryObj = JSONObject().apply {
                     this.put("id", "dl_" + System.currentTimeMillis())
-                    this.put("url", videoUrl)
+                    this.put("url", normalizedUrl)
                     this.put("title", finalTitle)
                     this.put("thumbnail", thumbnail)
                     this.put("uploader", uploader)
-                    this.put("platform", platform)
+                    this.put("platform", cleanPlatform)
                     this.put("quality", quality)
                     this.put("savedAt", System.currentTimeMillis())
                     this.put("fileName", fileName)
@@ -558,6 +835,7 @@ class VideoDownloaderPlugin : Plugin() {
                 }
                 call.reject("Native download error: ${e.message ?: "Unknown error"}")
             } finally {
+                inFlightDownloads.remove(normalizedUrl)
                 try { inputStream?.close() } catch (_: Exception) {}
                 try { outputStream?.close() } catch (_: Exception) {}
                 connection?.disconnect()
@@ -614,17 +892,17 @@ class VideoDownloaderPlugin : Plugin() {
     fun getVideoLibrary(call: PluginCall) {
         Thread {
             try {
-                val historyJsonStr = getHistoryJson(context)
-                val historyArray = JSONArray(historyJsonStr)
-                val historyByUri = HashMap<String, JSONObject>()
-                val historyByName = HashMap<String, JSONObject>()
+                val allMeta = getAllMetadata(context)
+                val metaByUri = HashMap<String, JSONObject>()
+                val metaByName = HashMap<String, JSONObject>()
 
-                for (i in 0 until historyArray.length()) {
-                    val item = historyArray.getJSONObject(i)
+                val keys = allMeta.keys()
+                while (keys.hasNext()) {
+                    val fn = keys.next()
+                    val item = allMeta.getJSONObject(fn)
                     val uri = item.optString("fileUri")
-                    val name = item.optString("fileName")
-                    if (uri.isNotBlank()) historyByUri[uri] = item
-                    if (name.isNotBlank()) historyByName[name] = item
+                    if (uri.isNotBlank()) metaByUri[uri] = item
+                    metaByName[fn] = item
                 }
 
                 val collectionUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -679,28 +957,50 @@ class VideoDownloaderPlugin : Plugin() {
                         val contentUri = ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, idVal)
                         val uriStr = contentUri.toString()
 
-                        val historyEntry = historyByUri[uriStr] ?: historyByName[displayName]
+                        val metaEntry = metaByUri[uriStr] ?: metaByName[displayName]
 
-                        val rawBaseName = displayName.substringBeforeLast(".")
-                        var platform = historyEntry?.optString("platform") ?: ""
+                        // Order of platform determination:
+                        // 1. Saved metadata
+                        var platform = metaEntry?.optString("platform", "")?.trim() ?: ""
+                        if (platform.equals("video", ignoreCase = true)) platform = ""
+
+                        // 2. [platform] tag in filename
                         if (platform.isBlank()) {
-                            val lower = displayName.lowercase()
-                            platform = when {
-                                lower.contains("tiktok") -> "tiktok"
-                                lower.contains("youtube") || lower.contains("youtu") -> "youtube"
-                                lower.contains("instagram") -> "instagram"
-                                lower.contains("facebook") || lower.contains("fb") -> "facebook"
-                                else -> "video"
+                            val tagMatch = "\\[([^\\]]+)\\]".toRegex().find(displayName)
+                            if (tagMatch != null) {
+                                val tag = tagMatch.groupValues[1].trim()
+                                if (!tag.equals("video", ignoreCase = true) && tag.isNotBlank()) {
+                                    platform = when (tag.lowercase()) {
+                                        "tiktok" -> "TikTok"
+                                        "youtube" -> "YouTube"
+                                        "instagram" -> "Instagram"
+                                        "facebook" -> "Facebook"
+                                        else -> tag
+                                    }
+                                }
                             }
                         }
 
-                        var title = historyEntry?.optString("title") ?: ""
+                        // 3. Guess from sourceUrl domain
+                        if (platform.isBlank()) {
+                            val sourceUrl = metaEntry?.optString("sourceUrl", "") ?: ""
+                            if (sourceUrl.isNotBlank()) {
+                                val guessed = detectPlatformName(sourceUrl)
+                                if (guessed != "Other") platform = guessed
+                            }
+                        }
+
+                        // 4. "Other"
+                        if (platform.isBlank() || platform.equals("video", ignoreCase = true)) {
+                            platform = "Other"
+                        }
+
+                        // Title resolution: saved metadata -> clean filename
+                        var title = metaEntry?.optString("title", "")?.trim() ?: ""
                         if (title.isBlank()) {
-                            val clean = rawBaseName.replace("\\[$platform\\]".toRegex(RegexOption.IGNORE_CASE), "")
-                                .replace("\\[[^\\]]+\\]".toRegex(), "")
-                                .replace("_", " ")
-                                .trim()
-                            title = if (clean.isNotBlank()) clean else rawBaseName
+                            val base = displayName.substringBeforeLast(".")
+                            val clean = base.replace("\\[[^\\]]+\\]".toRegex(), "").replace("_", " ").trim()
+                            title = if (clean.isNotBlank()) clean else displayName
                         }
 
                         var thumbBase64 = ""
@@ -714,8 +1014,8 @@ class VideoDownloaderPlugin : Plugin() {
                             }
                         } catch (_: Exception) {}
 
-                        if (thumbBase64.isBlank() && historyEntry != null) {
-                            thumbBase64 = historyEntry.optString("thumbnail", "")
+                        if (thumbBase64.isBlank() && metaEntry != null) {
+                            thumbBase64 = metaEntry.optString("thumbnailUrl", metaEntry.optString("thumbnail", ""))
                         }
 
                         val vObj = JSObject().apply {
@@ -727,6 +1027,10 @@ class VideoDownloaderPlugin : Plugin() {
                             this.put("durationMs", durationMs)
                             this.put("dateAdded", dateAddedMs)
                             this.put("thumbnail", thumbBase64)
+                            this.put("fileName", displayName)
+                            if (metaEntry != null) {
+                                this.put("sourceUrl", metaEntry.optString("sourceUrl", ""))
+                            }
                         }
                         videosArray.put(vObj)
                     }

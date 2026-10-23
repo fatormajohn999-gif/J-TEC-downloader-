@@ -9,8 +9,13 @@ import {
   RefreshCw,
   Clock,
   ShieldAlert,
-  FolderOpen,
   Sparkles,
+  CopyCheck,
+  Edit3,
+  Layers,
+  Check,
+  X,
+  MoreVertical,
 } from 'lucide-react';
 import { VideoLibraryItem, PlatformType } from '../types';
 import { VideoDownloader } from '../plugins/videoDownloader';
@@ -29,8 +34,32 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
   const [selectedPlatform, setSelectedPlatform] = useState<string>('all');
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
 
-  // Check permission and load videos from MediaStore
+  // Duplicates modal state
+  const [duplicateModalOpen, setDuplicateModalOpen] = useState(false);
+  const [duplicateGroups, setDuplicateGroups] = useState<{
+    key: string;
+    videos: VideoLibraryItem[];
+    keepVideo: VideoLibraryItem;
+    extraVideos: VideoLibraryItem[];
+  }[]>([]);
+  const [isDeletingDuplicates, setIsDeletingDuplicates] = useState(false);
+
+  // Rename modal state
+  const [renameModalVideo, setRenameModalVideo] = useState<VideoLibraryItem | null>(null);
+  const [newTitle, setNewTitle] = useState('');
+  const [newPlatform, setNewPlatform] = useState<string>('Other');
+  const [isRenaming, setIsRenaming] = useState(false);
+
+  // Close 3-dot menu when clicking outside
+  useEffect(() => {
+    const handleGlobalClick = () => setActiveMenuId(null);
+    window.addEventListener('click', handleGlobalClick);
+    return () => window.removeEventListener('click', handleGlobalClick);
+  }, []);
+
+  // Load videos from MediaStore
   const loadLibrary = useCallback(async () => {
     setIsLoading(true);
     try {
@@ -56,25 +85,19 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
     }
   }, [isNative]);
 
-  // Request permission
   const handleRequestPermission = async () => {
     try {
       await VideoDownloader.requestVideoPermission();
-      // Re-check after prompt
-      setTimeout(() => {
-        loadLibrary();
-      }, 500);
+      setTimeout(loadLibrary, 500);
     } catch (e) {
       console.error(e);
     }
   };
 
-  // Initial load
   useEffect(() => {
     loadLibrary();
   }, [loadLibrary, onRefreshTrigger]);
 
-  // Listen to foreground/visibility events
   useEffect(() => {
     const handleFocus = () => loadLibrary();
     const handleVisibility = () => {
@@ -88,7 +111,6 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
     };
   }, [loadLibrary]);
 
-  // Listen to nativeDownloadFinished
   useEffect(() => {
     let handle: any = null;
     (async () => {
@@ -103,7 +125,6 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
     };
   }, [loadLibrary]);
 
-  // Actions
   const handlePlay = async (video: VideoLibraryItem) => {
     try {
       await VideoDownloader.playVideo({
@@ -139,42 +160,140 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
     }
   };
 
-  // Filtering
-  const platforms = [
-    { id: 'all', label: 'All' },
-    { id: 'tiktok', label: 'TikTok' },
-    { id: 'youtube', label: 'YouTube' },
-    { id: 'instagram', label: 'Instagram' },
-    { id: 'facebook', label: 'Facebook' },
-  ];
+  const handleFindDuplicates = () => {
+    const map = new Map<string, VideoLibraryItem[]>();
+    for (const v of videos) {
+      if (v.size > 0) {
+        const durSec = Math.round((v.durationMs || 0) / 1000);
+        const groupKey = `${v.size}_${durSec}`;
+        const list = map.get(groupKey) || [];
+        list.push(v);
+        map.set(groupKey, list);
+      }
+    }
+
+    const groups: {
+      key: string;
+      videos: VideoLibraryItem[];
+      keepVideo: VideoLibraryItem;
+      extraVideos: VideoLibraryItem[];
+    }[] = [];
+
+    for (const [key, list] of map.entries()) {
+      if (list.length > 1) {
+        const sorted = [...list].sort((a, b) => (a.dateAdded || 0) - (b.dateAdded || 0));
+        groups.push({
+          key,
+          videos: sorted,
+          keepVideo: sorted[0],
+          extraVideos: sorted.slice(1),
+        });
+      }
+    }
+
+    setDuplicateGroups(groups);
+    setDuplicateModalOpen(true);
+  };
+
+  const handleDeleteDuplicates = async () => {
+    setIsDeletingDuplicates(true);
+    try {
+      const extraVideos = duplicateGroups.flatMap((g) => g.extraVideos);
+      for (const v of extraVideos) {
+        await VideoDownloader.deleteVideo({ uri: v.uri });
+      }
+      const removedUris = new Set(extraVideos.map((v) => v.uri));
+      setVideos((prev) => prev.filter((v) => !removedUris.has(v.uri)));
+      setDuplicateModalOpen(false);
+      setDuplicateGroups([]);
+    } catch (e) {
+      alert('Error deleting duplicate copies: ' + e);
+    } finally {
+      setIsDeletingDuplicates(false);
+    }
+  };
+
+  const handleOpenRename = (video: VideoLibraryItem) => {
+    setRenameModalVideo(video);
+    setNewTitle(video.title);
+    setNewPlatform(video.platform || 'Other');
+    setActiveMenuId(null);
+  };
+
+  const handleSaveRename = async () => {
+    if (!renameModalVideo) return;
+    const trimmedTitle = newTitle.trim();
+    if (!trimmedTitle) return;
+
+    setIsRenaming(true);
+    try {
+      const res = await VideoDownloader.renameVideo({
+        uri: renameModalVideo.uri,
+        newTitle: trimmedTitle,
+        newPlatform: newPlatform || 'Other',
+      });
+      if (res && res.success) {
+        setVideos((prev) =>
+          prev.map((v) =>
+            v.uri === renameModalVideo.uri
+              ? { ...v, title: res.title || trimmedTitle, platform: (res.platform || newPlatform) as PlatformType }
+              : v
+          )
+        );
+      }
+      setRenameModalVideo(null);
+    } catch (e) {
+      alert('Failed to rename video: ' + e);
+    } finally {
+      setIsRenaming(false);
+    }
+  };
 
   const filteredVideos = useMemo(() => {
     return videos.filter((v) => {
       const matchSearch =
         searchQuery.trim() === '' ||
         v.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        v.platform.toLowerCase().includes(searchQuery.toLowerCase());
+        (v.platform && v.platform.toLowerCase().includes(searchQuery.toLowerCase()));
+
       const matchPlatform =
-        selectedPlatform === 'all' || v.platform.toLowerCase() === selectedPlatform.toLowerCase();
+        selectedPlatform === 'all' ||
+        (v.platform && v.platform.toLowerCase() === selectedPlatform.toLowerCase()) ||
+        (selectedPlatform === 'other' &&
+          (!v.platform ||
+            !['tiktok', 'youtube', 'instagram', 'facebook'].includes(v.platform.toLowerCase())));
+
       return matchSearch && matchPlatform;
     });
   }, [videos, searchQuery, selectedPlatform]);
 
-  // Stats
   const totalSizeBytes = useMemo(() => {
     return videos.reduce((acc, v) => acc + (v.size || 0), 0);
   }, [videos]);
 
+  const platforms = [
+    { id: 'all', label: 'ALL' },
+    { id: 'tiktok', label: 'TIKTOK' },
+    { id: 'youtube', label: 'YOUTUBE' },
+    { id: 'instagram', label: 'INSTAGRAM' },
+    { id: 'facebook', label: 'FACEBOOK' },
+    { id: 'other', label: 'OTHER' },
+  ];
+
   const formatSize = (bytes: number) => {
-    if (!bytes || bytes <= 0) return '0 MB';
-    if (bytes >= 1024 * 1024 * 1024) {
-      return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+    if (!bytes) return '0 B';
+    const mb = bytes / (1024 * 1024);
+    if (mb < 1) {
+      return `${(bytes / 1024).toFixed(1)} KB`;
     }
-    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    if (mb >= 1024) {
+      return `${(mb / 1024).toFixed(2)} GB`;
+    }
+    return `${mb.toFixed(1)} MB`;
   };
 
   const formatDuration = (ms: number) => {
-    if (!ms || ms <= 0) return '--:--';
+    if (!ms) return '0:00';
     const totalSecs = Math.floor(ms / 1000);
     const mins = Math.floor(totalSecs / 60);
     const secs = totalSecs % 60;
@@ -190,119 +309,129 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
     });
   };
 
+  // Colored Platform Chips as specified:
+  // TikTok cyan/pink, YouTube red, Instagram purple/orange, Facebook blue, Other gray
   const getPlatformBadgeStyle = (platform: PlatformType | string) => {
-    const p = platform.toLowerCase();
+    const p = (platform || 'other').toLowerCase();
     switch (p) {
       case 'tiktok':
-        return 'bg-pink-950/60 text-pink-300 border-pink-800/60';
+        return 'bg-gradient-to-r from-cyan-950 to-pink-950 text-cyan-300 border-cyan-400/60 shadow-[0_0_8px_rgba(0,240,255,0.25)]';
       case 'youtube':
-        return 'bg-red-950/60 text-red-300 border-red-800/60';
+        return 'bg-red-950 text-red-400 border-red-600/70 shadow-[0_0_8px_rgba(239,68,68,0.25)]';
       case 'instagram':
-        return 'bg-purple-950/60 text-purple-300 border-purple-800/60';
+        return 'bg-gradient-to-r from-purple-950 to-amber-950 text-purple-300 border-purple-500/60 shadow-[0_0_8px_rgba(168,85,247,0.25)]';
       case 'facebook':
-        return 'bg-blue-950/60 text-blue-300 border-blue-800/60';
+        return 'bg-blue-950 text-blue-400 border-blue-500/70 shadow-[0_0_8px_rgba(59,130,246,0.25)]';
       default:
-        return 'bg-slate-800 text-slate-300 border-slate-700';
+        return 'bg-slate-900 text-slate-400 border-slate-700';
     }
   };
 
+  const totalExtraDuplicates = useMemo(() => {
+    return duplicateGroups.reduce((acc, g) => acc + g.extraVideos.length, 0);
+  }, [duplicateGroups]);
+
   return (
     <div className="space-y-4 pb-28">
-      {/* Web Fallback Notice */}
+      {/* Web Notice if in browser */}
       {!isNative && (
-        <div className="p-3.5 rounded-2xl bg-indigo-950/40 border border-indigo-800/60 flex items-center gap-3">
-          <div className="w-9 h-9 rounded-xl bg-indigo-900/60 border border-indigo-700/60 flex items-center justify-center shrink-0 text-indigo-300">
-            <Sparkles className="w-5 h-5" />
-          </div>
-          <div className="flex-1 min-w-0">
-            <h3 className="text-xs font-bold text-white">Browser Preview Mode</h3>
-            <p className="text-[11px] text-indigo-300/80">
-              Your video library is available in the Android app (synced directly with Movies/OmniDrop).
-            </p>
-          </div>
+        <div className="machine-surface p-3 rounded-xl flex items-center gap-2.5 text-xs text-slate-300">
+          <Sparkles className="w-4 h-4 text-cyan-400 shrink-0" />
+          <span>Your video library is available in the Android app (synced directly with Movies/OmniDrop).</span>
         </div>
       )}
 
       {/* Permission Missing State */}
       {isNative && hasPermission === false && (
-        <div className="p-6 rounded-2xl bg-slate-900/90 border border-amber-900/50 text-center space-y-4 shadow-xl">
-          <div className="w-14 h-14 mx-auto rounded-2xl bg-amber-950/60 border border-amber-700/60 flex items-center justify-center text-amber-400">
+        <div className="machine-surface p-6 rounded-xl text-center space-y-4">
+          <div className="w-14 h-14 mx-auto rounded-xl bg-amber-950/60 border border-amber-500/50 flex items-center justify-center text-amber-400">
             <ShieldAlert className="w-7 h-7" />
           </div>
           <div className="space-y-1">
-            <h3 className="text-sm font-bold text-white">Video Permission Required</h3>
-            <p className="text-xs text-slate-400 max-w-xs mx-auto">
-              OmniDrop needs permission to access and play videos saved in your phone&apos;s Movies/OmniDrop folder.
+            <h3 className="font-mono text-sm font-bold text-white uppercase">
+              PERMISSION REQUIRED // READ_MEDIA_VIDEO
+            </h3>
+            <p className="text-xs text-slate-400 max-w-xs mx-auto font-sans">
+              OmniDrop requires permission to query and play video files stored in Movies/OmniDrop.
             </p>
           </div>
           <button
             onClick={handleRequestPermission}
-            className="w-full py-2.5 px-4 rounded-xl bg-cyan-600 hover:bg-cyan-500 active:scale-95 font-semibold text-xs text-slate-950 transition shadow-[0_0_15px_rgba(0,240,255,0.4)]"
+            className="machine-btn-primary w-full py-2.5 rounded-lg font-mono text-xs uppercase"
           >
-            Allow Access to My Videos
+            ALLOW ACCESS TO MY VIDEOS
           </button>
         </div>
       )}
 
-      {/* Header Info & Stats */}
+      {/* Header Info & Stats in Machine Style */}
       <div className="flex items-center justify-between pt-1">
         <div>
-          <h2 className="text-base font-bold text-white flex items-center gap-2 tracking-wide font-mono">
-            <Film className="w-4 h-4 text-cyan-400" />
+          <h2 className="text-xs font-mono font-bold text-cyan-400 uppercase tracking-widest flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full led-cyan" />
             VIDEOS // LIBRARY
           </h2>
-          <p className="text-xs text-slate-400 flex items-center gap-2 mt-0.5">
-            <span>{videos.length} {videos.length === 1 ? 'video' : 'videos'}</span>
-            <span className="w-1 h-1 rounded-full bg-slate-700" />
-            <span className="flex items-center gap-1 font-mono text-[11px] text-cyan-400">
-              <HardDrive className="w-3 h-3" />
-              {formatSize(totalSizeBytes)}
-            </span>
-          </p>
+          <div className="flex items-center gap-2 mt-0.5 font-mono text-xs text-slate-400">
+            <span>{videos.length} {videos.length === 1 ? 'CLIP' : 'CLIPS'}</span>
+            <span>•</span>
+            <span className="text-cyan-300 font-bold">{formatSize(totalSizeBytes)}</span>
+          </div>
         </div>
 
-        <button
-          onClick={loadLibrary}
-          disabled={isLoading}
-          className="p-2 rounded-xl bg-slate-900 border border-slate-800 text-slate-400 hover:text-cyan-400 transition active:scale-95 disabled:opacity-50"
-          title="Refresh library"
-        >
-          <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin text-cyan-400' : ''}`} />
-        </button>
+        <div className="flex items-center gap-2">
+          {/* Find Duplicates Button */}
+          <button
+            onClick={handleFindDuplicates}
+            className="machine-btn px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-mono text-cyan-300"
+            title="Find duplicate video files"
+          >
+            <CopyCheck className="w-3.5 h-3.5 text-cyan-400" />
+            <span>FIND DUPLICATES</span>
+          </button>
+
+          <button
+            onClick={loadLibrary}
+            disabled={isLoading}
+            className="machine-btn p-2 rounded-lg text-slate-400 hover:text-cyan-300 disabled:opacity-50"
+            title="Refresh library"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin text-cyan-400' : ''}`} />
+          </button>
+        </div>
       </div>
 
-      {/* Search Input */}
+      {/* Search Input in Machine Style */}
       <div className="relative">
-        <Search className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
+        <Search className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
         <input
           type="text"
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
-          placeholder="Search videos by title or platform..."
-          className="w-full pl-10 pr-4 py-2 text-xs rounded-xl bg-slate-900 border border-slate-800 text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500/80 focus:ring-1 focus:ring-cyan-500/50 transition font-sans"
+          placeholder="SEARCH VIDEOS OR PLATFORM..."
+          className="w-full pl-9 pr-8 py-2 rounded-lg bg-slate-950 border border-slate-800 focus:border-cyan-400 font-mono text-xs text-white placeholder-slate-600 outline-none uppercase"
         />
         {searchQuery && (
           <button
             onClick={() => setSearchQuery('')}
-            className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-500 hover:text-slate-300"
+            className="absolute right-2.5 top-1/2 -translate-y-1/2 font-mono text-xs text-slate-500 hover:text-white"
           >
             ✕
           </button>
         )}
       </div>
 
-      {/* Platform Filter Chips */}
-      <div className="flex items-center gap-1.5 overflow-x-auto pb-1 no-scrollbar text-xs">
+      {/* Platform Filter Buttons */}
+      <div className="flex items-center gap-1 overflow-x-auto pb-1 no-scrollbar text-xs">
         {platforms.map((p) => {
           const isActive = selectedPlatform === p.id;
           return (
             <button
               key={p.id}
               onClick={() => setSelectedPlatform(p.id)}
-              className={`px-3 py-1.5 rounded-lg border font-mono text-[11px] transition-all whitespace-nowrap active:scale-95 ${
+              className={`px-2.5 py-1 rounded-md font-mono text-[11px] whitespace-nowrap transition-all ${
                 isActive
-                  ? 'bg-cyan-950/80 text-cyan-300 border-cyan-500/70 shadow-[0_0_10px_rgba(0,240,255,0.2)] font-semibold'
-                  : 'bg-slate-900/90 text-slate-400 border-slate-800 hover:text-slate-200 hover:border-slate-700'
+                  ? 'machine-btn-primary text-slate-950 shadow-[0_0_8px_rgba(0,240,255,0.4)]'
+                  : 'machine-btn text-slate-400 hover:text-slate-200'
               }`}
             >
               {p.label}
@@ -313,36 +442,36 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
 
       {/* Loading Skeleton */}
       {isLoading && videos.length === 0 && (
-        <div className="space-y-3">
+        <div className="space-y-2.5">
           {[1, 2, 3].map((i) => (
             <div
               key={i}
-              className="p-3 rounded-2xl bg-slate-900/50 border border-slate-800 animate-pulse flex gap-3 items-center"
+              className="machine-surface p-3 rounded-xl animate-pulse flex gap-3 items-center"
             >
-              <div className="w-24 h-16 rounded-xl bg-slate-800/80 shrink-0" />
+              <div className="w-20 h-14 rounded-lg bg-slate-950 border border-slate-800 shrink-0" />
               <div className="flex-1 space-y-2">
-                <div className="h-3.5 bg-slate-800 rounded w-3/4" />
-                <div className="h-3 bg-slate-800/60 rounded w-1/2" />
+                <div className="h-3 bg-slate-800 rounded w-3/4" />
+                <div className="h-2.5 bg-slate-800/60 rounded w-1/3" />
               </div>
             </div>
           ))}
         </div>
       )}
 
-      {/* Empty State */}
+      {/* Machine Empty State */}
       {!isLoading && filteredVideos.length === 0 && (
-        <div className="p-8 text-center rounded-2xl bg-slate-900/60 border border-slate-800/80 space-y-3">
-          <div className="w-14 h-14 mx-auto rounded-2xl bg-slate-800/80 border border-slate-700/60 flex items-center justify-center text-slate-500">
-            <Film className="w-7 h-7 text-cyan-500/60" />
+        <div className="machine-surface p-8 text-center rounded-xl space-y-3">
+          <div className="w-14 h-14 mx-auto rounded-xl bg-slate-950 border border-cyan-500/30 flex items-center justify-center text-cyan-400 shadow-[0_0_15px_rgba(0,240,255,0.2)]">
+            <Film className="w-7 h-7" />
           </div>
           <div className="space-y-1">
-            <h3 className="text-sm font-semibold text-slate-200">
-              {searchQuery || selectedPlatform !== 'all' ? 'No matching videos' : 'No videos found in library'}
+            <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
+              {searchQuery || selectedPlatform !== 'all' ? 'NO MATCHING CLIPS' : 'LIBRARY VOID // NO RECORDED STREAMS'}
             </h3>
-            <p className="text-xs text-slate-400 max-w-xs mx-auto">
+            <p className="text-xs text-slate-400 max-w-xs mx-auto font-sans leading-relaxed">
               {searchQuery || selectedPlatform !== 'all'
-                ? 'Try adjusting your search or platform filter.'
-                : 'Videos downloaded with OmniDrop will automatically appear here and in your phone gallery (Movies/OmniDrop).'}
+                ? 'Adjust your search string or platform filter.'
+                : 'Videos downloaded with OmniDrop will automatically appear here and stay in Movies/OmniDrop.'}
             </p>
           </div>
         </div>
@@ -353,13 +482,13 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
         {filteredVideos.map((video) => (
           <div
             key={video.id || video.uri}
-            className="group relative p-3 rounded-2xl bg-slate-900/90 border border-slate-800 hover:border-cyan-500/40 transition-all duration-200 flex flex-col gap-2.5 shadow-lg"
+            className="machine-surface group relative p-3 rounded-xl flex flex-col gap-2.5 transition-all duration-150"
           >
             <div className="flex gap-3 items-center">
-              {/* Thumbnail with Play Overlay */}
+              {/* Thumbnail with Play Key */}
               <button
                 onClick={() => handlePlay(video)}
-                className="relative w-24 h-16 rounded-xl overflow-hidden bg-slate-950 shrink-0 border border-slate-800 group-hover:border-cyan-500/50 transition-colors text-left"
+                className="relative w-22 h-15 rounded-lg overflow-hidden bg-slate-950 shrink-0 border border-slate-800 group-hover:border-cyan-400/60 transition-colors text-left"
               >
                 {video.thumbnail ? (
                   <img
@@ -374,16 +503,15 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
                   </div>
                 )}
 
-                {/* Dark Vignette & Play Icon */}
+                {/* Dark Vignette & Play */}
                 <div className="absolute inset-0 bg-black/40 flex items-center justify-center group-hover:bg-black/20 transition-all">
-                  <div className="w-8 h-8 rounded-full bg-cyan-500/90 text-slate-950 flex items-center justify-center shadow-lg transition-transform group-hover:scale-110">
-                    <Play className="w-4 h-4 fill-slate-950 translate-x-0.5" />
+                  <div className="w-7 h-7 rounded-full bg-cyan-400 text-slate-950 flex items-center justify-center shadow-[0_0_8px_rgba(0,240,255,0.7)]">
+                    <Play className="w-3.5 h-3.5 fill-slate-950 translate-x-0.5" />
                   </div>
                 </div>
 
-                {/* Duration Overlay */}
                 {video.durationMs > 0 && (
-                  <span className="absolute bottom-1 right-1 px-1.5 py-0.5 rounded bg-black/80 font-mono text-[9px] text-white tracking-wider">
+                  <span className="absolute bottom-1 right-1 px-1 py-0.2 rounded bg-black/80 font-mono text-[9px] text-white">
                     {formatDuration(video.durationMs)}
                   </span>
                 )}
@@ -393,7 +521,7 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
               <div className="flex-1 min-w-0 pr-1">
                 <h4
                   onClick={() => handlePlay(video)}
-                  className="text-xs font-semibold text-white truncate cursor-pointer hover:text-cyan-300 transition"
+                  className="font-mono text-xs font-bold text-white truncate cursor-pointer hover:text-cyan-300 transition"
                   title={video.title}
                 >
                   {video.title}
@@ -401,11 +529,11 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
 
                 <div className="flex items-center gap-2 mt-1.5 flex-wrap">
                   <span
-                    className={`capitalize px-2 py-0.5 rounded border text-[10px] font-mono tracking-wide ${getPlatformBadgeStyle(
+                    className={`uppercase px-1.5 py-0.2 rounded border text-[10px] font-mono tracking-wider font-bold ${getPlatformBadgeStyle(
                       video.platform
                     )}`}
                   >
-                    {video.platform}
+                    {video.platform || 'Other'}
                   </span>
 
                   <span className="font-mono text-[11px] text-slate-400">
@@ -413,7 +541,7 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
                   </span>
 
                   {video.dateAdded > 0 && (
-                    <span className="flex items-center gap-1 text-[11px] text-slate-500">
+                    <span className="flex items-center gap-1 font-mono text-[10px] text-slate-500">
                       <Clock className="w-3 h-3" />
                       {formatDate(video.dateAdded)}
                     </span>
@@ -422,56 +550,253 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
               </div>
             </div>
 
-            {/* Bottom Actions Row */}
+            {/* Bottom Row: Play Button & 3-Dot Menu */}
             <div className="flex items-center justify-between pt-2 border-t border-slate-800/80">
               <button
                 onClick={() => handlePlay(video)}
-                className="flex items-center gap-1.5 text-xs font-mono font-semibold text-cyan-400 hover:text-cyan-300 px-3 py-1 rounded-lg bg-cyan-950/40 border border-cyan-800/40 transition active:scale-95"
+                className="machine-btn px-3 py-1 rounded-md text-xs font-mono font-bold text-cyan-300 flex items-center gap-1.5"
               >
-                <Play className="w-3.5 h-3.5 fill-cyan-400" />
-                PLAY
+                <Play className="w-3 h-3 fill-cyan-400" />
+                <span>PLAY</span>
               </button>
 
-              <div className="flex items-center gap-1.5">
+              <div className="relative">
+                {/* 3-Dot Trigger */}
                 <button
-                  onClick={() => handleShare(video)}
-                  className="flex items-center gap-1 text-xs text-slate-400 hover:text-white px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 transition active:scale-95"
-                  title="Share video"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setActiveMenuId(activeMenuId === video.uri ? null : video.uri);
+                  }}
+                  className="machine-btn p-1.5 rounded-md text-slate-400 hover:text-cyan-300"
+                  title="Card options"
                 >
-                  <Share2 className="w-3.5 h-3.5" />
-                  <span className="text-[11px]">Share</span>
+                  <MoreVertical className="w-3.5 h-3.5" />
                 </button>
 
-                {deleteConfirmId === video.uri ? (
-                  <div className="flex items-center gap-1">
+                {/* 3-Dot Dropdown Menu (Rename, Share, Delete) */}
+                {activeMenuId === video.uri && (
+                  <div
+                    onClick={(e) => e.stopPropagation()}
+                    className="absolute right-0 bottom-full mb-1 w-36 rounded-lg bg-slate-950 border border-cyan-500/40 shadow-2xl p-1 z-30 font-mono text-xs space-y-0.5 animate-fade-in"
+                  >
                     <button
-                      onClick={() => handleDelete(video)}
-                      disabled={isDeleting}
-                      className="px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-[11px] font-bold transition active:scale-95 disabled:opacity-50"
+                      onClick={() => handleOpenRename(video)}
+                      className="w-full px-2.5 py-1.5 rounded flex items-center gap-2 text-slate-300 hover:bg-slate-800 hover:text-cyan-300 text-left"
                     >
-                      Confirm
+                      <Edit3 className="w-3.5 h-3.5 text-cyan-400" />
+                      <span>Rename</span>
                     </button>
                     <button
-                      onClick={() => setDeleteConfirmId(null)}
-                      className="px-2 py-1 rounded-lg bg-slate-800 text-slate-300 text-[11px] transition"
+                      onClick={() => {
+                        setActiveMenuId(null);
+                        handleShare(video);
+                      }}
+                      className="w-full px-2.5 py-1.5 rounded flex items-center gap-2 text-slate-300 hover:bg-slate-800 hover:text-cyan-300 text-left"
                     >
-                      Cancel
+                      <Share2 className="w-3.5 h-3.5 text-cyan-400" />
+                      <span>Share</span>
+                    </button>
+                    <button
+                      onClick={() => {
+                        setActiveMenuId(null);
+                        setDeleteConfirmId(video.uri);
+                      }}
+                      className="w-full px-2.5 py-1.5 rounded flex items-center gap-2 text-rose-400 hover:bg-rose-950/50 text-left"
+                    >
+                      <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                      <span>Delete</span>
                     </button>
                   </div>
-                ) : (
-                  <button
-                    onClick={() => setDeleteConfirmId(video.uri)}
-                    className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-950/30 transition active:scale-95"
-                    title="Delete video"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
                 )}
               </div>
             </div>
+
+            {/* In-place Delete Confirmation */}
+            {deleteConfirmId === video.uri && (
+              <div className="p-2 rounded-lg bg-rose-950/60 border border-rose-500/50 flex items-center justify-between font-mono text-xs animate-fade-in">
+                <span className="text-rose-200">Confirm file deletion?</span>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={() => handleDelete(video)}
+                    disabled={isDeleting}
+                    className="px-2.5 py-1 rounded bg-rose-600 hover:bg-rose-500 text-white font-bold disabled:opacity-50"
+                  >
+                    DELETE
+                  </button>
+                  <button
+                    onClick={() => setDeleteConfirmId(null)}
+                    className="px-2 py-1 rounded bg-slate-800 text-slate-300"
+                  >
+                    CANCEL
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         ))}
       </div>
+
+      {/* Find Duplicates Modal */}
+      {duplicateModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="machine-surface w-full max-w-md max-h-[85vh] flex flex-col rounded-xl shadow-2xl">
+            <div className="p-3.5 border-b border-cyan-500/20 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Layers className="w-4 h-4 text-cyan-400" />
+                <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
+                  DUPLICATE SCANNER // AUDIT
+                </h3>
+              </div>
+              <button
+                onClick={() => setDuplicateModalOpen(false)}
+                className="text-slate-400 hover:text-white p-1"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-4 overflow-y-auto space-y-3.5 flex-1 font-mono text-xs">
+              {duplicateGroups.length === 0 ? (
+                <div className="text-center py-8 space-y-2">
+                  <div className="w-12 h-12 mx-auto rounded-full bg-emerald-950 border border-emerald-500/50 flex items-center justify-center text-emerald-400">
+                    <Check className="w-6 h-6" />
+                  </div>
+                  <h4 className="font-mono text-xs font-bold text-white uppercase">
+                    NO DUPLICATES DETECTED
+                  </h4>
+                  <p className="text-slate-400 max-w-xs mx-auto font-sans">
+                    All video files in your library have unique sizes and durations.
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <div className="p-3 rounded-lg bg-cyan-950/60 border border-cyan-500/40 text-cyan-300">
+                    Found <strong>{duplicateGroups.length}</strong> duplicate sets ({totalExtraDuplicates} redundant copies).
+                    Oldest original copies will be preserved.
+                  </div>
+
+                  <div className="space-y-3">
+                    {duplicateGroups.map((group, idx) => (
+                      <div
+                        key={idx}
+                        className="p-3 rounded-lg bg-slate-950 border border-slate-800 space-y-2"
+                      >
+                        <div className="flex justify-between text-slate-400 text-[11px]">
+                          <span>Group #{idx + 1}</span>
+                          <span>
+                            {formatSize(group.keepVideo.size)} • {formatDuration(group.keepVideo.durationMs)}
+                          </span>
+                        </div>
+
+                        <div className="p-2 rounded bg-emerald-950/30 border border-emerald-600/30 text-emerald-300 text-[11px] truncate">
+                          [KEEP OLDEST] {group.keepVideo.title}
+                        </div>
+
+                        {group.extraVideos.map((extra, eIdx) => (
+                          <div
+                            key={eIdx}
+                            className="p-2 rounded bg-rose-950/30 border border-rose-600/30 text-rose-300 text-[11px] truncate"
+                          >
+                            [PURGE EXTRA] {extra.title}
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+
+            {duplicateGroups.length > 0 && (
+              <div className="p-3.5 border-t border-slate-800 flex items-center justify-end gap-2">
+                <button
+                  onClick={() => setDuplicateModalOpen(false)}
+                  className="machine-btn px-3 py-1.5 rounded-lg font-mono text-xs text-slate-400"
+                >
+                  CANCEL
+                </button>
+                <button
+                  onClick={handleDeleteDuplicates}
+                  disabled={isDeletingDuplicates}
+                  className="machine-btn-danger px-4 py-1.5 rounded-lg font-mono text-xs font-bold uppercase"
+                >
+                  {isDeletingDuplicates ? 'PURGING...' : `PURGE ${totalExtraDuplicates} COPIES`}
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Rename Modal */}
+      {renameModalVideo && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="machine-surface w-full max-w-sm rounded-xl p-4 space-y-3 shadow-2xl">
+            <div className="flex items-center justify-between pb-2 border-b border-cyan-500/20">
+              <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
+                RENAME VIDEO RECORD
+              </h3>
+              <button
+                onClick={() => setRenameModalVideo(null)}
+                className="text-slate-400 hover:text-white"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-2.5">
+              <div>
+                <label className="block text-[10px] font-mono text-slate-400 mb-1 uppercase">
+                  VIDEO TITLE
+                </label>
+                <input
+                  type="text"
+                  value={newTitle}
+                  onChange={(e) => setNewTitle(e.target.value)}
+                  className="w-full rounded-lg bg-slate-950 border border-slate-800 focus:border-cyan-400 px-3 py-2 font-mono text-xs text-white outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-mono text-slate-400 mb-1 uppercase">
+                  PLATFORM CLASSIFICATION
+                </label>
+                <div className="grid grid-cols-3 gap-1">
+                  {['TikTok', 'YouTube', 'Instagram', 'Facebook', 'Other'].map((p) => (
+                    <button
+                      key={p}
+                      onClick={() => setNewPlatform(p)}
+                      className={`py-1.5 rounded font-mono text-[11px] font-bold transition-all ${
+                        newPlatform.toLowerCase() === p.toLowerCase()
+                          ? 'machine-btn-primary text-slate-950'
+                          : 'machine-btn text-slate-400'
+                      }`}
+                    >
+                      {p}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="pt-2 flex items-center justify-end gap-2">
+              <button
+                onClick={() => setRenameModalVideo(null)}
+                className="machine-btn px-3 py-1.5 rounded-lg font-mono text-xs text-slate-400"
+              >
+                CANCEL
+              </button>
+              <button
+                onClick={handleSaveRename}
+                disabled={isRenaming}
+                className="machine-btn-primary px-4 py-1.5 rounded-lg font-mono text-xs uppercase"
+              >
+                {isRenaming ? 'SAVING...' : 'SAVE CHANGES'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

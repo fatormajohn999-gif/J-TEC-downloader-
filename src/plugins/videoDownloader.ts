@@ -8,6 +8,8 @@ export interface VideoDownloaderPlugin {
   requestVideoPermission(): Promise<{ requested: boolean }>;
   getVideoLibrary(): Promise<{ videos: VideoLibraryItem[] }>;
   deleteVideo(options: { uri: string }): Promise<{ deleted: boolean }>;
+  renameVideo(options: { uri: string; newTitle: string; newPlatform: string }): Promise<{ success: boolean; title: string; platform: string }>;
+  checkDuplicate(options: { url: string }): Promise<{ exists: boolean; uri?: string; title?: string; fileName?: string }>;
   playVideo(options: { uri: string; title: string }): Promise<{ started: boolean }>;
   shareVideo(options: { uri: string; title?: string }): Promise<{ shared: boolean }>;
   startBubble(): Promise<{ status: string }>;
@@ -21,7 +23,13 @@ export interface VideoDownloaderPlugin {
     apiKey?: string;
     defaultQuality?: string;
     autoDownload?: boolean;
+    autoDownloadOnPaste?: boolean;
+    autoPlayNext?: boolean;
+    repeatMode?: 'off' | 'one' | 'all';
+    floatingSide?: 'left' | 'right';
+    floatingShowMs?: boolean;
   }): Promise<{ saved: boolean }>;
+  clearMetadataCache(): Promise<{ cleared: boolean }>;
   downloadAndSave(options: {
     url: string;
     quality: string;
@@ -64,6 +72,12 @@ const VideoDownloaderWeb: VideoDownloaderPlugin = {
   },
   async deleteVideo() {
     return { deleted: true };
+  },
+  async renameVideo(options) {
+    return { success: true, title: options.newTitle, platform: options.newPlatform };
+  },
+  async checkDuplicate() {
+    return { exists: false };
   },
   async playVideo() {
     return { started: false };
@@ -111,6 +125,12 @@ const VideoDownloaderWeb: VideoDownloaderPlugin = {
   },
   async saveNativeSettings() {
     return { saved: true };
+  },
+  async clearMetadataCache() {
+    try {
+      localStorage.removeItem('omnidrop_metadata_cache');
+    } catch {}
+    return { cleared: true };
   },
   async downloadAndSave() {
     throw new Error('downloadAndSave native method is only available on Android platform.');
