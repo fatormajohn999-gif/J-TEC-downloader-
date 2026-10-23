@@ -143,7 +143,8 @@ jobs:
       - name: Generate Custom App Icon
         run: |
           if [ -f assets/icon-foreground.svg ] && [ -f assets/icon-background.svg ]; then
-            npm install --no-save --no-audit --no-fund --legacy-peer-deps sharp @capacitor/assets
+            CAP_VERSION=$(node -p "require('./node_modules/@capacitor/core/package.json').version")
+            npm install --no-save --no-audit --no-fund --legacy-peer-deps sharp @capacitor/assets "@capacitor/android@$CAP_VERSION"
             node - <<'JS'
           const sharp = require('sharp');
           (async () => {
