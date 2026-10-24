@@ -1,7 +1,12 @@
 import os
 import re
+import json
 import uuid
+import shutil
+import tempfile
 import asyncio
+import zipfile
+import urllib.request
 from typing import Optional, List
 from urllib.parse import urlparse
 
@@ -9,9 +14,10 @@ from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks, st
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
+import subprocess
 import yt_dlp
 
-app = FastAPI(title="OmniDrop Video Downloader API", version="1.0.0")
+app = FastAPI(title="OmniDrop Video & Photo Downloader API", version="1.1.0")
 
 # CORS middleware allowing all origins
 app.add_middleware(
@@ -29,6 +35,7 @@ os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
 ALLOWED_DOMAINS = [
     "tiktok.com",
     "vt.tiktok.com",
+    "vm.tiktok.com",
     "youtube.com",
     "youtu.be",
     "instagram.com",
@@ -73,6 +80,20 @@ def validate_url(url: str) -> str:
         )
     return clean_url
 
+def resolve_tiktok_url(url: str) -> str:
+    """Resolves short TikTok links (vm.tiktok.com / vt.tiktok.com) by following redirects."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.geturl()
+    except Exception:
+        return url
+
 def cleanup_file(filepath: str):
     """Safely removes temporary download file after streaming."""
     try:
@@ -81,6 +102,98 @@ def cleanup_file(filepath: str):
     except Exception:
         pass
 
+def cleanup_photo_files(zip_path: str, temp_dir: str):
+    """Safely removes temporary ZIP and images folder after streaming."""
+    try:
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+    except Exception:
+        pass
+    try:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+def get_gallery_info(target_url: str):
+    """Extracts photo slideshow metadata from TikTok using gallery-dl."""
+    cmd = ["gallery-dl", "-j", "--socket-timeout", "15", target_url]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+    
+    items = []
+    for line in res.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+            if isinstance(data, list) and len(data) >= 2 and isinstance(data[1], dict):
+                items.append(data[1])
+            elif isinstance(data, dict):
+                items.append(data)
+        except Exception:
+            continue
+
+    if not items:
+        return None
+
+    first = items[0]
+    title = first.get("description") or first.get("desc") or first.get("title") or "TikTok Photos"
+    author_obj = first.get("author") or {}
+    uploader = ""
+    if isinstance(author_obj, dict):
+        uploader = author_obj.get("nickname") or author_obj.get("unique_id") or ""
+    if not uploader:
+        uploader = first.get("uploader") or first.get("author") or "Creator"
+
+    thumbnail = first.get("url") or first.get("thumbnail") or ""
+    image_count = len(items)
+
+    return {
+        "type": "photo",
+        "title": title,
+        "uploader": uploader,
+        "thumbnail": thumbnail,
+        "imageCount": image_count,
+        "platform": "tiktok"
+    }
+
+def download_gallery_photos(target_url: str, title: str):
+    """Downloads all slideshow images with gallery-dl, renames to image_01.jpg, packs into ZIP."""
+    temp_dir = tempfile.mkdtemp(prefix="omnidrop_photos_")
+    try:
+        cmd = ["gallery-dl", "-d", temp_dir, "--socket-timeout", "30", target_url]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        
+        found_files = []
+        for root, _, files in os.walk(temp_dir):
+            for f in sorted(files):
+                ext = os.path.splitext(f)[1].lower()
+                if ext in [".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp"]:
+                    found_files.append(os.path.join(root, f))
+
+        if not found_files:
+            raise Exception("No photos found in gallery download output")
+
+        found_files.sort()
+
+        # Sanitize title for filename
+        clean_title = re.sub(r'[^a-zA-Z0-9_\-\. ]', '_', title).strip() or "TikTok_photos"
+        clean_title = clean_title[:70]
+        zip_id = str(uuid.uuid4())[:8]
+        zip_filename = f"{clean_title} [TikTok photos].zip"
+        zip_path = os.path.join(TEMP_DOWNLOAD_DIR, f"{clean_title}_{zip_id}.zip")
+
+        with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zip_file:
+            for idx, src_file in enumerate(found_files, start=1):
+                archive_name = f"image_{idx:02d}.jpg"
+                zip_file.write(src_file, arcname=archive_name)
+
+        return zip_path, zip_filename, temp_dir
+    except Exception as e:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise e
+
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
@@ -88,7 +201,29 @@ def health_check():
 @app.post("/info", dependencies=[Depends(verify_api_key)])
 async def get_video_info(payload: InfoRequest):
     url = validate_url(payload.url)
+    loop = asyncio.get_running_loop()
 
+    # If TikTok link, resolve potential short redirects (vm.tiktok.com, vt.tiktok.com)
+    resolved_url = url
+    if "tiktok.com" in url.lower():
+        resolved_url = await loop.run_in_executor(None, resolve_tiktok_url, url)
+
+    # 1. Detect photo post by /photo/ in URL path
+    if "/photo/" in resolved_url.lower():
+        try:
+            gallery_data = await asyncio.wait_for(
+                loop.run_in_executor(None, get_gallery_info, resolved_url),
+                timeout=25.0
+            )
+            if gallery_data:
+                return gallery_data
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Timeout while retrieving photos from post.")
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail="Could not get the photos from this post.")
+
+    # 2. Standard video extraction with yt-dlp
     ydl_opts = {
         'skip_download': True,
         'quiet': True,
@@ -97,24 +232,33 @@ async def get_video_info(payload: InfoRequest):
         'socket_timeout': 15,
     }
 
-    loop = asyncio.get_running_loop()
-
     def _extract():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(url, download=False)
 
     try:
-        # 25 second timeout on metadata extraction
         info = await asyncio.wait_for(loop.run_in_executor(None, _extract), timeout=25.0)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Timeout while retrieving video information. Please try again.")
     except yt_dlp.utils.DownloadError as e:
         err_msg = str(e)
+        # Check if yt-dlp failed because it's a photo slideshow
+        if "tiktok" in url.lower() or "no video formats" in err_msg.lower():
+            try:
+                gallery_data = await asyncio.wait_for(
+                    loop.run_in_executor(None, get_gallery_info, resolved_url),
+                    timeout=20.0
+                )
+                if gallery_data:
+                    return gallery_data
+            except Exception:
+                pass
+
         if "private" in err_msg.lower() or "login required" in err_msg.lower():
             raise HTTPException(status_code=403, detail="This video is private or requires authentication to view.")
         if "not found" in err_msg.lower() or "404" in err_msg.lower() or "does not exist" in err_msg.lower():
             raise HTTPException(status_code=404, detail="The requested video was not found or has been deleted.")
         raise HTTPException(status_code=400, detail="Could not extract video details. Please ensure the link is public and valid.")
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Timeout while retrieving video information. Please try again.")
     except Exception:
         raise HTTPException(status_code=500, detail="An error occurred while inspecting the video link.")
 
@@ -122,6 +266,19 @@ async def get_video_info(payload: InfoRequest):
         raise HTTPException(status_code=404, detail="Unable to retrieve video information.")
 
     formats = info.get("formats", []) or []
+    
+    # If yt-dlp returned info without video formats on TikTok, check if photo post
+    if not formats and "tiktok" in url.lower():
+        try:
+            gallery_data = await asyncio.wait_for(
+                loop.run_in_executor(None, get_gallery_info, resolved_url),
+                timeout=20.0
+            )
+            if gallery_data:
+                return gallery_data
+        except Exception:
+            pass
+
     detected_heights = set()
     for f in formats:
         h = f.get("height")
@@ -139,7 +296,7 @@ async def get_video_info(payload: InfoRequest):
         if "best" not in qualities:
             qualities.insert(0, "best")
     
-    # Always include audio-only option
+    # Always include audio-only option for videos
     qualities.append("audio")
 
     # Detect platform
@@ -155,6 +312,7 @@ async def get_video_info(payload: InfoRequest):
         platform = "facebook"
 
     return {
+        "type": "video",
         "title": info.get("title") or "Video Download",
         "thumbnail": info.get("thumbnail") or "",
         "duration": info.get("duration") or 0,
@@ -165,14 +323,44 @@ async def get_video_info(payload: InfoRequest):
     }
 
 @app.post("/download", dependencies=[Depends(verify_api_key)])
-async def download_video(payload: DownloadRequest, background_tasks: BackgroundTasks):
+async def download_media(payload: DownloadRequest, background_tasks: BackgroundTasks):
     url = validate_url(payload.url)
     quality = (payload.quality or "best").lower().strip()
+    loop = asyncio.get_running_loop()
 
+    # Resolve redirects for TikTok links
+    resolved_url = url
+    if "tiktok.com" in url.lower():
+        resolved_url = await loop.run_in_executor(None, resolve_tiktok_url, url)
+
+    # 1. Check if photo post
+    if "/photo/" in resolved_url.lower():
+        try:
+            info = await loop.run_in_executor(None, get_gallery_info, resolved_url)
+            title = info.get("title") if info else "TikTok Photos"
+            zip_path, zip_filename, temp_dir = await asyncio.wait_for(
+                loop.run_in_executor(None, download_gallery_photos, resolved_url, title),
+                timeout=120.0
+            )
+            background_tasks.add_task(cleanup_photo_files, zip_path, temp_dir)
+
+            return FileResponse(
+                path=zip_path,
+                filename=zip_filename,
+                media_type="application/zip",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{zip_filename}"'
+                }
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Photo download timed out. Connection may be too slow.")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Could not get the photos from this post.")
+
+    # 2. Standard video download via yt-dlp
     file_id = str(uuid.uuid4())[:8]
     output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"%(title).80s_{file_id}.%(ext)s")
 
-    # Select yt-dlp format specification
     if quality == "audio":
         format_spec = "ba/b"
     elif quality == "1080p":
@@ -202,12 +390,9 @@ async def download_video(payload: DownloadRequest, background_tasks: BackgroundT
             'preferredquality': '192',
         }]
 
-    loop = asyncio.get_running_loop()
-
     def _do_download():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             meta = ydl.extract_info(url, download=True)
-            # Find the actual written filename
             if 'requested_downloads' in meta and meta['requested_downloads']:
                 filename = meta['requested_downloads'][0]['filepath']
             else:
@@ -222,20 +407,39 @@ async def download_video(payload: DownloadRequest, background_tasks: BackgroundT
             return filename, meta.get('title') or "video"
 
     try:
-        # 120 second download timeout
         filepath, raw_title = await asyncio.wait_for(loop.run_in_executor(None, _do_download), timeout=120.0)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Download timed out. The video might be too large or connection too slow.")
     except yt_dlp.utils.DownloadError as e:
         err_msg = str(e)
+        # If yt-dlp failed because it's a photo post, fallback to gallery-dl
+        if "tiktok" in url.lower() or "no video formats" in err_msg.lower():
+            try:
+                info = await loop.run_in_executor(None, get_gallery_info, resolved_url)
+                title = info.get("title") if info else "TikTok Photos"
+                zip_path, zip_filename, temp_dir = await asyncio.wait_for(
+                    loop.run_in_executor(None, download_gallery_photos, resolved_url, title),
+                    timeout=120.0
+                )
+                background_tasks.add_task(cleanup_photo_files, zip_path, temp_dir)
+                return FileResponse(
+                    path=zip_path,
+                    filename=zip_filename,
+                    media_type="application/zip",
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{zip_filename}"'
+                    }
+                )
+            except Exception:
+                pass
+
         if "private" in err_msg.lower():
             raise HTTPException(status_code=403, detail="Cannot download private video.")
         raise HTTPException(status_code=400, detail="Download failed. Please check the link and try again.")
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Download timed out. The video might be too large or connection too slow.")
     except Exception:
         raise HTTPException(status_code=500, detail="Failed to process video download.")
 
     if not os.path.exists(filepath):
-        # Fallback search if extension merged
         base = os.path.splitext(filepath)[0]
         for candidate in [base + ".mp4", base + ".mkv", base + ".webm", base + ".mp3"]:
             if os.path.exists(candidate):
@@ -245,10 +449,8 @@ async def download_video(payload: DownloadRequest, background_tasks: BackgroundT
     if not os.path.exists(filepath):
         raise HTTPException(status_code=500, detail="Output file could not be generated.")
 
-    # Schedule deletion after response finishes streaming
     background_tasks.add_task(cleanup_file, filepath)
 
-    # Sanitize title for filename
     safe_title = re.sub(r'[^a-zA-Z0-9_\-\. ]', '_', raw_title).strip() or "video"
     extension = os.path.splitext(filepath)[1] or (".mp3" if quality == "audio" else ".mp4")
     download_filename = f"{safe_title}{extension}"
@@ -265,7 +467,6 @@ async def download_video(payload: DownloadRequest, background_tasks: BackgroundT
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
-    """Never return internal stack traces to users."""
     return JSONResponse(
         status_code=500,
         content={"detail": "An unexpected error occurred while processing your request."}

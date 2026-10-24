@@ -13,6 +13,7 @@ import {
   Film,
   Music,
   ExternalLink,
+  Images,
 } from 'lucide-react';
 import { Capacitor } from '@capacitor/core';
 import { VideoInfo, AppSettings, PlatformType, DownloadHistoryItem } from '../types';
@@ -390,30 +391,32 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             </button>
           </div>
 
-          {/* Quality Selector Segmented Switch */}
-          <div>
-            <div className="text-[10px] font-mono text-slate-400 mb-1 uppercase tracking-wider">
-              STREAM QUALITY // ENCODE
+          {/* Quality Selector Segmented Switch - Hidden for photo posts */}
+          {(!videoInfo || videoInfo.type !== 'photo') && (
+            <div>
+              <div className="text-[10px] font-mono text-slate-400 mb-1 uppercase tracking-wider">
+                STREAM QUALITY // ENCODE
+              </div>
+              <div className="grid grid-cols-4 gap-1 p-1 bg-slate-950 rounded-lg border border-slate-800">
+                {QUALITY_OPTIONS.map((q) => {
+                  const isSelected = selectedQuality === q.id;
+                  return (
+                    <button
+                      key={q.id}
+                      onClick={() => setSelectedQuality(q.id)}
+                      className={`py-1.5 rounded text-center font-mono text-xs font-bold transition-all ${
+                        isSelected
+                          ? 'machine-btn-primary text-slate-950 shadow-[0_0_10px_rgba(0,240,255,0.5)]'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      {q.label}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
-            <div className="grid grid-cols-4 gap-1 p-1 bg-slate-950 rounded-lg border border-slate-800">
-              {QUALITY_OPTIONS.map((q) => {
-                const isSelected = selectedQuality === q.id;
-                return (
-                  <button
-                    key={q.id}
-                    onClick={() => setSelectedQuality(q.id)}
-                    className={`py-1.5 rounded text-center font-mono text-xs font-bold transition-all ${
-                      isSelected
-                        ? 'machine-btn-primary text-slate-950 shadow-[0_0_10px_rgba(0,240,255,0.5)]'
-                        : 'text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    {q.label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
+          )}
 
           {/* Download Action Key */}
           <button
@@ -435,12 +438,16 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             ) : isDownloading ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
-                <span>DOWNLOADING...</span>
+                <span>{videoInfo?.type === 'photo' ? 'SAVING PHOTOS...' : 'DOWNLOADING...'}</span>
               </>
             ) : (
               <>
-                <Download className="w-4 h-4" />
-                <span>{videoInfo ? 'DOWNLOAD VIDEO FILE' : 'INSPECT & DOWNLOAD'}</span>
+                {videoInfo?.type === 'photo' ? <Images className="w-4 h-4" /> : <Download className="w-4 h-4" />}
+                <span>
+                  {videoInfo
+                    ? (videoInfo.type === 'photo' ? 'SAVE PHOTOS' : 'DOWNLOAD VIDEO FILE')
+                    : 'INSPECT & DOWNLOAD'}
+                </span>
               </>
             )}
           </button>
@@ -462,22 +469,29 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         )}
       </div>
 
-      {/* POST-FETCH VIDEO CARD WITH "NO WATERMARK" LED BADGE */}
+      {/* POST-FETCH MEDIA CARD (VIDEO OR PHOTO POST) */}
       {videoInfo && (
         <div className="machine-surface rounded-xl p-4 space-y-3 animate-fade-in">
           <div className="flex items-center justify-between pb-2 border-b border-cyan-500/20">
             <div className="flex items-center gap-2">
               <span className="w-2 h-2 rounded-full led-emerald" />
               <h4 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
-                VIDEO TARGET LOCATED
+                {videoInfo.type === 'photo' ? 'TIKTOK PHOTO POST LOCATED' : 'VIDEO TARGET LOCATED'}
               </h4>
             </div>
 
-            {/* "NO WATERMARK" LED BADGE */}
-            <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-emerald-950/80 border border-emerald-500/40 font-mono text-[10px] text-emerald-300 font-bold">
-              <span className="w-1.5 h-1.5 rounded-full led-emerald" />
-              <span>NO WATERMARK</span>
-            </div>
+            {/* BADGE: "N PHOTOS" FOR PHOTO POST OR "NO WATERMARK" FOR VIDEO */}
+            {videoInfo.type === 'photo' ? (
+              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-purple-950/80 border border-purple-500/50 font-mono text-[10px] text-purple-300 font-bold shadow-[0_0_8px_rgba(168,85,247,0.3)]">
+                <Images className="w-3 h-3 text-purple-400" />
+                <span>{videoInfo.imageCount ? `${videoInfo.imageCount} PHOTOS` : 'PHOTOS SLIDESHOW'}</span>
+              </div>
+            ) : (
+              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-emerald-950/80 border border-emerald-500/40 font-mono text-[10px] text-emerald-300 font-bold">
+                <span className="w-1.5 h-1.5 rounded-full led-emerald" />
+                <span>NO WATERMARK</span>
+              </div>
+            )}
           </div>
 
           <div className="flex gap-3">
@@ -491,12 +505,17 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                 />
               ) : (
                 <div className="w-full h-full flex items-center justify-center text-slate-600">
-                  <Film className="w-8 h-8" />
+                  {videoInfo.type === 'photo' ? <Images className="w-8 h-8" /> : <Film className="w-8 h-8" />}
                 </div>
               )}
               {videoInfo.duration > 0 && (
                 <span className="absolute bottom-1 right-1 px-1 py-0.2 rounded bg-black/80 font-mono text-[9px] text-white">
                   {formatDuration(videoInfo.duration)}
+                </span>
+              )}
+              {videoInfo.type === 'photo' && videoInfo.imageCount && (
+                <span className="absolute bottom-1 right-1 px-1.5 py-0.5 rounded bg-black/90 font-mono text-[9px] text-purple-300 font-bold border border-purple-500/40">
+                  {videoInfo.imageCount}P
                 </span>
               )}
             </div>
@@ -513,7 +532,11 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                 <span className="uppercase px-1.5 py-0.2 rounded bg-slate-950 border border-slate-800 text-slate-300">
                   {videoInfo.platform}
                 </span>
-                <span>{selectedQuality.toUpperCase()}</span>
+                {videoInfo.type === 'photo' ? (
+                  <span className="text-purple-300 uppercase">PHOTOS ARCHIVE</span>
+                ) : (
+                  <span>{selectedQuality.toUpperCase()}</span>
+                )}
               </div>
             </div>
           </div>

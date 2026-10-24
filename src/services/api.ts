@@ -192,10 +192,25 @@ export async function fetchVideoInfo(url: string, settings: AppSettings): Promis
     }
 
     const data = await res.json();
+    if (data.type === 'photo') {
+      return {
+        type: 'photo',
+        title: data.title || 'TikTok Photos',
+        thumbnail: data.thumbnail || '',
+        duration: 0,
+        uploader: data.uploader || 'Creator',
+        qualities: [],
+        platform: 'tiktok',
+        imageCount: data.imageCount || 0,
+        url: normalized,
+      };
+    }
+
     let rawPlatform = data.platform || detectPlatform(normalized);
     if (rawPlatform === 'video') rawPlatform = 'other';
 
     return {
+      type: 'video',
       title: data.title || 'Untitled Video',
       thumbnail: data.thumbnail || '',
       duration: data.duration || 0,
@@ -292,7 +307,17 @@ export async function downloadVideoFile(
       throw new Error(errText);
     }
 
-    if (onProgress) onProgress(50, 'Downloading media stream...');
+    const contentType = res.headers.get('content-type') || '';
+    const isZip = contentType.includes('application/zip');
+    const contentDisposition = res.headers.get('content-disposition') || '';
+
+    let serverFileName = '';
+    const filenameMatch = contentDisposition.match(/filename=["']?([^"';]+)["']?/i);
+    if (filenameMatch && filenameMatch[1]) {
+      serverFileName = filenameMatch[1].trim();
+    }
+
+    if (onProgress) onProgress(50, isZip ? 'Downloading photos archive...' : 'Downloading media stream...');
 
     const contentLength = res.headers.get('content-length');
     const totalBytes = contentLength ? parseInt(contentLength, 10) : 0;
@@ -311,11 +336,11 @@ export async function downloadVideoFile(
           chunks.push(value);
           receivedBytes += value.length;
           const pct = Math.min(95, Math.round(50 + (receivedBytes / totalBytes) * 45));
-          if (onProgress) onProgress(pct, `Transferring video: ${(receivedBytes / (1024 * 1024)).toFixed(1)} MB...`);
+          if (onProgress) onProgress(pct, `Transferring: ${(receivedBytes / (1024 * 1024)).toFixed(1)} MB...`);
         }
       }
       blob = new Blob(chunks as BlobPart[], {
-        type: quality === 'audio' ? 'audio/mpeg' : 'video/mp4',
+        type: isZip ? 'application/zip' : (quality === 'audio' ? 'audio/mpeg' : 'video/mp4'),
       });
     } else {
       blob = await res.blob();
@@ -323,9 +348,16 @@ export async function downloadVideoFile(
 
     if (onProgress) onProgress(98, 'Saving file to device...');
 
-    const sanitizedTitle = title.replace(/[^a-zA-Z0-9_\-]/g, '_').substring(0, 50) || 'OmniDrop_video';
-    const ext = quality === 'audio' ? '.mp3' : '.mp4';
-    const fileName = `${sanitizedTitle}${ext}`;
+    const sanitizedTitle = title.replace(/[^a-zA-Z0-9_\-]/g, '_').substring(0, 50) || 'OmniDrop';
+    let fileName = serverFileName;
+    if (!fileName) {
+      if (isZip) {
+        fileName = `${sanitizedTitle} [TikTok photos].zip`;
+      } else {
+        const ext = quality === 'audio' ? '.mp3' : '.mp4';
+        fileName = `${sanitizedTitle}${ext}`;
+      }
+    }
 
     const blobUrl = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -339,7 +371,7 @@ export async function downloadVideoFile(
       window.URL.revokeObjectURL(blobUrl);
     }, 60000);
 
-    if (onProgress) onProgress(100, 'Saved successfully!');
+    if (onProgress) onProgress(100, isZip ? 'Photos ZIP saved!' : 'Saved successfully!');
     return fileName;
   } catch (err: any) {
     if (err.name === 'AbortError') {

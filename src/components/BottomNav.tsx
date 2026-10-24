@@ -1,18 +1,20 @@
 import React from 'react';
-import { DownloadCloud, Play, Settings, Info } from 'lucide-react';
+import { DownloadCloud, Play, Image, Settings, Info } from 'lucide-react';
 
-export type NavTab = 'home' | 'videos' | 'settings' | 'about';
+export type NavTab = 'home' | 'videos' | 'photos' | 'settings' | 'about';
 
 interface BottomNavProps {
   currentTab: NavTab;
   onSelectTab: (tab: NavTab) => void;
   videoCount?: number;
+  photoCount?: number;
 }
 
 export const BottomNav: React.FC<BottomNavProps> = ({
   currentTab,
   onSelectTab,
   videoCount,
+  photoCount,
 }) => {
   const tabs = [
     {
@@ -27,6 +29,13 @@ export const BottomNav: React.FC<BottomNavProps> = ({
       code: 'VID',
       icon: Play,
       badge: videoCount && videoCount > 0 ? videoCount : undefined,
+    },
+    {
+      id: 'photos' as NavTab,
+      label: 'Photos',
+      code: 'PIC',
+      icon: Image,
+      badge: photoCount && photoCount > 0 ? photoCount : undefined,
     },
     {
       id: 'settings' as NavTab,

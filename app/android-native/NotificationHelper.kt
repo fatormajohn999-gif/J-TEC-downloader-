@@ -99,12 +99,22 @@ object NotificationHelper {
     /**
      * Shows notification when a video download finishes
      */
-    fun showDownloadFinishedNotification(context: Context, title: String, message: String, filePath: String?) {
+    fun showDownloadFinishedNotification(
+        context: Context,
+        title: String,
+        message: String,
+        filePath: String?,
+        isImage: Boolean = false
+    ) {
         ensureChannels(context)
 
         val openIntent = if (!filePath.isNullOrBlank()) {
             Intent(Intent.ACTION_VIEW).apply {
-                this.setDataAndType(Uri.parse(filePath), "video/*")
+                if (isImage) {
+                    this.setDataAndType(Uri.parse(filePath), "image/*")
+                } else {
+                    this.setDataAndType(Uri.parse(filePath), "video/*")
+                }
                 this.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
             }
         } else {

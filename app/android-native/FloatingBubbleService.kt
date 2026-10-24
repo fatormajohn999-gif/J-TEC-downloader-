@@ -57,6 +57,8 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -1277,11 +1279,12 @@ class FloatingBubbleService : Service() {
 
     private fun showAlreadyDownloadedUI(dup: JSONObject, normUrl: String) {
         val density = resources.displayMetrics.density
-        val title = dup.optString("title", "Video")
+        val title = dup.optString("title", "Media")
         val fileUri = dup.optString("fileUri", "")
+        val isPhoto = dup.optString("type") == "photo"
 
         progressContainer?.visibility = View.VISIBLE
-        progressStatusText?.text = "Already downloaded: $title"
+        progressStatusText?.text = if (isPhoto) "Already downloaded: $title (${dup.optInt("imageCount", 0)} photos)" else "Already downloaded: $title"
         progressSpeedText?.text = "SAVED"
         segmentedProgressBar?.setProgress(100)
 
@@ -1289,12 +1292,14 @@ class FloatingBubbleService : Service() {
         row.removeAllViews()
         row.visibility = View.VISIBLE
 
-        val playBtn = createMechanicalButton(
-            text = "PLAY",
+        val actionBtn = createMechanicalButton(
+            text = if (isPhoto) "OPEN" else "PLAY",
             density = density,
             isGreen = true,
             onClick = {
-                if (fileUri.isNotBlank()) {
+                if (isPhoto) {
+                    openPicturesFolder(fileUri)
+                } else if (fileUri.isNotBlank()) {
                     try {
                         val intent = Intent(this@FloatingBubbleService, VideoPlayerActivity::class.java).apply {
                             this.action = Intent.ACTION_VIEW
@@ -1329,9 +1334,31 @@ class FloatingBubbleService : Service() {
             }
         )
 
-        row.addView(playBtn)
+        row.addView(actionBtn)
         row.addView(dlAgainBtn)
         row.addView(closeBtn)
+    }
+
+    private fun openPicturesFolder(firstUri: String? = null) {
+        if (!firstUri.isNullOrBlank()) {
+            try {
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    this.setDataAndType(Uri.parse(firstUri), "image/*")
+                    this.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(intent)
+                return
+            } catch (_: Exception) {}
+        }
+        try {
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                this.setDataAndType(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "image/*")
+                this.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
+        } catch (_: Exception) {
+            openGalleryFolder()
+        }
     }
 
     private fun startBackgroundDownload(videoUrl: String, force: Boolean = false) {
@@ -1471,6 +1498,159 @@ class FloatingBubbleService : Service() {
                     mainHandler.post {
                         progressStatusText?.text = "Download failed: $err"
                         isDownloading = false
+                    }
+                    return@execute
+                }
+
+                val contentType = conn.contentType ?: ""
+                if (contentType.contains("application/zip", ignoreCase = true)) {
+                    mainHandler.post {
+                        progressStatusText?.text = "Extracting photo slideshow archive..."
+                        segmentedProgressBar?.setProgress(30)
+                    }
+
+                    val zis = ZipInputStream(conn.inputStream)
+                    val resolver = contentResolver
+                    val savedUris = ArrayList<Uri>()
+                    var zipEntry = zis.nextEntry
+                    var photoIndex = 0
+
+                    while (zipEntry != null) {
+                        val entryName = zipEntry.name
+                        if (!zipEntry.isDirectory && (entryName.endsWith(".jpg", ignoreCase = true) || entryName.endsWith(".jpeg", ignoreCase = true) || entryName.endsWith(".png", ignoreCase = true) || entryName.endsWith(".webp", ignoreCase = true))) {
+                            photoIndex++
+                            val paddedNum = String.format(java.util.Locale.US, "%02d", photoIndex)
+                            val cleanTitle = title
+                                .replace("[\\\\/:*?\"<>|\\r\\n]".toRegex(), "_")
+                                .replace("\\s+".toRegex(), " ")
+                                .trim()
+                                .take(60)
+                                .ifBlank { "TikTok_photo" }
+                            val photoDisplayName = "${cleanTitle}_$paddedNum.jpg"
+
+                            val imgValues = ContentValues().apply {
+                                this.put(MediaStore.MediaColumns.DISPLAY_NAME, photoDisplayName)
+                                this.put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                    this.put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/OmniDrop")
+                                    this.put(MediaStore.MediaColumns.IS_PENDING, 1)
+                                }
+                            }
+
+                            val collectionUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                            } else {
+                                MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                            }
+
+                            val itemUri = resolver.insert(collectionUri, imgValues)
+                            if (itemUri != null) {
+                                resolver.openOutputStream(itemUri)?.use { outStream ->
+                                    val buf = ByteArray(8192)
+                                    var len: Int
+                                    while (zis.read(buf).also { len = it } != -1) {
+                                        outStream.write(buf, 0, len)
+                                    }
+                                    outStream.flush()
+                                }
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                    val updateValues = ContentValues().apply {
+                                        this.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                                    }
+                                    resolver.update(itemUri, updateValues, null, null)
+                                }
+                                savedUris.add(itemUri)
+                                val currentCount = photoIndex
+                                mainHandler.post {
+                                    val pct = (30 + (currentCount * 5)).coerceAtMost(95)
+                                    segmentedProgressBar?.setProgress(pct)
+                                    progressStatusText?.text = "Saving photo $currentCount to Pictures/OmniDrop..."
+                                    progressSpeedText?.text = "SAVING"
+                                }
+                            }
+                        }
+                        zis.closeEntry()
+                        zipEntry = zis.nextEntry
+                    }
+                    zis.close()
+
+                    val totalPhotos = savedUris.size
+                    val firstUri = savedUris.firstOrNull()?.toString() ?: ""
+                    val archiveFileName = "$title [TikTok photos]"
+                    val savedTimestamp = System.currentTimeMillis()
+                    recentDownloads[normalizedUrl] = savedTimestamp
+                    lastFinishedFileUri = firstUri
+
+                    val metaObj = JSONObject().apply {
+                        this.put("type", "photo")
+                        this.put("title", title)
+                        this.put("platform", "TikTok")
+                        this.put("uploader", uploader)
+                        this.put("thumbnailUrl", thumbnail)
+                        this.put("sourceUrl", normalizedUrl)
+                        this.put("imageCount", totalPhotos)
+                        this.put("downloadTime", savedTimestamp)
+                        this.put("fileName", archiveFileName)
+                        this.put("fileUri", firstUri)
+                    }
+                    VideoDownloaderPlugin.saveVideoMetadata(this@FloatingBubbleService, archiveFileName, metaObj)
+
+                    val historyEntry = JSONObject().apply {
+                        this.put("id", "dl_$savedTimestamp")
+                        this.put("type", "photo")
+                        this.put("url", normalizedUrl)
+                        this.put("title", title)
+                        this.put("thumbnail", thumbnail)
+                        this.put("uploader", uploader)
+                        this.put("platform", "TikTok")
+                        this.put("quality", "photo")
+                        this.put("imageCount", totalPhotos)
+                        this.put("savedAt", savedTimestamp)
+                        this.put("fileName", archiveFileName)
+                        this.put("fileUri", firstUri)
+                    }
+                    VideoDownloaderPlugin.saveHistoryEntry(this@FloatingBubbleService, historyEntry)
+                    VideoDownloaderPlugin.instance?.emitNativeDownloadFinished(historyEntry)
+
+                    NotificationHelper.showDownloadFinishedNotification(
+                        this@FloatingBubbleService,
+                        "Saved $totalPhotos photos",
+                        "Saved to Pictures/OmniDrop",
+                        firstUri,
+                        isImage = true
+                    )
+
+                    mainHandler.post {
+                        tabInnerFrame?.flashGreen()
+                        isDownloading = false
+                        segmentedProgressBar?.setProgress(100)
+                        progressStatusText?.text = "Saved $totalPhotos photos"
+                        progressSpeedText?.text = "READY"
+
+                        val row = finishedActionsLayout
+                        if (row != null) {
+                            row.removeAllViews()
+                            row.visibility = View.VISIBLE
+                            val openBtn = createMechanicalButton(
+                                text = "OPEN",
+                                density = resources.displayMetrics.density,
+                                isGreen = true,
+                                onClick = { openPicturesFolder(firstUri) }
+                            )
+                            val dismissBtn = createMechanicalButton(
+                                text = "CLOSE",
+                                density = resources.displayMetrics.density,
+                                onClick = {
+                                    progressContainer?.visibility = View.GONE
+                                    row.visibility = View.GONE
+                                }
+                            )
+                            row.addView(openBtn)
+                            row.addView(dismissBtn)
+                        }
+
+                        linkEditText?.setText("")
+                        refreshRecentDownloadsUI()
                     }
                     return@execute
                 }

@@ -8,6 +8,7 @@ import { Header } from './components/Header';
 import { BottomNav, NavTab } from './components/BottomNav';
 import { HomeScreen } from './components/HomeScreen';
 import { VideosScreen } from './components/VideosScreen';
+import { PhotosScreen } from './components/PhotosScreen';
 import { SettingsScreen } from './components/SettingsScreen';
 import { AboutScreen } from './components/AboutScreen';
 import { ServerWakingBanner } from './components/ServerWakingBanner';
@@ -314,6 +315,10 @@ export default function App() {
 
         {currentTab === 'videos' && (
           <VideosScreen />
+        )}
+
+        {currentTab === 'photos' && (
+          <PhotosScreen />
         )}
 
         {currentTab === 'settings' && (

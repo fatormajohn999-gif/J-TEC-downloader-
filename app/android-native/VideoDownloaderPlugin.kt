@@ -28,6 +28,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -173,10 +175,12 @@ class VideoDownloaderPlugin : Plugin() {
                     val itemUrl = normalizeUrl(item.optString("sourceUrl", item.optString("url", "")))
                     if (itemUrl.isNotBlank() && itemUrl == norm) {
                         val uriStr = item.optString("fileUri", "")
+                        val isPhoto = item.optString("type") == "photo"
                         if (uriStr.isNotBlank()) {
                             try {
                                 val uri = Uri.parse(uriStr)
-                                val cursor = context.contentResolver.query(uri, arrayOf(MediaStore.Video.Media._ID), null, null, null)
+                                val col = if (isPhoto) arrayOf(MediaStore.Images.Media._ID) else arrayOf(MediaStore.Video.Media._ID)
+                                val cursor = context.contentResolver.query(uri, col, null, null, null)
                                 val exists = cursor?.use { it.count > 0 } ?: false
                                 if (exists) {
                                     return item.apply {
@@ -709,6 +713,124 @@ class VideoDownloaderPlugin : Plugin() {
                     return@Thread
                 }
 
+                val contentType = connection.contentType ?: ""
+                if (contentType.contains("application/zip", ignoreCase = true)) {
+                    reportProgress(35, "Extracting photo slideshow archive...")
+                    val zis = ZipInputStream(connection.inputStream)
+                    val resolver = context.contentResolver
+                    val savedUris = ArrayList<Uri>()
+                    var zipEntry = zis.nextEntry
+                    var photoIndex = 0
+
+                    while (zipEntry != null) {
+                        val entryName = zipEntry.name
+                        if (!zipEntry.isDirectory && (entryName.endsWith(".jpg", ignoreCase = true) || entryName.endsWith(".jpeg", ignoreCase = true) || entryName.endsWith(".png", ignoreCase = true) || entryName.endsWith(".webp", ignoreCase = true))) {
+                            photoIndex++
+                            val paddedNum = String.format(Locale.US, "%02d", photoIndex)
+                            val cleanTitle = finalTitle
+                                .replace("[\\\\/:*?\"<>|\\r\\n]".toRegex(), "_")
+                                .replace("\\s+".toRegex(), " ")
+                                .trim()
+                                .take(60)
+                                .ifBlank { "TikTok_photo" }
+                            val photoDisplayName = "${cleanTitle}_$paddedNum.jpg"
+
+                            val imgValues = ContentValues().apply {
+                                this.put(MediaStore.MediaColumns.DISPLAY_NAME, photoDisplayName)
+                                this.put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                    this.put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/OmniDrop")
+                                    this.put(MediaStore.MediaColumns.IS_PENDING, 1)
+                                }
+                            }
+
+                            val collectionUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                            } else {
+                                MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                            }
+
+                            val itemUri = resolver.insert(collectionUri, imgValues)
+                            if (itemUri != null) {
+                                resolver.openOutputStream(itemUri)?.use { outStream ->
+                                    val buf = ByteArray(8192)
+                                    var len: Int
+                                    while (zis.read(buf).also { len = it } != -1) {
+                                        outStream.write(buf, 0, len)
+                                    }
+                                    outStream.flush()
+                                }
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                    val updateValues = ContentValues().apply {
+                                        this.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                                    }
+                                    resolver.update(itemUri, updateValues, null, null)
+                                }
+                                savedUris.add(itemUri)
+                                val pct = (35 + (photoIndex * 5)).coerceAtMost(95)
+                                reportProgress(pct, "Saving photo $photoIndex to Pictures/OmniDrop...")
+                            }
+                        }
+                        zis.closeEntry()
+                        zipEntry = zis.nextEntry
+                    }
+                    zis.close()
+
+                    val totalPhotos = savedUris.size
+                    val firstUri = savedUris.firstOrNull()?.toString() ?: ""
+                    val archiveFileName = "$finalTitle [TikTok photos]"
+
+                    reportProgress(100, "Saved $totalPhotos photos to Pictures/OmniDrop!")
+
+                    NotificationHelper.showDownloadFinishedNotification(
+                        context,
+                        "Saved $totalPhotos photos",
+                        "Saved to Pictures/OmniDrop",
+                        firstUri,
+                        isImage = true
+                    )
+
+                    val metaObj = JSONObject().apply {
+                        this.put("type", "photo")
+                        this.put("title", finalTitle)
+                        this.put("platform", "TikTok")
+                        this.put("uploader", uploader)
+                        this.put("thumbnailUrl", thumbnail)
+                        this.put("sourceUrl", normalizedUrl)
+                        this.put("imageCount", totalPhotos)
+                        this.put("downloadTime", System.currentTimeMillis())
+                        this.put("fileName", archiveFileName)
+                        this.put("fileUri", firstUri)
+                    }
+                    saveVideoMetadata(context, archiveFileName, metaObj)
+
+                    val entryObj = JSONObject().apply {
+                        this.put("id", "dl_" + System.currentTimeMillis())
+                        this.put("type", "photo")
+                        this.put("url", normalizedUrl)
+                        this.put("title", finalTitle)
+                        this.put("thumbnail", thumbnail)
+                        this.put("uploader", uploader)
+                        this.put("platform", "TikTok")
+                        this.put("quality", "photo")
+                        this.put("imageCount", totalPhotos)
+                        this.put("savedAt", System.currentTimeMillis())
+                        this.put("fileName", archiveFileName)
+                        this.put("fileUri", firstUri)
+                    }
+                    saveHistoryEntry(context, entryObj)
+                    emitNativeDownloadFinished(entryObj)
+
+                    val res = JSObject().apply {
+                        this.put("fileName", archiveFileName)
+                        this.put("uri", firstUri)
+                        this.put("type", "photo")
+                        this.put("imageCount", totalPhotos)
+                    }
+                    call.resolve(res)
+                    return@Thread
+                }
+
                 reportProgress(30, "Preparing phone gallery storage...")
 
                 val resolver = context.contentResolver
@@ -853,13 +975,12 @@ class VideoDownloaderPlugin : Plugin() {
 
     @PluginMethod
     fun hasVideoPermission(call: PluginCall) {
-        val perm = if (Build.VERSION.SDK_INT >= 33) {
-            "android.permission.READ_MEDIA_VIDEO"
-        } else {
-            android.Manifest.permission.READ_EXTERNAL_STORAGE
-        }
-        val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            androidx.core.content.ContextCompat.checkSelfPermission(context, perm) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        val granted = if (Build.VERSION.SDK_INT >= 33) {
+            val video = androidx.core.content.ContextCompat.checkSelfPermission(context, "android.permission.READ_MEDIA_VIDEO") == android.content.pm.PackageManager.PERMISSION_GRANTED
+            val images = androidx.core.content.ContextCompat.checkSelfPermission(context, "android.permission.READ_MEDIA_IMAGES") == android.content.pm.PackageManager.PERMISSION_GRANTED
+            video && images
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.READ_EXTERNAL_STORAGE) == android.content.pm.PackageManager.PERMISSION_GRANTED
         } else {
             true
         }
@@ -871,15 +992,17 @@ class VideoDownloaderPlugin : Plugin() {
 
     @PluginMethod
     fun requestVideoPermission(call: PluginCall) {
-        val perm = if (Build.VERSION.SDK_INT >= 33) {
-            "android.permission.READ_MEDIA_VIDEO"
+        val perms = if (Build.VERSION.SDK_INT >= 33) {
+            arrayOf("android.permission.READ_MEDIA_VIDEO", "android.permission.READ_MEDIA_IMAGES")
         } else {
-            android.Manifest.permission.READ_EXTERNAL_STORAGE
+            arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val granted = androidx.core.content.ContextCompat.checkSelfPermission(context, perm) == android.content.pm.PackageManager.PERMISSION_GRANTED
-            if (!granted) {
-                androidx.core.app.ActivityCompat.requestPermissions(activity, arrayOf(perm), 992)
+            val anyMissing = perms.any {
+                androidx.core.content.ContextCompat.checkSelfPermission(context, it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+            }
+            if (anyMissing) {
+                androidx.core.app.ActivityCompat.requestPermissions(activity, perms, 992)
             }
         }
         val res = JSObject().apply {
@@ -1127,6 +1250,212 @@ class VideoDownloaderPlugin : Plugin() {
             call.resolve(ret)
         } catch (e: Exception) {
             call.reject("Failed to share video: ${e.message ?: "Unknown error"}")
+        }
+    }
+
+    @PluginMethod
+    fun getPhotoLibrary(call: PluginCall) {
+        Thread {
+            try {
+                val allMeta = getAllMetadata(context)
+                val metaByUri = HashMap<String, JSONObject>()
+                val metaByName = HashMap<String, JSONObject>()
+
+                val keys = allMeta.keys()
+                while (keys.hasNext()) {
+                    val fn = keys.next()
+                    val item = allMeta.getJSONObject(fn)
+                    val uri = item.optString("fileUri")
+                    if (uri.isNotBlank()) metaByUri[uri] = item
+                    metaByName[fn] = item
+                }
+
+                val collectionUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+                } else {
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                }
+
+                val projectionList = mutableListOf(
+                    MediaStore.Images.Media._ID,
+                    MediaStore.Images.Media.DISPLAY_NAME,
+                    MediaStore.Images.Media.SIZE,
+                    MediaStore.Images.Media.DATE_ADDED,
+                    MediaStore.Images.Media.WIDTH,
+                    MediaStore.Images.Media.HEIGHT
+                )
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    projectionList.add(MediaStore.Images.Media.RELATIVE_PATH)
+                }
+                projectionList.add(MediaStore.Images.Media.DATA)
+
+                val projection = projectionList.toTypedArray()
+                val selection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ? OR ${MediaStore.Images.Media.DATA} LIKE ?"
+                } else {
+                    "${MediaStore.Images.Media.DATA} LIKE ?"
+                }
+                val selectionArgs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    arrayOf("%Pictures/OmniDrop%", "%/Pictures/OmniDrop/%")
+                } else {
+                    arrayOf("%/Pictures/OmniDrop/%")
+                }
+                val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
+
+                val photosArray = JSArray()
+                val cursor = context.contentResolver.query(collectionUri, projection, selection, selectionArgs, sortOrder)
+
+                cursor?.use { c ->
+                    val idCol = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                    val nameCol = c.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
+                    val sizeCol = c.getColumnIndexOrThrow(MediaStore.Images.Media.SIZE)
+                    val dateCol = c.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
+                    val widthCol = c.getColumnIndexOrThrow(MediaStore.Images.Media.WIDTH)
+                    val heightCol = c.getColumnIndexOrThrow(MediaStore.Images.Media.HEIGHT)
+
+                    while (c.moveToNext()) {
+                        val idVal = c.getLong(idCol)
+                        val displayName = c.getString(nameCol) ?: "photo.jpg"
+                        val sizeBytes = c.getLong(sizeCol)
+                        val dateAddedSec = c.getLong(dateCol)
+                        val dateAddedMs = dateAddedSec * 1000L
+                        val width = c.getInt(widthCol)
+                        val height = c.getInt(heightCol)
+
+                        val contentUri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, idVal)
+                        val uriStr = contentUri.toString()
+
+                        // Post title extraction:
+                        // Strip " [TikTok photos]" tag and trailing numbers "_01"
+                        val baseName = displayName.substringBeforeLast(".")
+                        var extractedPostTitle = baseName
+                            .replace("\\[TikTok photos\\]".toRegex(RegexOption.IGNORE_CASE), "")
+                            .replace("_\\d+$".toRegex(), "")
+                            .trim()
+                        if (extractedPostTitle.isBlank()) extractedPostTitle = displayName
+
+                        val metaEntry = metaByUri[uriStr] ?: metaByName[displayName] ?: metaByName["$extractedPostTitle [TikTok photos]"]
+                        val postTitle = metaEntry?.optString("title", "")?.takeIf { it.isNotBlank() } ?: extractedPostTitle
+                        val platform = metaEntry?.optString("platform", "TikTok")?.takeIf { it.isNotBlank() } ?: "TikTok"
+                        val sourceUrl = metaEntry?.optString("sourceUrl", "") ?: ""
+
+                        var thumbBase64 = ""
+                        try {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                val bm = context.contentResolver.loadThumbnail(contentUri, Size(256, 256), null)
+                                val baos = ByteArrayOutputStream()
+                                bm.compress(Bitmap.CompressFormat.JPEG, 75, baos)
+                                val bytes = baos.toByteArray()
+                                thumbBase64 = "data:image/jpeg;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+                            }
+                        } catch (_: Exception) {}
+
+                        val pObj = JSObject().apply {
+                            this.put("id", idVal.toString())
+                            this.put("uri", uriStr)
+                            this.put("fileName", displayName)
+                            this.put("size", sizeBytes)
+                            this.put("dateAdded", dateAddedMs)
+                            this.put("width", width)
+                            this.put("height", height)
+                            this.put("postTitle", postTitle)
+                            this.put("thumbnail", thumbBase64)
+                            this.put("platform", platform)
+                            this.put("sourceUrl", sourceUrl)
+                        }
+                        photosArray.put(pObj)
+                    }
+                }
+
+                val ret = JSObject().apply {
+                    this.put("photos", photosArray)
+                }
+                call.resolve(ret)
+            } catch (e: Exception) {
+                call.reject("Failed to query photo library: ${e.message ?: "Unknown error"}")
+            }
+        }.start()
+    }
+
+    @PluginMethod
+    fun deletePhotos(call: PluginCall) {
+        val urisArray = call.getArray("uris")
+        val singleUri = call.getString("uri")
+        val targetUris = mutableListOf<String>()
+
+        if (urisArray != null) {
+            for (i in 0 until urisArray.length()) {
+                val u = urisArray.optString(i)
+                if (!u.isNullOrBlank()) targetUris.add(u)
+            }
+        } else if (!singleUri.isNullOrBlank()) {
+            targetUris.add(singleUri)
+        }
+
+        if (targetUris.isEmpty()) {
+            call.reject("Missing required parameter: uris")
+            return
+        }
+
+        Thread {
+            try {
+                var deletedCount = 0
+                for (u in targetUris) {
+                    try {
+                        val uri = Uri.parse(u)
+                        val count = context.contentResolver.delete(uri, null, null)
+                        if (count > 0) deletedCount++
+                    } catch (_: Exception) {}
+                }
+                val ret = JSObject().apply {
+                    this.put("deleted", deletedCount > 0)
+                    this.put("count", deletedCount)
+                }
+                call.resolve(ret)
+            } catch (e: Exception) {
+                call.reject("Failed to delete photos: ${e.message ?: "Unknown error"}")
+            }
+        }.start()
+    }
+
+    @PluginMethod
+    fun openPhotoViewer(call: PluginCall) {
+        val urisArray = call.getArray("uris")
+        val initialIndex = call.getInt("index", 0) ?: 0
+        val postTitle = call.getString("postTitle") ?: "OmniDrop Photos"
+
+        val uriList = ArrayList<String>()
+        if (urisArray != null) {
+            for (i in 0 until urisArray.length()) {
+                val u = urisArray.optString(i)
+                if (!u.isNullOrBlank()) uriList.add(u)
+            }
+        }
+        val singleUri = call.getString("uri")
+        if (uriList.isEmpty() && !singleUri.isNullOrBlank()) {
+            uriList.add(singleUri)
+        }
+
+        if (uriList.isEmpty()) {
+            call.reject("Missing required parameter: uris")
+            return
+        }
+
+        try {
+            val intent = Intent(context, PhotoViewerActivity::class.java).apply {
+                this.action = Intent.ACTION_VIEW
+                this.putStringArrayListExtra("photo_uris", uriList)
+                this.putExtra("initial_index", initialIndex)
+                this.putExtra("post_title", postTitle)
+                this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(intent)
+            val ret = JSObject().apply {
+                this.put("started", true)
+            }
+            call.resolve(ret)
+        } catch (e: Exception) {
+            call.reject("Failed to launch PhotoViewerActivity: ${e.message ?: "Unknown error"}")
         }
     }
 }

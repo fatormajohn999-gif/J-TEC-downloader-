@@ -1,5 +1,5 @@
 import { registerPlugin, PluginListenerHandle } from '@capacitor/core';
-import { DownloadHistoryItem, VideoLibraryItem } from '../types';
+import { DownloadHistoryItem, VideoLibraryItem, PhotoLibraryItem } from '../types';
 
 export interface VideoDownloaderPlugin {
   hasOverlayPermission(): Promise<{ granted: boolean }>;
@@ -8,6 +8,9 @@ export interface VideoDownloaderPlugin {
   requestVideoPermission(): Promise<{ requested: boolean }>;
   getVideoLibrary(): Promise<{ videos: VideoLibraryItem[] }>;
   deleteVideo(options: { uri: string }): Promise<{ deleted: boolean }>;
+  getPhotoLibrary(): Promise<{ photos: PhotoLibraryItem[] }>;
+  deletePhotos(options: { uris: string[] }): Promise<{ deleted: boolean; count: number }>;
+  openPhotoViewer(options: { uris: string[]; index?: number; postTitle?: string }): Promise<{ started: boolean }>;
   renameVideo(options: { uri: string; newTitle: string; newPlatform: string }): Promise<{ success: boolean; title: string; platform: string }>;
   checkDuplicate(options: { url: string }): Promise<{ exists: boolean; uri?: string; title?: string; fileName?: string }>;
   playVideo(options: {
@@ -83,6 +86,15 @@ const VideoDownloaderWeb: VideoDownloaderPlugin = {
   },
   async deleteVideo() {
     return { deleted: true };
+  },
+  async getPhotoLibrary() {
+    return { photos: [] };
+  },
+  async deletePhotos(options) {
+    return { deleted: true, count: options?.uris?.length || 0 };
+  },
+  async openPhotoViewer() {
+    return { started: false };
   },
   async renameVideo(options) {
     return { success: true, title: options.newTitle, platform: options.newPlatform };

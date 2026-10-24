@@ -1,6 +1,7 @@
 export type PlatformType = 'tiktok' | 'youtube' | 'instagram' | 'facebook' | 'other' | string;
 
 export interface VideoInfo {
+  type?: 'video' | 'photo';
   title: string;
   thumbnail: string;
   duration: number;
@@ -9,6 +10,7 @@ export interface VideoInfo {
   platform: PlatformType;
   id?: string;
   url: string;
+  imageCount?: number;
 }
 
 export interface VideoLibraryItem {
@@ -22,6 +24,20 @@ export interface VideoLibraryItem {
   thumbnail: string;
   sourceUrl?: string;
   fileName?: string;
+}
+
+export interface PhotoLibraryItem {
+  id: string;
+  uri: string;
+  fileName: string;
+  size: number;
+  dateAdded: number;
+  width: number;
+  height: number;
+  postTitle: string;
+  thumbnail: string;
+  platform?: PlatformType;
+  sourceUrl?: string;
 }
 
 export interface DownloadHistoryItem {
