@@ -97,6 +97,7 @@ jobs:
               '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />\n'
               '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n'
               '    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />\n'
+              '    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />\n'
               '    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />\n'
           )
           comps = (
@@ -104,6 +105,7 @@ jobs:
               '            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="floating_quick_download_bubble" />\n'
               '        </service>\n'
               '        <activity android:name="com.omnidrop.app.plugin.ClipboardBridgeActivity" android:theme="@android:style/Theme.Translucent.NoTitleBar" android:excludeFromRecents="true" android:launchMode="singleTask" android:exported="false" />\n'
+              '        <activity android:name="com.omnidrop.app.plugin.PhotoViewerActivity" android:exported="false" android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize" />\n'
               '        <activity android:name="com.omnidrop.app.plugin.VideoPlayerActivity" android:exported="false" android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize" />\n'
               '        <activity android:name="com.omnidrop.app.plugin.ShareActivity" android:exported="true" android:theme="@android:style/Theme.Translucent.NoTitleBar">\n'
               '            <intent-filter>\n'
