@@ -55,12 +55,34 @@ class VideoPlayerActivity : Activity() {
         private const val PREFS_PLAYBACK = "omnidrop_playback_positions"
         private const val PREFS_PLAYER_UI = "omnidrop_player_prefs"
         private const val KEY_SWIPE_HINT_SHOWN = "swipe_hint_shown"
+
+        private val sharedPlaylist = ArrayList<PlaylistItem>()
+
+        fun setPlaylist(items: List<PlaylistItem>) {
+            sharedPlaylist.clear()
+            sharedPlaylist.addAll(items)
+        }
+
+        fun getPlaylist(): List<PlaylistItem> {
+            return ArrayList(sharedPlaylist)
+        }
+
+        fun recordCrash(context: Context, t: Throwable) {
+            try {
+                val file = java.io.File(context.filesDir, "last_crash.txt")
+                val sw = java.io.StringWriter()
+                val pw = java.io.PrintWriter(sw)
+                t.printStackTrace(pw)
+                val stackTrace = sw.toString()
+                val content = "TIMESTAMP: ${java.util.Date()}\nCOMPONENT: VideoPlayerActivity\nERROR: ${t.javaClass.name}: ${t.message}\n\n$stackTrace\n"
+                file.writeText(content, Charsets.UTF_8)
+            } catch (_: Exception) {}
+        }
     }
 
     data class PlaylistItem(
         val uri: String,
         val title: String,
-        val thumbnail: String? = null,
         val platform: String? = null
     )
 
@@ -96,6 +118,7 @@ class VideoPlayerActivity : Activity() {
     private lateinit var centerFlashView: TextView
     private lateinit var titleFlashBannerView: TextView
     private lateinit var swipeHintOverlay: LinearLayout
+    private lateinit var errorOverlay: LinearLayout
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var mediaPlayer: MediaPlayer? = null
@@ -146,51 +169,43 @@ class VideoPlayerActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        try {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        parseIntentData()
-        loadNativeSettings()
+            parseIntentData()
+            loadNativeSettings()
 
-        if (savedInstanceState != null) {
-            currentSpeedIndex = savedInstanceState.getInt("saved_speed", 1)
-            isOrientationLockedByUser = savedInstanceState.getBoolean("orient_locked", false)
-            currentIndex = savedInstanceState.getInt("saved_index", currentIndex)
-            currentRepeatMode = savedInstanceState.getString("saved_repeat", currentRepeatMode) ?: "off"
+            if (savedInstanceState != null) {
+                currentSpeedIndex = savedInstanceState.getInt("saved_speed", 1)
+                isOrientationLockedByUser = savedInstanceState.getBoolean("orient_locked", false)
+                currentIndex = savedInstanceState.getInt("saved_index", currentIndex)
+                currentRepeatMode = savedInstanceState.getString("saved_repeat", currentRepeatMode) ?: "off"
+            }
+
+            buildPlayerUI()
+            setupGestures()
+            loadVideoAtCurrentIndex(animate = false, slideLeft = true)
+            checkAndShowSwipeHint()
+        } catch (t: Throwable) {
+            recordCrash(this, t)
+            android.widget.Toast.makeText(this, "Could not open the player", android.widget.Toast.LENGTH_SHORT).show()
+            finish()
         }
-
-        buildPlayerUI()
-        setupGestures()
-        loadVideoAtCurrentIndex(animate = false, slideLeft = true)
-        checkAndShowSwipeHint()
     }
 
     private fun parseIntentData() {
         val initialUri = intent.data ?: intent.getStringExtra("video_uri")?.let { Uri.parse(it) }
         val initialTitle = intent.getStringExtra("video_title") ?: "OmniDrop Video"
-        val playlistJson = intent.getStringExtra("playlist_json") ?: ""
         val targetIndex = intent.getIntExtra("current_index", 0)
 
         playlist.clear()
-        if (playlistJson.isNotBlank()) {
-            try {
-                val array = JSONArray(playlistJson)
-                for (i in 0 until array.length()) {
-                    val item = array.getJSONObject(i)
-                    val uri = item.optString("uri", "")
-                    val title = item.optString("title", "Video ${i + 1}")
-                    val thumb = item.optString("thumbnail", "")
-                    val platform = item.optString("platform", "Other")
-                    if (uri.isNotBlank()) {
-                        playlist.add(PlaylistItem(uri, title, thumb, platform))
-                    }
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
+        val fromHolder = getPlaylist()
+        if (fromHolder.isNotEmpty()) {
+            playlist.addAll(fromHolder)
         }
 
         if (playlist.isEmpty() && initialUri != null) {
-            playlist.add(PlaylistItem(initialUri.toString(), initialTitle))
+            playlist.add(PlaylistItem(initialUri.toString(), initialTitle, "Other"))
         }
 
         currentIndex = if (playlist.isNotEmpty()) {
@@ -280,9 +295,72 @@ class VideoPlayerActivity : Activity() {
         buildBottomBar()
 
         rootContainer.addView(hudOverlay)
+
+        buildErrorOverlay()
+        rootContainer.addView(errorOverlay)
+
         setContentView(rootContainer)
 
         scheduleControlsAutoHide()
+    }
+
+    private fun buildErrorOverlay() {
+        errorOverlay = LinearLayout(this).apply {
+            this.orientation = LinearLayout.VERTICAL
+            this.gravity = Gravity.CENTER
+            this.setPadding(dp(28), dp(28), dp(28), dp(28))
+            this.setBackgroundColor(Color.parseColor("#F2080B10"))
+            this.visibility = View.GONE
+            val lp = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ).apply {
+                this.gravity = Gravity.CENTER
+            }
+            this.layoutParams = lp
+        }
+
+        val errIcon = TextView(this).apply {
+            this.text = "⚠"
+            this.setTextColor(Color.parseColor("#EF4444"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 36f)
+            this.gravity = Gravity.CENTER
+        }
+        errorOverlay.addView(errIcon)
+
+        val errTitle = TextView(this).apply {
+            this.text = "CANNOT PLAY MEDIA"
+            this.setTextColor(Color.parseColor("#EF4444"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            this.typeface = Typeface.MONOSPACE
+            this.gravity = Gravity.CENTER
+            this.setPadding(dp(0), dp(10), dp(0), dp(8))
+        }
+        errorOverlay.addView(errTitle)
+
+        val errDesc = TextView(this).apply {
+            this.text = "Can't play this file. It may have been moved or deleted, or the app has no access to it"
+            this.setTextColor(Color.parseColor("#F1F5F9"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            this.typeface = Typeface.MONOSPACE
+            this.gravity = Gravity.CENTER
+            this.setPadding(dp(16), dp(0), dp(16), dp(24))
+        }
+        errorOverlay.addView(errDesc)
+
+        val backBtn = TextView(this).apply {
+            this.text = "‹ BACK TO LIBRARY"
+            this.setTextColor(Color.parseColor("#00F0FF"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            this.typeface = Typeface.MONOSPACE
+            this.gravity = Gravity.CENTER
+            this.setPadding(dp(20), dp(10), dp(20), dp(10))
+            this.background = createMechanicalButtonBackground(false)
+            this.setOnClickListener {
+                finish()
+            }
+        }
+        errorOverlay.addView(backBtn)
     }
 
     private fun buildGestureOverlays() {
@@ -1005,8 +1083,10 @@ class VideoPlayerActivity : Activity() {
     }
 
     private fun prepareAndStartVideo(item: PlaylistItem) {
+        errorOverlay.visibility = View.GONE
+
         // Show thumbnail placeholder while video loads
-        loadThumbnailIntoPlaceholder(item.thumbnail)
+        loadThumbnailIntoPlaceholder(item.uri)
 
         videoView.stopPlayback()
         videoView.setVideoURI(Uri.parse(item.uri))
@@ -1060,12 +1140,13 @@ class VideoPlayerActivity : Activity() {
         videoView.setOnErrorListener { _, _, _ ->
             showControls()
             thumbnailImageView.visibility = View.GONE
-            false
+            errorOverlay.visibility = View.VISIBLE
+            true
         }
     }
 
-    private fun loadThumbnailIntoPlaceholder(thumbStr: String?) {
-        if (thumbStr.isNullOrBlank()) {
+    private fun loadThumbnailIntoPlaceholder(uriStr: String?) {
+        if (uriStr.isNullOrBlank()) {
             thumbnailImageView.setImageDrawable(null)
             thumbnailImageView.visibility = View.GONE
             return
@@ -1076,19 +1157,22 @@ class VideoPlayerActivity : Activity() {
 
         Thread {
             try {
-                val cleanBase64 = if (thumbStr.contains(",")) {
-                    thumbStr.substringAfter(",")
-                } else {
-                    thumbStr
-                }
-                val decoded = Base64.decode(cleanBase64, Base64.DEFAULT)
-                val bmp = BitmapFactory.decodeByteArray(decoded, 0, decoded.size)
-                if (bmp != null) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val uri = Uri.parse(uriStr)
+                    val bm = contentResolver.loadThumbnail(uri, android.util.Size(512, 512), null)
                     mainHandler.post {
-                        thumbnailImageView.setImageBitmap(bmp)
+                        thumbnailImageView.setImageBitmap(bm)
+                    }
+                } else {
+                    mainHandler.post {
+                        thumbnailImageView.setImageDrawable(null)
                     }
                 }
-            } catch (_: Exception) {}
+            } catch (_: Exception) {
+                mainHandler.post {
+                    thumbnailImageView.setImageDrawable(null)
+                }
+            }
         }.start()
     }
 

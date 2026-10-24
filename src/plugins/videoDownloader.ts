@@ -19,8 +19,6 @@ export interface VideoDownloaderPlugin {
     playlist?: Array<{
       uri: string;
       title: string;
-      thumbnail?: string;
-      durationMs?: number;
       platform?: string;
     }>;
     initialIndex?: number;
@@ -44,6 +42,8 @@ export interface VideoDownloaderPlugin {
     floatingShowMs?: boolean;
   }): Promise<{ saved: boolean }>;
   clearMetadataCache(): Promise<{ cleared: boolean }>;
+  getLastCrash(): Promise<{ crash: string }>;
+  clearLastCrash(): Promise<{ cleared: boolean }>;
   downloadAndSave(options: {
     url: string;
     quality: string;
@@ -153,6 +153,12 @@ const VideoDownloaderWeb: VideoDownloaderPlugin = {
     try {
       localStorage.removeItem('omnidrop_metadata_cache');
     } catch {}
+    return { cleared: true };
+  },
+  async getLastCrash() {
+    return { crash: '' };
+  },
+  async clearLastCrash() {
     return { cleared: true };
   },
   async downloadAndSave() {

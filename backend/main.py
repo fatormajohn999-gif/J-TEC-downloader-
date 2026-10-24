@@ -6,18 +6,19 @@ import shutil
 import tempfile
 import asyncio
 import zipfile
+import subprocess
 import urllib.request
-from typing import Optional, List
+import urllib.error
+from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
-import subprocess
 import yt_dlp
 
-app = FastAPI(title="OmniDrop Video & Photo Downloader API", version="1.1.0")
+app = FastAPI(title="OmniDrop Video & Photo Downloader API", version="1.2.0")
 
 # CORS middleware allowing all origins
 app.add_middleware(
@@ -42,6 +43,8 @@ ALLOWED_DOMAINS = [
     "facebook.com",
     "fb.watch",
 ]
+
+DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
 class InfoRequest(BaseModel):
     url: str
@@ -80,19 +83,60 @@ def validate_url(url: str) -> str:
         )
     return clean_url
 
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Urllib redirect handler that stops automatic redirection and exposes Location."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
 def resolve_tiktok_url(url: str) -> str:
-    """Resolves short TikTok links (vm.tiktok.com / vt.tiktok.com) by following redirects."""
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            }
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.geturl()
-    except Exception:
+    """
+    Resolves short links (vm.tiktok.com, vt.tiktok.com) by following redirects manually,
+    one hop at a time with no automatic redirect, up to 5 hops, using a desktop browser
+    User-Agent, and stopping at the first Location that contains /photo/ or /video/,
+    so a captcha or login redirect does not hide the real post link.
+    """
+    if not any(d in url.lower() for d in ["tiktok.com", "vt.tiktok.com", "vm.tiktok.com"]):
         return url
+
+    current_url = url
+    opener = urllib.request.build_opener(NoRedirectHandler)
+
+    for hop in range(5):
+        if "/photo/" in current_url.lower() or "/video/" in current_url.lower():
+            break
+
+        try:
+            req = urllib.request.Request(
+                current_url,
+                headers={
+                    "User-Agent": DESKTOP_UA,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                }
+            )
+            try:
+                with opener.open(req, timeout=8) as resp:
+                    final_url = resp.geturl()
+                    if "/photo/" in final_url.lower() or "/video/" in final_url.lower():
+                        current_url = final_url
+                    break
+            except urllib.error.HTTPError as e:
+                if e.code in (301, 302, 303, 307, 308):
+                    location = e.headers.get("Location")
+                    if location:
+                        if location.startswith("/"):
+                            parsed_u = urlparse(current_url)
+                            location = f"{parsed_u.scheme}://{parsed_u.netloc}{location}"
+                        current_url = location
+                        if "/photo/" in current_url.lower() or "/video/" in current_url.lower():
+                            break
+                        continue
+                break
+        except Exception as ex:
+            print(f"[resolve_tiktok_url] hop {hop} failed: {ex}")
+            break
+
+    return current_url
 
 def cleanup_file(filepath: str):
     """Safely removes temporary download file after streaming."""
@@ -115,56 +159,175 @@ def cleanup_photo_files(zip_path: str, temp_dir: str):
     except Exception:
         pass
 
-def get_gallery_info(target_url: str):
-    """Extracts photo slideshow metadata from TikTok using gallery-dl."""
-    cmd = ["gallery-dl", "-j", "--socket-timeout", "15", target_url]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
-    
-    items = []
-    for line in res.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            data = json.loads(line)
-            if isinstance(data, list) and len(data) >= 2 and isinstance(data[1], dict):
-                items.append(data[1])
-            elif isinstance(data, dict):
-                items.append(data)
-        except Exception:
-            continue
+def is_valid_image_url(url_str: str) -> bool:
+    """Checks if a URL points to a standard image file."""
+    u = url_str.strip()
+    if not (u.startswith("http://") or u.startswith("https://")):
+        return False
+    path = urlparse(u).path.lower()
+    return any(path.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp", ".heic"])
 
-    if not items:
-        return None
+def fetch_tiktok_rehydration_data(target_url: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Fallback method: fetches TikTok post page with desktop User-Agent,
+    finds <script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">,
+    and extracts image URLs and metadata.
+    """
+    try:
+        req = urllib.request.Request(
+            target_url,
+            headers={
+                "User-Agent": DESKTOP_UA,
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.tiktok.com/",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
 
-    first = items[0]
-    title = first.get("description") or first.get("desc") or first.get("title") or "TikTok Photos"
-    author_obj = first.get("author") or {}
+        if "verify-bar" in html or "captcha" in html.lower() or "security check" in html.lower():
+            print("[fetch_tiktok_rehydration_data] TikTok captcha/block page encountered")
+            return None, "captcha"
+
+        match = re.search(r'<script\s+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"\s+type="application/json">(.*?)</script>', html, re.DOTALL)
+        if not match:
+            print("[fetch_tiktok_rehydration_data] __UNIVERSAL_DATA_FOR_REHYDRATION__ not found")
+            return None, "no_data"
+
+        data = json.loads(match.group(1))
+        scope = data.get("__DEFAULT_SCOPE__", {})
+        video_detail = scope.get("webapp.video-detail", {})
+        item_info = video_detail.get("itemInfo", {})
+        item_struct = item_info.get("itemStruct", {})
+
+        title = item_struct.get("desc") or "TikTok photos"
+        author = item_struct.get("author", {})
+        uploader = author.get("nickname") or author.get("uniqueId") or "Creator"
+
+        image_post = item_struct.get("imagePost", {})
+        raw_images = image_post.get("images", []) or []
+
+        image_urls = []
+        for img in raw_images:
+            url_list = img.get("imageURL", {}).get("urlList", [])
+            if url_list:
+                image_urls.append(url_list[0])
+
+        if not image_urls:
+            return None, "no_photos"
+
+        return {
+            "title": title,
+            "uploader": uploader,
+            "thumbnail": image_urls[0],
+            "imageUrls": image_urls,
+            "count": len(image_urls)
+        }, None
+    except Exception as e:
+        print(f"[fetch_tiktok_rehydration_data] Error: {e}")
+        return None, str(e)
+
+def get_gallery_info(target_url: str) -> Optional[Dict[str, Any]]:
+    """
+    Extracts photo slideshow metadata from TikTok.
+    1. Runs gallery-dl -g to get image list and count.
+    2. Runs gallery-dl -j and parses the whole stdout with a single json.loads.
+    3. If metadata parse fails, still returns type 'photo' with title 'TikTok photos',
+       count from URL list and first image URL as thumbnail.
+    4. If gallery-dl returns no images, falls back to __UNIVERSAL_DATA_FOR_REHYDRATION__.
+    """
+    # 1. Run gallery-dl -g
+    cmd_g = ["gallery-dl", "-g", "--socket-timeout", "15", target_url]
+    res_g = subprocess.run(cmd_g, capture_output=True, text=True, timeout=25)
+
+    image_urls = []
+    if res_g.returncode == 0 and res_g.stdout:
+        for line in res_g.stdout.splitlines():
+            clean_line = line.strip()
+            if is_valid_image_url(clean_line):
+                image_urls.append(clean_line)
+    else:
+        print(f"[gallery-dl -g] cmd: {' '.join(cmd_g)}, code: {res_g.returncode}")
+        if res_g.stderr:
+            print(f"[gallery-dl -g stderr]: {res_g.stderr[-1500:]}")
+
+    title = ""
     uploader = ""
-    if isinstance(author_obj, dict):
-        uploader = author_obj.get("nickname") or author_obj.get("unique_id") or ""
-    if not uploader:
-        uploader = first.get("uploader") or first.get("author") or "Creator"
+    thumbnail = ""
 
-    thumbnail = first.get("url") or first.get("thumbnail") or ""
-    image_count = len(items)
+    # 2. Run gallery-dl -j if image_urls found
+    if image_urls:
+        cmd_j = ["gallery-dl", "-j", "--socket-timeout", "15", target_url]
+        res_j = subprocess.run(cmd_j, capture_output=True, text=True, timeout=25)
+        if res_j.returncode == 0 and res_j.stdout:
+            try:
+                parsed_json = json.loads(res_j.stdout)
+                if isinstance(parsed_json, list):
+                    for item in parsed_json:
+                        meta = None
+                        if isinstance(item, list):
+                            for elem in item:
+                                if isinstance(elem, dict):
+                                    meta = elem
+                                    break
+                        elif isinstance(item, dict):
+                            meta = item
 
-    return {
-        "type": "photo",
-        "title": title,
-        "uploader": uploader,
-        "thumbnail": thumbnail,
-        "imageCount": image_count,
-        "platform": "tiktok"
-    }
+                        if meta:
+                            if not title:
+                                title = meta.get("description") or meta.get("desc") or meta.get("title") or ""
+                            if not uploader:
+                                author = meta.get("author")
+                                if isinstance(author, dict):
+                                    uploader = author.get("nickname") or author.get("unique_id") or ""
+                                elif isinstance(author, str):
+                                    uploader = author
+                                if not uploader:
+                                    uploader = meta.get("uploader") or ""
+                            if not thumbnail:
+                                thumbnail = meta.get("thumbnail") or meta.get("url") or ""
+            except Exception as e:
+                print(f"[gallery-dl -j] JSON parse error: {e}")
+        else:
+            print(f"[gallery-dl -j] code: {res_j.returncode}")
+            if res_j.stderr:
+                print(f"[gallery-dl -j stderr]: {res_j.stderr[-1500:]}")
 
-def download_gallery_photos(target_url: str, title: str):
-    """Downloads all slideshow images with gallery-dl, renames to image_01.jpg, packs into ZIP."""
+        return {
+            "type": "photo",
+            "title": title or "TikTok photos",
+            "uploader": uploader or "Creator",
+            "thumbnail": thumbnail or (image_urls[0] if image_urls else ""),
+            "imageCount": len(image_urls),
+            "platform": "tiktok"
+        }
+
+    # 3. Fallback: __UNIVERSAL_DATA_FOR_REHYDRATION__
+    fallback_data, err_reason = fetch_tiktok_rehydration_data(target_url)
+    if fallback_data:
+        return {
+            "type": "photo",
+            "title": fallback_data.get("title") or "TikTok photos",
+            "uploader": fallback_data.get("uploader") or "Creator",
+            "thumbnail": fallback_data.get("thumbnail") or "",
+            "imageCount": fallback_data.get("count", 0),
+            "platform": "tiktok"
+        }
+
+    return None
+
+def download_gallery_photos(target_url: str, title: str) -> Tuple[str, str, str]:
+    """
+    Downloads all slideshow images, packs them into a ZIP, and preserves each image's
+    real extension (image_01.jpeg, image_02.webp, etc.).
+    Falls back to __UNIVERSAL_DATA_FOR_REHYDRATION__ if gallery-dl fails.
+    """
     temp_dir = tempfile.mkdtemp(prefix="omnidrop_photos_")
     try:
+        # 1. Try gallery-dl download
         cmd = ["gallery-dl", "-d", temp_dir, "--socket-timeout", "30", target_url]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        
+
         found_files = []
         for root, _, files in os.walk(temp_dir):
             for f in sorted(files):
@@ -172,8 +335,45 @@ def download_gallery_photos(target_url: str, title: str):
                 if ext in [".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp"]:
                     found_files.append(os.path.join(root, f))
 
+        # 2. If gallery-dl returned no files, log and try scraping fallback
         if not found_files:
-            raise Exception("No photos found in gallery download output")
+            print(f"[download_gallery_photos] gallery-dl failed. cmd: {' '.join(cmd)}, code: {res.returncode}")
+            if res.stderr:
+                print(f"[download_gallery_photos stderr]: {res.stderr[-1500:]}")
+
+            fallback_data, reason = fetch_tiktok_rehydration_data(target_url)
+            if fallback_data and fallback_data.get("imageUrls"):
+                image_urls = fallback_data["imageUrls"]
+                for idx, img_url in enumerate(image_urls, start=1):
+                    # Determine extension
+                    path_ext = os.path.splitext(urlparse(img_url).path)[1].lower()
+                    if path_ext not in [".jpg", ".jpeg", ".png", ".webp", ".heic"]:
+                        path_ext = ".jpeg"
+
+                    dest_file = os.path.join(temp_dir, f"dl_{idx:03d}{path_ext}")
+                    req = urllib.request.Request(
+                        img_url,
+                        headers={
+                            "User-Agent": DESKTOP_UA,
+                            "Referer": "https://www.tiktok.com/",
+                        }
+                    )
+                    with urllib.request.urlopen(req, timeout=15) as resp, open(dest_file, "wb") as out_f:
+                        out_f.write(resp.read())
+                    found_files.append(dest_file)
+            else:
+                if reason == "captcha":
+                    raise HTTPException(
+                        status_code=403,
+                        detail="TikTok blocked the server from reading this post. Try again later."
+                    )
+                elif reason == "no_photos":
+                    raise HTTPException(status_code=400, detail="This post has no photos")
+                else:
+                    raise HTTPException(status_code=400, detail="TikTok blocked the server from reading this post. Try again later.")
+
+        if not found_files:
+            raise HTTPException(status_code=400, detail="This post has no photos")
 
         found_files.sort()
 
@@ -186,13 +386,18 @@ def download_gallery_photos(target_url: str, title: str):
 
         with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zip_file:
             for idx, src_file in enumerate(found_files, start=1):
-                archive_name = f"image_{idx:02d}.jpg"
+                ext = os.path.splitext(src_file)[1].lower() or ".jpeg"
+                archive_name = f"image_{idx:02d}{ext}"
                 zip_file.write(src_file, arcname=archive_name)
 
         return zip_path, zip_filename, temp_dir
+    except HTTPException:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
     except Exception as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
-        raise e
+        print(f"[download_gallery_photos] General error: {e}")
+        raise HTTPException(status_code=400, detail="Could not get the photos from this post.")
 
 @app.get("/health")
 def health_check():
@@ -203,9 +408,9 @@ async def get_video_info(payload: InfoRequest):
     url = validate_url(payload.url)
     loop = asyncio.get_running_loop()
 
-    # If TikTok link, resolve potential short redirects (vm.tiktok.com, vt.tiktok.com)
+    # If TikTok link, resolve short redirects (vm.tiktok.com, vt.tiktok.com)
     resolved_url = url
-    if "tiktok.com" in url.lower():
+    if any(d in url.lower() for d in ["tiktok.com", "vt.tiktok.com", "vm.tiktok.com"]):
         resolved_url = await loop.run_in_executor(None, resolve_tiktok_url, url)
 
     # 1. Detect photo post by /photo/ in URL path
@@ -219,9 +424,18 @@ async def get_video_info(payload: InfoRequest):
                 return gallery_data
         except asyncio.TimeoutError:
             raise HTTPException(status_code=504, detail="Timeout while retrieving photos from post.")
-        except Exception:
-            pass
-        raise HTTPException(status_code=400, detail="Could not get the photos from this post.")
+        except Exception as e:
+            print(f"[/info] Error getting photo info: {e}")
+
+        # Return minimal photo response rather than failing so user can still attempt download
+        return {
+            "type": "photo",
+            "title": "TikTok photos",
+            "uploader": "Creator",
+            "thumbnail": "",
+            "imageCount": 1,
+            "platform": "tiktok"
+        }
 
     # 2. Standard video extraction with yt-dlp
     ydl_opts = {
@@ -266,7 +480,7 @@ async def get_video_info(payload: InfoRequest):
         raise HTTPException(status_code=404, detail="Unable to retrieve video information.")
 
     formats = info.get("formats", []) or []
-    
+
     # If yt-dlp returned info without video formats on TikTok, check if photo post
     if not formats and "tiktok" in url.lower():
         try:
@@ -289,13 +503,13 @@ async def get_video_info(payload: InfoRequest):
     for h in [1080, 720, 480, 360]:
         if any(height >= h for height in detected_heights):
             qualities.append(f"{h}p")
-    
+
     if not qualities:
         qualities = ["best"]
     else:
         if "best" not in qualities:
             qualities.insert(0, "best")
-    
+
     # Always include audio-only option for videos
     qualities.append("audio")
 
@@ -330,7 +544,7 @@ async def download_media(payload: DownloadRequest, background_tasks: BackgroundT
 
     # Resolve redirects for TikTok links
     resolved_url = url
-    if "tiktok.com" in url.lower():
+    if any(d in url.lower() for d in ["tiktok.com", "vt.tiktok.com", "vm.tiktok.com"]):
         resolved_url = await loop.run_in_executor(None, resolve_tiktok_url, url)
 
     # 1. Check if photo post
@@ -352,9 +566,12 @@ async def download_media(payload: DownloadRequest, background_tasks: BackgroundT
                     "Content-Disposition": f'attachment; filename="{zip_filename}"'
                 }
             )
+        except HTTPException:
+            raise
         except asyncio.TimeoutError:
             raise HTTPException(status_code=504, detail="Photo download timed out. Connection may be too slow.")
-        except Exception:
+        except Exception as e:
+            print(f"[/download] Photo download exception: {e}")
             raise HTTPException(status_code=400, detail="Could not get the photos from this post.")
 
     # 2. Standard video download via yt-dlp
@@ -410,7 +627,7 @@ async def download_media(payload: DownloadRequest, background_tasks: BackgroundT
         filepath, raw_title = await asyncio.wait_for(loop.run_in_executor(None, _do_download), timeout=120.0)
     except yt_dlp.utils.DownloadError as e:
         err_msg = str(e)
-        # If yt-dlp failed because it's a photo post, fallback to gallery-dl
+        # If yt-dlp failed because it's a photo post, fallback to photo download
         if "tiktok" in url.lower() or "no video formats" in err_msg.lower():
             try:
                 info = await loop.run_in_executor(None, get_gallery_info, resolved_url)
@@ -428,6 +645,8 @@ async def download_media(payload: DownloadRequest, background_tasks: BackgroundT
                         "Content-Disposition": f'attachment; filename="{zip_filename}"'
                     }
                 )
+            except HTTPException:
+                raise
             except Exception:
                 pass
 
@@ -463,6 +682,13 @@ async def download_media(payload: DownloadRequest, background_tasks: BackgroundT
         headers={
             "Content-Disposition": f'attachment; filename="{download_filename}"'
         }
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail}
     )
 
 @app.exception_handler(Exception)

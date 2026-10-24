@@ -131,8 +131,6 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
       const playlist = filteredVideos.map((v) => ({
         uri: v.uri,
         title: v.title,
-        thumbnail: v.thumbnail,
-        durationMs: v.durationMs,
         platform: v.platform,
       }));
       await VideoDownloader.playVideo({

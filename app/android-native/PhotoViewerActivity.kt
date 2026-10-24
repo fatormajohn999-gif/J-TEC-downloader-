@@ -77,32 +77,51 @@ class PhotoViewerActivity : Activity() {
     private lateinit var scaleDetector: ScaleGestureDetector
     private lateinit var gestureDetector: GestureDetector
 
+    companion object {
+        fun recordCrash(context: Context, t: Throwable) {
+            try {
+                val file = java.io.File(context.filesDir, "last_crash.txt")
+                val sw = java.io.StringWriter()
+                val pw = java.io.PrintWriter(sw)
+                t.printStackTrace(pw)
+                val stackTrace = sw.toString()
+                val content = "TIMESTAMP: ${java.util.Date()}\nCOMPONENT: PhotoViewerActivity\nERROR: ${t.javaClass.name}: ${t.message}\n\n$stackTrace\n"
+                file.writeText(content, Charsets.UTF_8)
+            } catch (_: Exception) {}
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        try {
+            // Read extras
+            val incomingUris = intent.getStringArrayListExtra("photo_uris")
+            if (incomingUris != null) {
+                photoUris.addAll(incomingUris)
+            }
+            val singleUri = intent.getStringExtra("uri")
+            if (photoUris.isEmpty() && !singleUri.isNullOrBlank()) {
+                photoUris.add(singleUri)
+            }
 
-        // Read extras
-        val incomingUris = intent.getStringArrayListExtra("photo_uris")
-        if (incomingUris != null) {
-            photoUris.addAll(incomingUris)
-        }
-        val singleUri = intent.getStringExtra("uri")
-        if (photoUris.isEmpty() && !singleUri.isNullOrBlank()) {
-            photoUris.add(singleUri)
-        }
+            currentIndex = intent.getIntExtra("initial_index", 0).coerceIn(0, (photoUris.size - 1).coerceAtLeast(0))
+            postTitle = intent.getStringExtra("post_title") ?: "OmniDrop Photos"
 
-        currentIndex = intent.getIntExtra("initial_index", 0).coerceIn(0, (photoUris.size - 1).coerceAtLeast(0))
-        postTitle = intent.getStringExtra("post_title") ?: "OmniDrop Photos"
+            if (photoUris.isEmpty()) {
+                Toast.makeText(this, "No photos to display", Toast.LENGTH_SHORT).show()
+                finish()
+                return
+            }
 
-        if (photoUris.isEmpty()) {
-            Toast.makeText(this, "No photos to display", Toast.LENGTH_SHORT).show()
+            buildViewerUI()
+            setupGestureDetectors()
+            loadCurrentPhoto(animate = false, slideLeft = false)
+            scheduleHudAutoHide()
+        } catch (t: Throwable) {
+            recordCrash(this, t)
+            Toast.makeText(this, "Could not open the player", Toast.LENGTH_SHORT).show()
             finish()
-            return
         }
-
-        buildViewerUI()
-        setupGestureDetectors()
-        loadCurrentPhoto(animate = false, slideLeft = false)
-        scheduleHudAutoHide()
     }
 
     private fun dp(value: Int): Int {

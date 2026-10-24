@@ -1197,21 +1197,38 @@ class VideoDownloaderPlugin : Plugin() {
         val title = call.getString("title") ?: "OmniDrop Video"
         val initialIndex = call.getInt("initialIndex", 0) ?: 0
         val playlistArray = call.getArray("playlist")
-        val playlistJson = playlistArray?.toString() ?: ""
 
         if (uriStr.isNullOrBlank()) {
             call.reject("Missing required parameter: uri")
             return
         }
         try {
+            val list = mutableListOf<VideoPlayerActivity.PlaylistItem>()
+            if (playlistArray != null) {
+                for (i in 0 until playlistArray.length()) {
+                    val obj = playlistArray.optJSONObject(i)
+                    if (obj != null) {
+                        val u = obj.optString("uri", "")
+                        val t = obj.optString("title", "Video ${i + 1}")
+                        val p = obj.optString("platform", "Other")
+                        if (u.isNotBlank()) {
+                            list.add(VideoPlayerActivity.PlaylistItem(u, t, p))
+                        }
+                    }
+                }
+            }
+            if (list.isEmpty()) {
+                list.add(VideoPlayerActivity.PlaylistItem(uriStr, title, "Other"))
+            }
+
+            // In-memory playlist holder to prevent TransactionTooLargeException
+            VideoPlayerActivity.setPlaylist(list)
+
             val intent = Intent(context, VideoPlayerActivity::class.java).apply {
                 this.action = Intent.ACTION_VIEW
                 this.data = Uri.parse(uriStr)
                 this.putExtra("video_title", title)
                 this.putExtra("current_index", initialIndex)
-                if (playlistJson.isNotBlank()) {
-                    this.putExtra("playlist_json", playlistJson)
-                }
                 this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             context.startActivity(intent)
@@ -1458,4 +1475,41 @@ class VideoDownloaderPlugin : Plugin() {
             call.reject("Failed to launch PhotoViewerActivity: ${e.message ?: "Unknown error"}")
         }
     }
+
+    @PluginMethod
+    fun getLastCrash(call: PluginCall) {
+        try {
+            val file = java.io.File(context.filesDir, "last_crash.txt")
+            val text = if (file.exists()) file.readText(Charsets.UTF_8) else ""
+            val ret = JSObject().apply {
+                this.put("crash", text)
+            }
+            call.resolve(ret)
+        } catch (e: Exception) {
+            val ret = JSObject().apply {
+                this.put("crash", "")
+            }
+            call.resolve(ret)
+        }
+    }
+
+    @PluginMethod
+    fun clearLastCrash(call: PluginCall) {
+        try {
+            val file = java.io.File(context.filesDir, "last_crash.txt")
+            if (file.exists()) {
+                file.delete()
+            }
+            val ret = JSObject().apply {
+                this.put("cleared", true)
+            }
+            call.resolve(ret)
+        } catch (e: Exception) {
+            val ret = JSObject().apply {
+                this.put("cleared", false)
+            }
+            call.resolve(ret)
+        }
+    }
 }
+

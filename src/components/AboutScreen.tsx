@@ -18,12 +18,43 @@ import {
   Layers,
   Music,
   Bot,
+  Copy,
+  Trash2,
 } from 'lucide-react';
+import { VideoDownloader } from '../plugins/videoDownloader';
 
 type SubScreen = 'guide' | 'privacy' | 'developer' | 'info' | null;
 
 export const AboutScreen: React.FC = () => {
   const [activeSubScreen, setActiveSubScreen] = useState<SubScreen>(null);
+  const [crashLog, setCrashLog] = useState<string>('');
+  const [isCopied, setIsCopied] = useState(false);
+
+  React.useEffect(() => {
+    if (activeSubScreen === 'info') {
+      VideoDownloader.getLastCrash()
+        .then((res) => {
+          setCrashLog(res?.crash || '');
+        })
+        .catch(() => setCrashLog(''));
+    }
+  }, [activeSubScreen]);
+
+  const handleCopyCrash = async () => {
+    if (!crashLog) return;
+    try {
+      await navigator.clipboard.writeText(crashLog);
+      setIsCopied(true);
+      setTimeout(() => setIsCopied(false), 2000);
+    } catch {}
+  };
+
+  const handleClearCrash = async () => {
+    try {
+      await VideoDownloader.clearLastCrash();
+      setCrashLog('');
+    } catch {}
+  };
 
   const menuItems = [
     {
@@ -493,6 +524,49 @@ export const AboutScreen: React.FC = () => {
               <span className="text-emerald-400 font-bold">MIT / Personal Use</span>
             </div>
           </div>
+        </div>
+
+        {/* Diagnostics Section */}
+        <div className="machine-surface rounded-xl p-4 space-y-3">
+          <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+            <div className="flex items-center gap-2">
+              <span className={`w-2 h-2 rounded-full ${crashLog ? 'led-red' : 'led-emerald'}`} />
+              <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
+                DIAGNOSTICS // CRASH LOG
+              </h3>
+            </div>
+            {crashLog && (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleCopyCrash}
+                  className="px-2 py-1 rounded bg-slate-900 border border-slate-700 hover:border-cyan-400 font-mono text-[10px] text-cyan-300 flex items-center gap-1 active:scale-95"
+                  title="Copy crash details"
+                >
+                  <Copy className="w-3 h-3" />
+                  <span>{isCopied ? 'COPIED' : 'COPY'}</span>
+                </button>
+                <button
+                  onClick={handleClearCrash}
+                  className="px-2 py-1 rounded bg-red-950/60 border border-red-500/50 hover:border-red-400 font-mono text-[10px] text-red-300 flex items-center gap-1 active:scale-95"
+                  title="Clear crash log"
+                >
+                  <Trash2 className="w-3 h-3" />
+                  <span>CLEAR</span>
+                </button>
+              </div>
+            )}
+          </div>
+
+          {crashLog ? (
+            <div className="p-3 rounded-lg bg-black/90 border border-red-500/40 font-mono text-[11px] text-red-300 max-h-48 overflow-y-auto whitespace-pre-wrap select-text leading-relaxed">
+              {crashLog}
+            </div>
+          ) : (
+            <div className="py-2.5 text-center font-mono text-xs text-slate-400 flex items-center justify-center gap-2">
+              <div className="w-2 h-2 rounded-full led-emerald" />
+              <span>No crashes recorded</span>
+            </div>
+          )}
         </div>
 
         <div className="machine-surface rounded-xl p-3.5 flex items-center justify-between text-xs font-mono">
