@@ -27,7 +27,6 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.graphics.drawable.LayerDrawable
 import android.net.TrafficStats
 import android.net.Uri
 import android.os.Build
@@ -55,9 +54,10 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.ArrayDeque
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
-import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import org.json.JSONArray
 import org.json.JSONObject
@@ -74,6 +74,8 @@ class FloatingBubbleService : Service() {
         private const val PREF_BACKEND_URL = "backend_url"
         private const val PREF_API_KEY = "api_key"
         private const val PREF_DEFAULT_QUALITY = "default_quality"
+        private const val PREF_FLOATING_AUTO_CLEAR = "floating_auto_clear"
+        private const val PREF_FLOATING_VIBRATE = "floating_vibrate"
         const val PREF_HISTORY_KEY = "native_download_history"
 
         val SUPPORTED_DOMAINS = arrayOf(
@@ -116,9 +118,13 @@ class FloatingBubbleService : Service() {
     private var serverStatusText: TextView? = null
     private var netLedDot: View? = null
     private var netStatusText: TextView? = null
-    private var trafficSpeedText: TextView? = null
+    private var trafficDnText: TextView? = null
+    private var trafficUpText: TextView? = null
+    private var queueStatusText: TextView? = null
     private var pingGraphView: PingGraphView? = null
     private var linkEditText: EditText? = null
+    private var smartKeyBtn: TextView? = null
+    private var retryBtn: View? = null
     private var manualDownloadBtn: View? = null
     private var progressContainer: LinearLayout? = null
     private var progressStatusText: TextView? = null
@@ -135,10 +141,34 @@ class FloatingBubbleService : Service() {
     private var isPanelOpen: Boolean = false
     private var isDownloading: Boolean = false
     private var autoDownloadEnabled: Boolean = true
+    private var autoClearEnabled: Boolean = true
+    private var vibrateEnabled: Boolean = true
     private var backendUrl: String = ""
     private var apiKey: String = ""
     private var defaultQuality: String = "best"
     private var lastFinishedFileUri: String? = null
+    private var lastFailedUrl: String? = null
+
+    // Active Download Tracking for Cancellation
+    @Volatile private var isDownloadCancelled: Boolean = false
+    private var activeDownloadConnection: HttpURLConnection? = null
+    private var activeDownloadOutputStream: OutputStream? = null
+    private var activeTargetUri: Uri? = null
+    private var activeNormalizedUrl: String? = null
+
+    // Download Queue
+    private val downloadQueue = ArrayDeque<String>()
+
+    // Typing timestamp and Auto-Clear Runnable
+    private var lastTypingTimestamp: Long = 0L
+    private var autoClearRunnable: Runnable? = null
+
+    // Idle Fade Runnable (5 seconds without interaction)
+    private val idleFadeRunnable = Runnable {
+        if (!isDownloading && !isPanelOpen) {
+            tabRootView?.animate()?.alpha(0.45f)?.setDuration(400L)?.start()
+        }
+    }
 
     // Dual Ping Readings
     private var serverPingMs: Int = -1
@@ -188,6 +218,7 @@ class FloatingBubbleService : Service() {
                 isScreenOn = false
             } else if (Intent.ACTION_SCREEN_ON == act) {
                 isScreenOn = true
+                resetIdleFade()
                 measureDualPing()
             }
         }
@@ -215,6 +246,7 @@ class FloatingBubbleService : Service() {
         initPanelOverlay()
 
         mainHandler.post(dualPingRunnable)
+        resetIdleFade()
     }
 
     private fun loadSavedSettings() {
@@ -225,34 +257,57 @@ class FloatingBubbleService : Service() {
             backendUrl = p.getString(PREF_BACKEND_URL, "") ?: ""
             apiKey = p.getString(PREF_API_KEY, "") ?: ""
             defaultQuality = p.getString(PREF_DEFAULT_QUALITY, "best") ?: "best"
+            autoClearEnabled = p.getBoolean(PREF_FLOATING_AUTO_CLEAR, true)
+            vibrateEnabled = p.getBoolean(PREF_FLOATING_VIBRATE, true)
         }
     }
 
-    fun updateSettings(newUrl: String, newApiKey: String, newQuality: String, newAutoDownload: Boolean) {
+    fun updateSettings(
+        newUrl: String,
+        newApiKey: String,
+        newQuality: String,
+        newAutoDownload: Boolean,
+        newAutoClear: Boolean = true,
+        newVibrate: Boolean = true
+    ) {
         backendUrl = newUrl.trim()
         apiKey = newApiKey.trim()
         defaultQuality = newQuality
         autoDownloadEnabled = newAutoDownload
+        autoClearEnabled = newAutoClear
+        vibrateEnabled = newVibrate
         prefs?.edit()?.apply {
             this.putString(PREF_BACKEND_URL, backendUrl)
             this.putString(PREF_API_KEY, apiKey)
             this.putString(PREF_DEFAULT_QUALITY, defaultQuality)
             this.putBoolean(PREF_AUTO_DOWNLOAD, autoDownloadEnabled)
+            this.putBoolean(PREF_FLOATING_AUTO_CLEAR, autoClearEnabled)
+            this.putBoolean(PREF_FLOATING_VIBRATE, vibrateEnabled)
             this.apply()
         }
         mainHandler.post {
             updateAutoDownloadUI()
             measureDualPing()
+            resetIdleFade()
         }
     }
 
     fun handleSharedUrl(sharedUrl: String) {
         mainHandler.post {
+            resetIdleFade()
             if (!isPanelOpen) {
                 openPanel()
             }
             linkEditText?.setText(sharedUrl)
-            triggerLinkProcessing(sharedUrl, isManual = false)
+            enqueueOrStartDownload(sharedUrl, isManual = false)
+        }
+    }
+
+    private fun resetIdleFade() {
+        mainHandler.removeCallbacks(idleFadeRunnable)
+        tabRootView?.animate()?.alpha(1.0f)?.setDuration(150L)?.start()
+        if (!isDownloading && !isPanelOpen) {
+            mainHandler.postDelayed(idleFadeRunnable, 5000L)
         }
     }
 
@@ -360,6 +415,10 @@ class FloatingBubbleService : Service() {
 
                 when (event.action) {
                     MotionEvent.ACTION_DOWN -> {
+                        resetIdleFade()
+                        if (tabInnerFrame?.isFinishedOrFailed() == true) {
+                            tabInnerFrame?.resetToIdle()
+                        }
                         initialX = lp.x
                         initialY = lp.y
                         touchStartX = event.rawX
@@ -374,6 +433,7 @@ class FloatingBubbleService : Service() {
                         return true
                     }
                     MotionEvent.ACTION_UP -> {
+                        resetIdleFade()
                         val duration = System.currentTimeMillis() - touchStartTime
                         val totalDx = event.rawX - touchStartX
                         val totalDy = event.rawY - touchStartY
@@ -428,6 +488,7 @@ class FloatingBubbleService : Service() {
 
         overlay.setOnTouchListener { _, event ->
             if (event.action == MotionEvent.ACTION_DOWN) {
+                resetIdleFade()
                 val card = panelMachineCard
                 if (card != null) {
                     val location = IntArray(2)
@@ -530,10 +591,9 @@ class FloatingBubbleService : Service() {
         header.addView(closeBtn)
         content.addView(header)
 
-        // --- 2. DUAL STATUS INSTRUMENT PANEL (SERVER & NET & TRAFFIC) ---
+        // --- 2. FIXED-HEIGHT DUAL STATUS INSTRUMENT PANEL (TWO ROWS) ---
         val statusBoard = LinearLayout(this).apply {
-            this.orientation = LinearLayout.HORIZONTAL
-            this.gravity = Gravity.CENTER_VERTICAL
+            this.orientation = LinearLayout.VERTICAL
             this.setPadding((10 * density).toInt(), (8 * density).toInt(), (10 * density).toInt(), (8 * density).toInt())
 
             val shape = GradientDrawable().apply {
@@ -550,16 +610,18 @@ class FloatingBubbleService : Service() {
             this.layoutParams = lp
         }
 
-        // SERVER Reading
-        val serverLayout = LinearLayout(this).apply {
+        // ROW 1: SRV & NET READOUTS (Fixed-width slots, singleLine, never wraps or pushes)
+        val row1 = LinearLayout(this).apply {
             this.orientation = LinearLayout.HORIZONTAL
             this.gravity = Gravity.CENTER_VERTICAL
-            val slp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            this.layoutParams = slp
+            val rlp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (22 * density).toInt())
+            this.layoutParams = rlp
         }
+
+        // SERVER Slot
         val sLed = View(this).apply {
             val dlp = LinearLayout.LayoutParams((6 * density).toInt(), (6 * density).toInt()).apply {
-                this.rightMargin = (5 * density).toInt()
+                this.rightMargin = (4 * density).toInt()
             }
             this.layoutParams = dlp
             this.background = createCircleDrawable(Color.parseColor("#EF4444"))
@@ -576,23 +638,28 @@ class FloatingBubbleService : Service() {
             this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             this.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
             this.setTextColor(Color.parseColor("#00F0FF"))
+            this.setSingleLine(true)
+            this.maxLines = 1
+            this.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            val vlp = LinearLayout.LayoutParams((46 * density).toInt(), LinearLayout.LayoutParams.WRAP_CONTENT)
+            this.layoutParams = vlp
         }
         serverStatusText = sVal
-        serverLayout.addView(sLed)
-        serverLayout.addView(sLabel)
-        serverLayout.addView(sVal)
-        statusBoard.addView(serverLayout)
+        row1.addView(sLed)
+        row1.addView(sLabel)
+        row1.addView(sVal)
 
-        // NET Reading
-        val netLayout = LinearLayout(this).apply {
-            this.orientation = LinearLayout.HORIZONTAL
-            this.gravity = Gravity.CENTER_VERTICAL
-            val nlp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            this.layoutParams = nlp
+        // Spacer between SRV and NET
+        val spacer1 = View(this).apply {
+            val slp = LinearLayout.LayoutParams((12 * density).toInt(), 1)
+            this.layoutParams = slp
         }
+        row1.addView(spacer1)
+
+        // NET Slot
         val nLed = View(this).apply {
             val dlp = LinearLayout.LayoutParams((6 * density).toInt(), (6 * density).toInt()).apply {
-                this.rightMargin = (5 * density).toInt()
+                this.rightMargin = (4 * density).toInt()
             }
             this.layoutParams = dlp
             this.background = createCircleDrawable(Color.parseColor("#10B981"))
@@ -609,23 +676,83 @@ class FloatingBubbleService : Service() {
             this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             this.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
             this.setTextColor(Color.parseColor("#00F0FF"))
+            this.setSingleLine(true)
+            this.maxLines = 1
+            this.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            val vlp = LinearLayout.LayoutParams((46 * density).toInt(), LinearLayout.LayoutParams.WRAP_CONTENT)
+            this.layoutParams = vlp
         }
         netStatusText = nVal
-        netLayout.addView(nLed)
-        netLayout.addView(nLabel)
-        netLayout.addView(nVal)
-        statusBoard.addView(netLayout)
+        row1.addView(nLed)
+        row1.addView(nLabel)
+        row1.addView(nVal)
 
-        // Speeds (UP/DN without Unicode arrows)
-        val speedTv = TextView(this).apply {
-            this.text = "DN 0 B/s"
+        statusBoard.addView(row1)
+
+        // ROW 2: SPEED READOUTS & QUEUE BADGE (Fixed-width slots, capped at 999 MB/s)
+        val row2 = LinearLayout(this).apply {
+            this.orientation = LinearLayout.HORIZONTAL
+            this.gravity = Gravity.CENTER_VERTICAL
+            val rlp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (18 * density).toInt()).apply {
+                this.topMargin = (3 * density).toInt()
+            }
+            this.layoutParams = rlp
+        }
+
+        val dnLabel = TextView(this).apply {
+            this.text = "DN "
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            this.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            this.setTextColor(Color.parseColor("#64748B"))
+        }
+        val dnVal = TextView(this).apply {
+            this.text = "0 B/s"
             this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
             this.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
             this.setTextColor(Color.parseColor("#38BDF8"))
+            this.setSingleLine(true)
+            this.maxLines = 1
+            val dnlp = LinearLayout.LayoutParams((68 * density).toInt(), LinearLayout.LayoutParams.WRAP_CONTENT)
+            this.layoutParams = dnlp
         }
-        trafficSpeedText = speedTv
-        statusBoard.addView(speedTv)
+        trafficDnText = dnVal
+        row2.addView(dnLabel)
+        row2.addView(dnVal)
 
+        val upLabel = TextView(this).apply {
+            this.text = "UP "
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            this.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            this.setTextColor(Color.parseColor("#64748B"))
+        }
+        val upVal = TextView(this).apply {
+            this.text = "0 B/s"
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            this.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            this.setTextColor(Color.parseColor("#38BDF8"))
+            this.setSingleLine(true)
+            this.maxLines = 1
+            val uplp = LinearLayout.LayoutParams((68 * density).toInt(), LinearLayout.LayoutParams.WRAP_CONTENT)
+            this.layoutParams = uplp
+        }
+        trafficUpText = upVal
+        row2.addView(upLabel)
+        row2.addView(upVal)
+
+        val queueTv = TextView(this).apply {
+            this.text = ""
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            this.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            this.setTextColor(Color.parseColor("#00F0FF"))
+            this.gravity = Gravity.END or Gravity.CENTER_VERTICAL
+            this.setSingleLine(true)
+            val qlp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            this.layoutParams = qlp
+        }
+        queueStatusText = queueTv
+        row2.addView(queueTv)
+
+        statusBoard.addView(row2)
         content.addView(statusBoard)
 
         // --- 3. PING MONITOR GRAPH ---
@@ -638,7 +765,7 @@ class FloatingBubbleService : Service() {
         pingGraphView = graph
         content.addView(graph)
 
-        // --- 4. INPUT & MECHANICAL PASTE ---
+        // --- 4. INPUT & ONE SMART KEY + RETRY KEY ---
         val inputContainer = LinearLayout(this).apply {
             this.orientation = LinearLayout.HORIZONTAL
             this.gravity = Gravity.CENTER_VERTICAL
@@ -654,7 +781,9 @@ class FloatingBubbleService : Service() {
         }
 
         val edit = EditText(this).apply {
-            val elp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            val elp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                this.rightMargin = (6 * density).toInt()
+            }
             this.layoutParams = elp
             this.hint = "Paste TikTok, YT, IG, FB link..."
             this.setHintTextColor(Color.parseColor("#64748B"))
@@ -667,14 +796,53 @@ class FloatingBubbleService : Service() {
         linkEditText = edit
         inputContainer.addView(edit)
 
-        val pasteBtn = createMechanicalButton(
-            text = "PASTE",
+        // RETRY Key (shows beside CLEAR key on failed download)
+        val retry = createMechanicalButton(
+            text = "RETRY",
             density = density,
             isAccent = true,
-            onClick = { handlePasteButtonClick() }
-        )
-        inputContainer.addView(pasteBtn)
+            isCompact = true,
+            onClick = { handleRetryButtonClick() }
+        ).apply {
+            val rlp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                this.rightMargin = (6 * density).toInt()
+            }
+            this.layoutParams = rlp
+            this.visibility = View.GONE
+        }
+        retryBtn = retry
+        inputContainer.addView(retry)
 
+        // ONE SMART KEY: Dynamic 3 states: PASTE (cyan), CLEAR (amber), CANCEL (red)
+        val smartBtn = TextView(this).apply {
+            this.text = "PASTE"
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            this.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            this.setTextColor(Color.WHITE)
+            this.gravity = Gravity.CENTER
+            this.setPadding((12 * density).toInt(), (7 * density).toInt(), (12 * density).toInt(), (7 * density).toInt())
+
+            val shape = GradientDrawable().apply {
+                this.shape = GradientDrawable.RECTANGLE
+                this.cornerRadius = 6 * density
+                this.setColor(Color.parseColor("#083344"))
+                this.setStroke((1.5f * density).toInt(), Color.parseColor("#00F0FF"))
+            }
+            this.background = shape
+
+            this.setOnTouchListener { v, event ->
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> v.translationY = 2 * density
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> v.translationY = 0f
+                }
+                false
+            }
+            this.setOnClickListener { handleSmartKeyClick() }
+        }
+        smartKeyBtn = smartBtn
+        inputContainer.addView(smartBtn)
+
+        // Optional manual Download button if auto-download is disabled
         val dlBtn = createMechanicalButton(
             text = "DOWNLOAD",
             density = density,
@@ -682,10 +850,14 @@ class FloatingBubbleService : Service() {
             onClick = {
                 val url = linkEditText?.text?.toString()?.trim()
                 if (!url.isNullOrBlank()) {
-                    triggerLinkProcessing(url, isManual = true)
+                    enqueueOrStartDownload(url, isManual = true)
                 }
             }
         ).apply {
+            val dlp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                this.leftMargin = (6 * density).toInt()
+            }
+            this.layoutParams = dlp
             this.visibility = if (autoDownloadEnabled) View.GONE else View.VISIBLE
         }
         manualDownloadBtn = dlBtn
@@ -695,12 +867,19 @@ class FloatingBubbleService : Service() {
 
         edit.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                lastTypingTimestamp = System.currentTimeMillis()
+                autoClearRunnable?.let { mainHandler.removeCallbacks(it) }
+            }
             override fun afterTextChanged(s: Editable?) {
+                updateSmartKeyUI()
                 val text = s?.toString()?.trim() ?: ""
+                if (text.isNotBlank() && retryBtn?.visibility == View.VISIBLE && text != lastFailedUrl) {
+                    retryBtn?.visibility = View.GONE
+                }
                 val supportedUrl = extractSupportedUrl(text)
                 if (supportedUrl != null && autoDownloadEnabled && !isDownloading) {
-                    triggerLinkProcessing(supportedUrl, isManual = false)
+                    enqueueOrStartDownload(supportedUrl, isManual = false)
                 }
             }
         })
@@ -839,6 +1018,100 @@ class FloatingBubbleService : Service() {
         content.addView(recentsContainer)
 
         refreshRecentDownloadsUI()
+        updateSmartKeyUI()
+    }
+
+    private fun updateSmartKeyUI() {
+        val btn = smartKeyBtn ?: return
+        val density = resources.displayMetrics.density
+        val text = linkEditText?.text?.toString()?.trim() ?: ""
+
+        if (isDownloading) {
+            btn.text = "CANCEL"
+            btn.setTextColor(Color.WHITE)
+            val shape = GradientDrawable().apply {
+                this.shape = GradientDrawable.RECTANGLE
+                this.cornerRadius = 6 * density
+                this.setColor(Color.parseColor("#7F1D1D")) // Deep Red
+                this.setStroke((1.5f * density).toInt(), Color.parseColor("#EF4444")) // Bright Red
+            }
+            btn.background = shape
+        } else if (text.isNotEmpty()) {
+            btn.text = "CLEAR"
+            btn.setTextColor(Color.WHITE)
+            val shape = GradientDrawable().apply {
+                this.shape = GradientDrawable.RECTANGLE
+                this.cornerRadius = 6 * density
+                this.setColor(Color.parseColor("#78350F")) // Deep Amber
+                this.setStroke((1.5f * density).toInt(), Color.parseColor("#F59E0B")) // Bright Amber
+            }
+            btn.background = shape
+        } else {
+            btn.text = "PASTE"
+            btn.setTextColor(Color.WHITE)
+            val shape = GradientDrawable().apply {
+                this.shape = GradientDrawable.RECTANGLE
+                this.cornerRadius = 6 * density
+                this.setColor(Color.parseColor("#083344")) // Deep Cyan
+                this.setStroke((1.5f * density).toInt(), Color.parseColor("#00F0FF")) // Bright Cyan
+            }
+            btn.background = shape
+        }
+    }
+
+    private fun handleSmartKeyClick() {
+        resetIdleFade()
+        if (isDownloading) {
+            cancelCurrentDownload()
+        } else if (!linkEditText?.text.isNullOrBlank()) {
+            // CLEAR state
+            linkEditText?.setText("")
+            progressContainer?.visibility = View.GONE
+            finishedActionsLayout?.visibility = View.GONE
+            progressStatusText?.text = ""
+            progressSpeedText?.text = ""
+            segmentedProgressBar?.setProgress(0)
+            retryBtn?.visibility = View.GONE
+            lastFailedUrl = null
+            tabInnerFrame?.resetToIdle()
+            panelMachineCard?.setGlowColor(Color.parseColor("#344259"))
+            updateSmartKeyUI()
+        } else {
+            // PASTE state
+            handlePasteButtonClick()
+        }
+    }
+
+    private fun handleRetryButtonClick() {
+        resetIdleFade()
+        val urlToRetry = lastFailedUrl ?: linkEditText?.text?.toString()?.trim()
+        if (!urlToRetry.isNullOrBlank()) {
+            retryBtn?.visibility = View.GONE
+            enqueueOrStartDownload(urlToRetry, isManual = true, force = true)
+        }
+    }
+
+    private fun cancelCurrentDownload() {
+        isDownloadCancelled = true
+        try { activeDownloadOutputStream?.close() } catch (_: Exception) {}
+        try { activeDownloadConnection?.disconnect() } catch (_: Exception) {}
+        activeTargetUri?.let { uri ->
+            try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
+        }
+        activeNormalizedUrl?.let { url ->
+            VideoDownloaderPlugin.inFlightDownloads.remove(url)
+        }
+        isDownloading = false
+        mainHandler.post {
+            progressStatusText?.text = "Cancelled"
+            progressSpeedText?.text = ""
+            segmentedProgressBar?.setProgress(0)
+            tabInnerFrame?.resetToIdle()
+            panelMachineCard?.setGlowColor(Color.parseColor("#344259"))
+            updateSmartKeyUI()
+            resetIdleFade()
+            processNextInQueue()
+        }
     }
 
     private fun refreshRecentDownloadsUI() {
@@ -1140,6 +1413,12 @@ class FloatingBubbleService : Service() {
     private fun openPanel() {
         if (isPanelOpen) return
         isPanelOpen = true
+        resetIdleFade()
+
+        if (tabInnerFrame?.isFinishedOrFailed() == true) {
+            tabInnerFrame?.resetToIdle()
+        }
+        panelMachineCard?.setGlowColor(Color.parseColor("#344259"))
 
         val overlay = panelRootOverlay ?: return
         val card = panelMachineCard ?: return
@@ -1170,6 +1449,7 @@ class FloatingBubbleService : Service() {
         mainHandler.post(trafficRunnable)
 
         refreshRecentDownloadsUI()
+        updateSmartKeyUI()
         checkClipboardOnOpen()
     }
 
@@ -1191,6 +1471,7 @@ class FloatingBubbleService : Service() {
                 override fun onAnimationEnd(animation: Animator) {
                     overlay.visibility = View.GONE
                     isPanelOpen = false
+                    resetIdleFade()
                 }
             })
         }
@@ -1208,8 +1489,9 @@ class FloatingBubbleService : Service() {
                     val lastDl = recentDownloads[supported] ?: 0L
                     if (System.currentTimeMillis() - lastDl > 120_000L) {
                         linkEditText?.setText(supported)
+                        updateSmartKeyUI()
                         if (autoDownloadEnabled && !isDownloading) {
-                            triggerLinkProcessing(supported, isManual = false)
+                            enqueueOrStartDownload(supported, isManual = false)
                         }
                     }
                 }
@@ -1223,12 +1505,19 @@ class FloatingBubbleService : Service() {
             val clip: ClipData? = cm.primaryClip
             if (clip != null && clip.itemCount > 0) {
                 val clipText = clip.getItemAt(0)?.coerceToText(this)?.toString()?.trim() ?: ""
-                linkEditText?.setText(clipText)
-                val supported = extractSupportedUrl(clipText)
-                if (supported != null) {
-                    triggerLinkProcessing(supported, isManual = false)
+                if (clipText.isNotBlank()) {
+                    linkEditText?.setText(clipText)
+                    updateSmartKeyUI()
+                    val supported = extractSupportedUrl(clipText)
+                    if (supported != null) {
+                        if (autoDownloadEnabled) {
+                            enqueueOrStartDownload(supported, isManual = false)
+                        }
+                    } else {
+                        Toast.makeText(this, "Clipboard URL not in supported platforms", Toast.LENGTH_SHORT).show()
+                    }
                 } else {
-                    Toast.makeText(this, "Clipboard URL not in supported platforms", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "Clipboard is empty", Toast.LENGTH_SHORT).show()
                 }
             } else {
                 Toast.makeText(this, "Clipboard is empty", Toast.LENGTH_SHORT).show()
@@ -1239,10 +1528,9 @@ class FloatingBubbleService : Service() {
     }
 
     // -------------------------------------------------------------------------
+    // 4. QUEUE & AUTO-DOWNLOAD PIPELINE
     // -------------------------------------------------------------------------
-    // 4. AUTO-DOWNLOAD & MEDIASTORE PIPELINE
-    // -------------------------------------------------------------------------
-    private fun triggerLinkProcessing(url: String, isManual: Boolean, force: Boolean = false) {
+    private fun enqueueOrStartDownload(url: String, isManual: Boolean, force: Boolean = false) {
         val supportedUrl = extractSupportedUrl(url)
         if (supportedUrl == null) {
             if (isManual) {
@@ -1253,14 +1541,20 @@ class FloatingBubbleService : Service() {
 
         val normUrl = VideoDownloaderPlugin.normalizeUrl(supportedUrl)
 
-        if (VideoDownloaderPlugin.inFlightDownloads.containsKey(normUrl) || isDownloading) {
-            if (isManual) {
-                Toast.makeText(this, "Download already in progress...", Toast.LENGTH_SHORT).show()
+        if (isDownloading) {
+            if (!downloadQueue.contains(normUrl) && normUrl != activeNormalizedUrl) {
+                downloadQueue.addLast(normUrl)
+                updateQueueUI()
+                Toast.makeText(this, "Queued (${downloadQueue.size} in queue)", Toast.LENGTH_SHORT).show()
+            } else {
+                if (isManual) {
+                    Toast.makeText(this, "Already downloading or in queue", Toast.LENGTH_SHORT).show()
+                }
             }
             return
         }
 
-        // Duplicate check before downloading: check if already downloaded & file still exists
+        // Duplicate check before downloading
         if (!force) {
             val dup = VideoDownloaderPlugin.checkDuplicateDownload(this, normUrl)
             if (dup != null) {
@@ -1277,6 +1571,19 @@ class FloatingBubbleService : Service() {
         startBackgroundDownload(normUrl, force)
     }
 
+    private fun updateQueueUI() {
+        tabInnerFrame?.setQueueCount(downloadQueue.size)
+        queueStatusText?.text = if (downloadQueue.isNotEmpty()) "QUEUE: ${downloadQueue.size}" else ""
+    }
+
+    private fun processNextInQueue() {
+        if (!isDownloading && downloadQueue.isNotEmpty()) {
+            val nextUrl = downloadQueue.removeFirst()
+            updateQueueUI()
+            startBackgroundDownload(nextUrl, force = false)
+        }
+    }
+
     private fun showAlreadyDownloadedUI(dup: JSONObject, normUrl: String) {
         val density = resources.displayMetrics.density
         val title = dup.optString("title", "Media")
@@ -1287,6 +1594,7 @@ class FloatingBubbleService : Service() {
         progressStatusText?.text = if (isPhoto) "Already downloaded: $title (${dup.optInt("imageCount", 0)} photos)" else "Already downloaded: $title"
         progressSpeedText?.text = "SAVED"
         segmentedProgressBar?.setProgress(100)
+        segmentedProgressBar?.setProgressColor(Color.parseColor("#10B981"))
 
         val row = finishedActionsLayout ?: return
         row.removeAllViews()
@@ -1377,11 +1685,26 @@ class FloatingBubbleService : Service() {
         }
 
         isDownloading = true
-        progressContainer?.visibility = View.VISIBLE
-        finishedActionsLayout?.visibility = View.GONE
-        segmentedProgressBar?.setProgress(0)
-        progressStatusText?.text = "Connecting to server..."
-        progressSpeedText?.text = ""
+        isDownloadCancelled = false
+        activeNormalizedUrl = normalizedUrl
+        activeTargetUri = null
+        activeDownloadConnection = null
+        activeDownloadOutputStream = null
+        lastFailedUrl = null
+
+        mainHandler.post {
+            resetIdleFade()
+            updateSmartKeyUI()
+            retryBtn?.visibility = View.GONE
+            tabInnerFrame?.setDownloading(0)
+            panelMachineCard?.setGlowColor(Color.parseColor("#00F0FF"))
+            segmentedProgressBar?.setProgressColor(Color.parseColor("#00F0FF"))
+            progressContainer?.visibility = View.VISIBLE
+            finishedActionsLayout?.visibility = View.GONE
+            segmentedProgressBar?.setProgress(0)
+            progressStatusText?.text = "Connecting to server..."
+            progressSpeedText?.text = ""
+        }
 
         backgroundExecutor.execute {
             var targetUri: Uri? = null
@@ -1395,6 +1718,7 @@ class FloatingBubbleService : Service() {
                 val healthUrl = "${backendUrl.removeSuffix("/")}/health"
 
                 for (attempt in 1..15) {
+                    if (isDownloadCancelled) throw InterruptedException("Cancelled")
                     mainHandler.post {
                         progressStatusText?.text = if (attempt > 1) "Waking server... ($attempt/15)" else "Connecting..."
                     }
@@ -1414,10 +1738,21 @@ class FloatingBubbleService : Service() {
                     Thread.sleep(2000L)
                 }
 
+                if (isDownloadCancelled) throw InterruptedException("Cancelled")
+
                 if (!isReady) {
                     mainHandler.post {
                         progressStatusText?.text = "Backend unreachable."
+                        progressSpeedText?.text = "ERR"
                         isDownloading = false
+                        lastFailedUrl = normalizedUrl
+                        tabInnerFrame?.setFailed()
+                        panelMachineCard?.setGlowColor(Color.parseColor("#EF4444"))
+                        segmentedProgressBar?.setProgressColor(Color.parseColor("#EF4444"))
+                        retryBtn?.visibility = View.VISIBLE
+                        updateSmartKeyUI()
+                        performHapticFeedback(isSuccess = false)
+                        mainHandler.postDelayed({ processNextInQueue() }, 1200L)
                     }
                     return@execute
                 }
@@ -1458,8 +1793,10 @@ class FloatingBubbleService : Service() {
                     iConn.disconnect()
                 } catch (_: Exception) {}
 
+                if (isDownloadCancelled) throw InterruptedException("Cancelled")
+
                 val cleanPlatform = VideoDownloaderPlugin.cleanPlatformName(platform, normalizedUrl)
-                val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US)
+                val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
                 val dateStr = sdf.format(java.util.Date())
 
                 if (title.isBlank() || title.equals("video", ignoreCase = true) || title.startsWith("OmniDrop", ignoreCase = true)) {
@@ -1482,6 +1819,7 @@ class FloatingBubbleService : Service() {
                     this.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
                     if (apiKey.isNotBlank()) this.setRequestProperty("x-api-key", apiKey)
                 }
+                activeDownloadConnection = conn
 
                 val payload = JSONObject().apply {
                     this.put("url", normalizedUrl)
@@ -1495,9 +1833,19 @@ class FloatingBubbleService : Service() {
                 val respCode = conn.responseCode
                 if (respCode != HttpURLConnection.HTTP_OK) {
                     val err = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: "HTTP $respCode"
+                    val shortReason = parseShortServerError(err)
+                    lastFailedUrl = normalizedUrl
                     mainHandler.post {
-                        progressStatusText?.text = "Download failed: $err"
+                        progressStatusText?.text = "Failed: $shortReason"
+                        progressSpeedText?.text = "ERR"
                         isDownloading = false
+                        tabInnerFrame?.setFailed()
+                        panelMachineCard?.setGlowColor(Color.parseColor("#EF4444"))
+                        segmentedProgressBar?.setProgressColor(Color.parseColor("#EF4444"))
+                        retryBtn?.visibility = View.VISIBLE
+                        updateSmartKeyUI()
+                        performHapticFeedback(isSuccess = false)
+                        mainHandler.postDelayed({ processNextInQueue() }, 1200L)
                     }
                     return@execute
                 }
@@ -1507,6 +1855,7 @@ class FloatingBubbleService : Service() {
                     mainHandler.post {
                         progressStatusText?.text = "Extracting photo slideshow archive..."
                         segmentedProgressBar?.setProgress(30)
+                        tabInnerFrame?.setDownloading(30)
                     }
 
                     val zis = ZipInputStream(conn.inputStream)
@@ -1516,10 +1865,11 @@ class FloatingBubbleService : Service() {
                     var photoIndex = 0
 
                     while (zipEntry != null) {
+                        if (isDownloadCancelled) throw InterruptedException("Cancelled")
                         val entryName = zipEntry.name
                         if (!zipEntry.isDirectory && (entryName.endsWith(".jpg", ignoreCase = true) || entryName.endsWith(".jpeg", ignoreCase = true) || entryName.endsWith(".png", ignoreCase = true) || entryName.endsWith(".webp", ignoreCase = true))) {
                             photoIndex++
-                            val paddedNum = String.format(java.util.Locale.US, "%02d", photoIndex)
+                            val paddedNum = String.format(Locale.US, "%02d", photoIndex)
                             val cleanTitle = title
                                 .replace("[\\\\/:*?\"<>|\\r\\n]".toRegex(), "_")
                                 .replace("\\s+".toRegex(), " ")
@@ -1549,6 +1899,7 @@ class FloatingBubbleService : Service() {
                                     val buf = ByteArray(8192)
                                     var len: Int
                                     while (zis.read(buf).also { len = it } != -1) {
+                                        if (isDownloadCancelled) throw InterruptedException("Cancelled")
                                         outStream.write(buf, 0, len)
                                     }
                                     outStream.flush()
@@ -1564,6 +1915,7 @@ class FloatingBubbleService : Service() {
                                 mainHandler.post {
                                     val pct = (30 + (currentCount * 5)).coerceAtMost(95)
                                     segmentedProgressBar?.setProgress(pct)
+                                    tabInnerFrame?.setDownloading(pct)
                                     progressStatusText?.text = "Saving photo $currentCount to Pictures/OmniDrop..."
                                     progressSpeedText?.text = "SAVING"
                                 }
@@ -1621,11 +1973,15 @@ class FloatingBubbleService : Service() {
                     )
 
                     mainHandler.post {
-                        tabInnerFrame?.flashGreen()
+                        tabInnerFrame?.setFinished()
+                        panelMachineCard?.setGlowColor(Color.parseColor("#10B981"))
+                        segmentedProgressBar?.setProgressColor(Color.parseColor("#10B981"))
                         isDownloading = false
                         segmentedProgressBar?.setProgress(100)
                         progressStatusText?.text = "Saved $totalPhotos photos"
                         progressSpeedText?.text = "READY"
+                        updateSmartKeyUI()
+                        performHapticFeedback(isSuccess = true)
 
                         val row = finishedActionsLayout
                         if (row != null) {
@@ -1649,8 +2005,9 @@ class FloatingBubbleService : Service() {
                             row.addView(dismissBtn)
                         }
 
-                        linkEditText?.setText("")
                         refreshRecentDownloadsUI()
+                        scheduleAutoClear()
+                        mainHandler.postDelayed({ processNextInQueue() }, 800L)
                     }
                     return@execute
                 }
@@ -1694,12 +2051,20 @@ class FloatingBubbleService : Service() {
                 if (targetUri == null) {
                     mainHandler.post {
                         progressStatusText?.text = "Failed to allocate gallery storage."
+                        progressSpeedText?.text = "ERR"
                         isDownloading = false
+                        tabInnerFrame?.setFailed()
+                        panelMachineCard?.setGlowColor(Color.parseColor("#EF4444"))
+                        segmentedProgressBar?.setProgressColor(Color.parseColor("#EF4444"))
+                        updateSmartKeyUI()
+                        performHapticFeedback(isSuccess = false)
                     }
                     return@execute
                 }
+                activeTargetUri = targetUri
 
                 output = resolver.openOutputStream(targetUri)
+                activeDownloadOutputStream = output
                 input = conn.inputStream
                 val totalBytes = conn.contentLengthLong
 
@@ -1710,6 +2075,7 @@ class FloatingBubbleService : Service() {
                 var bytesSinceLastSample: Long = 0
 
                 while (input.read(buffer).also { bytesRead = it } != -1) {
+                    if (isDownloadCancelled) throw InterruptedException("Cancelled")
                     output?.write(buffer, 0, bytesRead)
                     bytesCopied += bytesRead
                     bytesSinceLastSample += bytesRead
@@ -1718,7 +2084,7 @@ class FloatingBubbleService : Service() {
                     val diff = now - lastProgressUpdate
                     if (diff >= 300) {
                         val speedMbPerSec = (bytesSinceLastSample.toDouble() / (1024 * 1024)) / (diff / 1000.0)
-                        val totalMb = String.format(java.util.Locale.US, "%.1f", bytesCopied / (1024.0 * 1024.0))
+                        val totalMb = String.format(Locale.US, "%.1f", bytesCopied / (1024.0 * 1024.0))
                         val pct = if (totalBytes > 0) ((bytesCopied * 100) / totalBytes).toInt().coerceIn(1, 99) else 50
 
                         lastProgressUpdate = now
@@ -1726,8 +2092,9 @@ class FloatingBubbleService : Service() {
 
                         mainHandler.post {
                             segmentedProgressBar?.setProgress(pct)
+                            tabInnerFrame?.setDownloading(pct)
                             progressStatusText?.text = "$totalMb MB ($pct%)"
-                            progressSpeedText?.text = String.format(java.util.Locale.US, "DN %.1f MB/s", speedMbPerSec)
+                            progressSpeedText?.text = String.format(Locale.US, "DN %.1f MB/s", speedMbPerSec)
                         }
                     }
                 }
@@ -1744,7 +2111,6 @@ class FloatingBubbleService : Service() {
                 recentDownloads[normalizedUrl] = savedTimestamp
                 lastFinishedFileUri = targetUri.toString()
 
-                // Save to metadata store (keyed by fileName)
                 val metaObj = JSONObject().apply {
                     this.put("title", title)
                     this.put("platform", cleanPlatform)
@@ -1757,7 +2123,6 @@ class FloatingBubbleService : Service() {
                 }
                 VideoDownloaderPlugin.saveVideoMetadata(this, fileName, metaObj)
 
-                // Save to native history
                 val historyEntry = JSONObject().apply {
                     this.put("id", "dl_$savedTimestamp")
                     this.put("url", normalizedUrl)
@@ -1773,7 +2138,6 @@ class FloatingBubbleService : Service() {
                 VideoDownloaderPlugin.saveHistoryEntry(this, historyEntry)
                 VideoDownloaderPlugin.instance?.emitNativeDownloadFinished(historyEntry)
 
-                // Finished notification
                 NotificationHelper.showDownloadFinishedNotification(
                     this,
                     "Saved to Gallery",
@@ -1782,13 +2146,16 @@ class FloatingBubbleService : Service() {
                 )
 
                 mainHandler.post {
-                    tabInnerFrame?.flashGreen()
+                    tabInnerFrame?.setFinished()
+                    panelMachineCard?.setGlowColor(Color.parseColor("#10B981"))
+                    segmentedProgressBar?.setProgressColor(Color.parseColor("#10B981"))
                     isDownloading = false
                     segmentedProgressBar?.setProgress(100)
                     progressStatusText?.text = "Saved to ${if (isAudio) "Music/OmniDrop" else "Movies/OmniDrop"}"
                     progressSpeedText?.text = "READY"
+                    updateSmartKeyUI()
+                    performHapticFeedback(isSuccess = true)
 
-                    // Reset finished buttons
                     val row = finishedActionsLayout
                     if (row != null) {
                         row.removeAllViews()
@@ -1811,17 +2178,41 @@ class FloatingBubbleService : Service() {
                         row.addView(dismissBtn)
                     }
 
-                    linkEditText?.setText("")
                     refreshRecentDownloadsUI()
+                    scheduleAutoClear()
+                    mainHandler.postDelayed({ processNextInQueue() }, 800L)
                 }
 
             } catch (e: Exception) {
                 if (targetUri != null) {
                     try { contentResolver.delete(targetUri, null, null) } catch (_: Exception) {}
                 }
-                mainHandler.post {
-                    progressStatusText?.text = "Error: ${e.message ?: "Failed"}"
-                    isDownloading = false
+                if (isDownloadCancelled) {
+                    mainHandler.post {
+                        progressStatusText?.text = "Cancelled"
+                        progressSpeedText?.text = ""
+                        segmentedProgressBar?.setProgress(0)
+                        tabInnerFrame?.resetToIdle()
+                        panelMachineCard?.setGlowColor(Color.parseColor("#344259"))
+                        isDownloading = false
+                        updateSmartKeyUI()
+                    }
+                } else {
+                    val rawMsg = e.message ?: "Failed"
+                    val shortReason = parseShortServerError(rawMsg)
+                    lastFailedUrl = normalizedUrl
+                    mainHandler.post {
+                        progressStatusText?.text = "Failed: $shortReason"
+                        progressSpeedText?.text = "ERR"
+                        isDownloading = false
+                        tabInnerFrame?.setFailed()
+                        panelMachineCard?.setGlowColor(Color.parseColor("#EF4444"))
+                        segmentedProgressBar?.setProgressColor(Color.parseColor("#EF4444"))
+                        retryBtn?.visibility = View.VISIBLE
+                        updateSmartKeyUI()
+                        performHapticFeedback(isSuccess = false)
+                        mainHandler.postDelayed({ processNextInQueue() }, 1200L)
+                    }
                 }
             } finally {
                 VideoDownloaderPlugin.inFlightDownloads.remove(normalizedUrl)
@@ -1830,6 +2221,88 @@ class FloatingBubbleService : Service() {
                 conn?.disconnect()
             }
         }
+    }
+
+    private fun scheduleAutoClear() {
+        if (!autoClearEnabled) return
+        autoClearRunnable?.let { mainHandler.removeCallbacks(it) }
+        autoClearRunnable = Runnable {
+            if (!isDownloading && (System.currentTimeMillis() - lastTypingTimestamp >= 3800L)) {
+                linkEditText?.setText("")
+                progressContainer?.visibility = View.GONE
+                finishedActionsLayout?.visibility = View.GONE
+                progressStatusText?.text = ""
+                progressSpeedText?.text = ""
+                segmentedProgressBar?.setProgress(0)
+                updateSmartKeyUI()
+            }
+        }
+        mainHandler.postDelayed(autoClearRunnable!!, 4000L)
+    }
+
+    private fun parseShortServerError(rawErr: String): String {
+        if (rawErr.isBlank()) return "Server error"
+        try {
+            if (rawErr.startsWith("{")) {
+                val json = JSONObject(rawErr)
+                if (json.has("detail")) {
+                    val d = json.getString("detail").trim()
+                    if (d.isNotBlank()) return d.take(85)
+                }
+                if (json.has("error")) {
+                    val e = json.getString("error").trim()
+                    if (e.isNotBlank()) return e.take(85)
+                }
+            }
+        } catch (_: Exception) {}
+        val cleaned = rawErr.replace("\n", " ").trim()
+        return if (cleaned.length > 85) cleaned.take(82) + "..." else cleaned
+    }
+
+    private fun performHapticFeedback(isSuccess: Boolean) {
+        if (!vibrateEnabled) return
+        try {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+            if (audioManager != null && audioManager.ringerMode == android.media.AudioManager.RINGER_MODE_SILENT) {
+                return
+            }
+
+            val hasVibratePermission = androidx.core.content.ContextCompat.checkSelfPermission(
+                this,
+                android.Manifest.permission.VIBRATE
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+            if (!hasVibratePermission) return
+
+            val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val vibratorManager = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? android.os.VibratorManager
+                vibratorManager?.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                getSystemService(Context.VIBRATOR_SERVICE) as? android.os.Vibrator
+            } ?: return
+
+            if (!vibrator.hasVibrator()) return
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (isSuccess) {
+                    val effect = android.os.VibrationEffect.createOneShot(45L, android.os.VibrationEffect.DEFAULT_AMPLITUDE)
+                    vibrator.vibrate(effect)
+                } else {
+                    val pattern = longArrayOf(0, 40, 60, 40)
+                    val effect = android.os.VibrationEffect.createWaveform(pattern, -1)
+                    vibrator.vibrate(effect)
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                if (isSuccess) {
+                    vibrator.vibrate(45L)
+                } else {
+                    val pattern = longArrayOf(0, 40, 60, 40)
+                    vibrator.vibrate(pattern, -1)
+                }
+            }
+        } catch (_: Exception) {}
     }
 
     private fun openFinishedVideo() {
@@ -1951,20 +2424,35 @@ class FloatingBubbleService : Service() {
         }
     }
 
+    private fun formatPingDisplay(pingMs: Int, stateStr: String): String {
+        if (stateStr == "SLEEP") return "ZZ"
+        if (stateStr == "WAKING") return "WAKE"
+        if (stateStr == "OFF" || pingMs < 0) return "OFF"
+        return when {
+            pingMs <= 999 -> "${pingMs}ms"
+            pingMs < 10000 -> String.format(Locale.US, "%.1fs", pingMs / 1000.0)
+            else -> "10s+"
+        }
+    }
+
     private fun updateInstrumentUI() {
-        // 1. Update Edge Tab
         tabInnerFrame?.updateStatus(serverState, serverPingMs)
 
-        // 2. Update Server Instrument
+        // Server Instrument
         when (serverState) {
             "ONLINE" -> {
                 serverLedDot?.background = createCircleDrawable(Color.parseColor("#10B981"))
-                serverStatusText?.text = "${serverPingMs}ms"
+                serverStatusText?.text = formatPingDisplay(serverPingMs, serverState)
                 serverStatusText?.setTextColor(Color.parseColor("#00F0FF"))
             }
             "SLEEP" -> {
                 serverLedDot?.background = createCircleDrawable(Color.parseColor("#F59E0B"))
-                serverStatusText?.text = "SLEEP"
+                serverStatusText?.text = "ZZ"
+                serverStatusText?.setTextColor(Color.parseColor("#F59E0B"))
+            }
+            "WAKING" -> {
+                serverLedDot?.background = createCircleDrawable(Color.parseColor("#F59E0B"))
+                serverStatusText?.text = "WAKE"
                 serverStatusText?.setTextColor(Color.parseColor("#F59E0B"))
             }
             else -> {
@@ -1974,11 +2462,11 @@ class FloatingBubbleService : Service() {
             }
         }
 
-        // 3. Update Net Instrument
-        if (netPingMs > 0) {
+        // Net Instrument
+        if (netPingMs >= 0) {
             val netColor = if (netPingMs < 300) Color.parseColor("#10B981") else Color.parseColor("#F59E0B")
             netLedDot?.background = createCircleDrawable(netColor)
-            netStatusText?.text = "${netPingMs}ms"
+            netStatusText?.text = formatPingDisplay(netPingMs, "ONLINE")
             netStatusText?.setTextColor(Color.parseColor("#00F0FF"))
         } else {
             netLedDot?.background = createCircleDrawable(Color.parseColor("#EF4444"))
@@ -1986,7 +2474,7 @@ class FloatingBubbleService : Service() {
             netStatusText?.setTextColor(Color.parseColor("#EF4444"))
         }
 
-        // 4. Update Ping Graph with active reading
+        // Ping Graph
         val sample = when {
             serverPingMs > 0 -> serverPingMs
             netPingMs > 0 -> netPingMs
@@ -2008,9 +2496,8 @@ class FloatingBubbleService : Service() {
             val rxSpeed = rxDiff.toDouble() / (timeDiff / 1000.0)
             val txSpeed = txDiff.toDouble() / (timeDiff / 1000.0)
 
-            val rxFmt = formatBytesSpeed(rxSpeed)
-            val txFmt = formatBytesSpeed(txSpeed)
-            trafficSpeedText?.text = "DN $rxFmt  UP $txFmt"
+            trafficDnText?.text = formatCappedSpeed(rxSpeed)
+            trafficUpText?.text = formatCappedSpeed(txSpeed)
         }
 
         lastRxBytes = currentRx
@@ -2018,11 +2505,13 @@ class FloatingBubbleService : Service() {
         lastTrafficSampleTime = now
     }
 
-    private fun formatBytesSpeed(bytesPerSec: Double): String {
+    private fun formatCappedSpeed(bytesPerSec: Double): String {
+        val mb = bytesPerSec / (1024.0 * 1024.0)
         return when {
-            bytesPerSec >= (1024 * 1024) -> String.format("%.1f MB/s", bytesPerSec / (1024 * 1024))
-            bytesPerSec >= 1024 -> String.format("%.0f KB/s", bytesPerSec / 1024)
-            else -> String.format("%.0f B/s", bytesPerSec)
+            mb >= 999.0 -> "999 MB/s"
+            mb >= 1.0 -> String.format(Locale.US, "%.1f MB/s", mb)
+            bytesPerSec >= 1024.0 -> String.format(Locale.US, "%.0f KB/s", bytesPerSec / 1024.0)
+            else -> String.format(Locale.US, "%.0f B/s", bytesPerSec.coerceAtLeast(0.0))
         }
     }
 
@@ -2039,6 +2528,8 @@ class FloatingBubbleService : Service() {
         try { unregisterReceiver(screenReceiver) } catch (_: Exception) {}
         mainHandler.removeCallbacks(dualPingRunnable)
         mainHandler.removeCallbacks(trafficRunnable)
+        mainHandler.removeCallbacks(idleFadeRunnable)
+        autoClearRunnable?.let { mainHandler.removeCallbacks(it) }
 
         tabRootView?.let { try { windowManager?.removeView(it) } catch (_: Exception) {} }
         panelRootOverlay?.let { try { windowManager?.removeView(it) } catch (_: Exception) {} }
@@ -2053,14 +2544,27 @@ class FloatingBubbleService : Service() {
      * Machined Metal Latch Handle for the Edge Tab:
      * - Dark gunmetal with bevel highlights
      * - Status LED dot
-     * - Digital segment ms number or "ZZ" or "OFF"
+     * - Real-time state colors: IDLE (ping/ZZ/OFF), DOWNLOADING (cyan bottom-up fill + %), FINISHED (green + ✓), FAILED (red + !)
+     * - Small queue count badge
      */
     class EdgeLatchTabView(context: Context, private var isLeft: Boolean) : FrameLayout(context) {
+        enum class TabVisualState {
+            IDLE,
+            DOWNLOADING,
+            FINISHED,
+            FAILED
+        }
+
+        private var visualState = TabVisualState.IDLE
         private var state: String = "OFF"
         private var pingMs: Int = -1
-        private var isFlashingGreen: Boolean = false
+        private var downloadPercent: Int = 0
+        private var queueCount: Int = 0
+        private var pulseAnimator: ValueAnimator? = null
+        private var pulseScale: Float = 1.0f
 
         private val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val dlFillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val bevelLightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             this.color = Color.parseColor("#44526B")
             this.style = Paint.Style.STROKE
@@ -2088,7 +2592,27 @@ class FloatingBubbleService : Service() {
             this.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.NORMAL)
             this.textAlign = Paint.Align.CENTER
         }
+        private val symbolPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = Color.WHITE
+            this.textSize = 18f * context.resources.displayMetrics.scaledDensity
+            this.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            this.textAlign = Paint.Align.CENTER
+        }
         private val ledPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val badgeBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = Color.parseColor("#00F0FF")
+        }
+        private val badgeBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = Color.parseColor("#083344")
+            this.style = Paint.Style.STROKE
+            this.strokeWidth = 1.5f * context.resources.displayMetrics.density
+        }
+        private val badgeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = Color.parseColor("#05080E")
+            this.textSize = 8.5f * context.resources.displayMetrics.scaledDensity
+            this.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            this.textAlign = Paint.Align.CENTER
+        }
 
         init {
             setWillNotDraw(false)
@@ -2102,16 +2626,65 @@ class FloatingBubbleService : Service() {
         fun updateStatus(srvState: String, ping: Int) {
             state = srvState
             pingMs = ping
+            if (visualState == TabVisualState.IDLE) {
+                postInvalidate()
+            }
+        }
+
+        fun setDownloading(percent: Int) {
+            visualState = TabVisualState.DOWNLOADING
+            downloadPercent = percent.coerceIn(0, 100)
+            pulseAnimator?.cancel()
+            pulseScale = 1.0f
+            scaleX = 1.0f
+            scaleY = 1.0f
             postInvalidate()
         }
 
-        fun flashGreen() {
-            isFlashingGreen = true
+        fun setFinished() {
+            visualState = TabVisualState.FINISHED
+            startPulseAnimation()
             postInvalidate()
-            postDelayed({
-                isFlashingGreen = false
-                postInvalidate()
-            }, 1800L)
+        }
+
+        fun setFailed() {
+            visualState = TabVisualState.FAILED
+            startPulseAnimation()
+            postInvalidate()
+        }
+
+        fun isFinishedOrFailed(): Boolean {
+            return visualState == TabVisualState.FINISHED || visualState == TabVisualState.FAILED
+        }
+
+        fun resetToIdle() {
+            visualState = TabVisualState.IDLE
+            pulseAnimator?.cancel()
+            pulseScale = 1.0f
+            scaleX = 1.0f
+            scaleY = 1.0f
+            postInvalidate()
+        }
+
+        fun setQueueCount(count: Int) {
+            queueCount = count
+            postInvalidate()
+        }
+
+        private fun startPulseAnimation() {
+            pulseAnimator?.cancel()
+            val anim = ValueAnimator.ofFloat(1.0f, 1.14f, 1.0f).apply {
+                this.duration = 450L
+                this.repeatCount = 2
+                this.addUpdateListener { va ->
+                    val v = va.animatedValue as Float
+                    pulseScale = v
+                    scaleX = v
+                    scaleY = v
+                }
+            }
+            pulseAnimator = anim
+            anim.start()
         }
 
         override fun onDraw(canvas: Canvas) {
@@ -2123,53 +2696,112 @@ class FloatingBubbleService : Service() {
             val density = context.resources.displayMetrics.density
             val r = 16f * density
 
-            // 1. Body Gradient
-            if (isFlashingGreen) {
-                bodyPaint.shader = LinearGradient(0f, 0f, w, h, Color.parseColor("#065F46"), Color.parseColor("#047857"), Shader.TileMode.CLAMP)
-            } else {
-                bodyPaint.shader = LinearGradient(0f, 0f, w, h, Color.parseColor("#101522"), Color.parseColor("#192231"), Shader.TileMode.CLAMP)
-            }
-
             val path = Path()
             val radii = if (isLeft) {
                 floatArrayOf(0f, 0f, r, r, r, r, 0f, 0f)
             } else {
                 floatArrayOf(r, r, 0f, 0f, 0f, 0f, r, r)
             }
-            path.addRoundRect(RectF(0f, 0f, w, h), radii, Path.Direction.CW)
-            canvas.drawPath(path, bodyPaint)
+            val tabRect = RectF(0f, 0f, w, h)
+            path.addRoundRect(tabRect, radii, Path.Direction.CW)
+
+            // 1. Base Body Gradient
+            when (visualState) {
+                TabVisualState.FINISHED -> {
+                    bodyPaint.shader = LinearGradient(0f, 0f, w, h, Color.parseColor("#059669"), Color.parseColor("#047857"), Shader.TileMode.CLAMP)
+                    canvas.drawPath(path, bodyPaint)
+                }
+                TabVisualState.FAILED -> {
+                    bodyPaint.shader = LinearGradient(0f, 0f, w, h, Color.parseColor("#DC2626"), Color.parseColor("#991B1B"), Shader.TileMode.CLAMP)
+                    canvas.drawPath(path, bodyPaint)
+                }
+                else -> {
+                    bodyPaint.shader = LinearGradient(0f, 0f, w, h, Color.parseColor("#101522"), Color.parseColor("#192231"), Shader.TileMode.CLAMP)
+                    canvas.drawPath(path, bodyPaint)
+
+                    // If DOWNLOADING: Fill from bottom up with cyan glow proportional to percent
+                    if (visualState == TabVisualState.DOWNLOADING) {
+                        val fillTop = h * (1f - (downloadPercent / 100f))
+                        canvas.save()
+                        canvas.clipPath(path)
+                        dlFillPaint.shader = LinearGradient(0f, fillTop, 0f, h, Color.parseColor("#00F0FF"), Color.parseColor("#0284C7"), Shader.TileMode.CLAMP)
+                        dlFillPaint.alpha = 180
+                        canvas.drawRect(0f, fillTop, w, h, dlFillPaint)
+                        canvas.restore()
+                    }
+                }
+            }
 
             // 2. Bevel & Specular Highlight
-            canvas.drawPath(path, if (isLeft) bevelLightPaint else bevelDarkPaint)
+            val bevelColor = when (visualState) {
+                TabVisualState.FINISHED -> Color.parseColor("#34D399")
+                TabVisualState.FAILED -> Color.parseColor("#F87171")
+                TabVisualState.DOWNLOADING -> Color.parseColor("#00F0FF")
+                else -> if (isLeft) Color.parseColor("#44526B") else Color.parseColor("#05080E")
+            }
+            bevelLightPaint.color = bevelColor
+            canvas.drawPath(path, bevelLightPaint)
             canvas.drawLine(w * 0.5f, h * 0.15f, w * 0.5f, h * 0.85f, highlightLinePaint)
 
             // 3. Status LED Dot
-            val ledColor = when {
-                isFlashingGreen -> Color.parseColor("#34D399")
-                state == "ONLINE" -> Color.parseColor("#10B981")
-                state == "SLEEP" -> Color.parseColor("#F59E0B")
-                else -> Color.parseColor("#EF4444")
+            val ledColor = when (visualState) {
+                TabVisualState.FINISHED -> Color.parseColor("#34D399")
+                TabVisualState.FAILED -> Color.parseColor("#F87171")
+                TabVisualState.DOWNLOADING -> Color.parseColor("#00F0FF")
+                else -> when (state) {
+                    "ONLINE" -> Color.parseColor("#10B981")
+                    "SLEEP" -> Color.parseColor("#F59E0B")
+                    else -> Color.parseColor("#EF4444")
+                }
             }
             ledPaint.color = ledColor
             canvas.drawCircle(w * 0.5f, 15f * density, 3.5f * density, ledPaint)
 
-            // 4. Digital Text
+            // 4. Center Display Text / Symbol
             val textY = 44f * density
-            when (state) {
-                "ONLINE" -> {
+            when (visualState) {
+                TabVisualState.FINISHED -> {
+                    symbolPaint.textSize = 17f * context.resources.displayMetrics.scaledDensity
+                    canvas.drawText("✓", w * 0.5f, textY + (2f * density), symbolPaint)
+                }
+                TabVisualState.FAILED -> {
+                    symbolPaint.textSize = 19f * context.resources.displayMetrics.scaledDensity
+                    canvas.drawText("!", w * 0.5f, textY + (2f * density), symbolPaint)
+                }
+                TabVisualState.DOWNLOADING -> {
                     textPaint.color = Color.parseColor("#00F0FF")
-                    val display = if (pingMs > 0) "$pingMs" else "—"
-                    canvas.drawText(display, w * 0.5f, textY, textPaint)
-                    canvas.drawText("ms", w * 0.5f, textY + (12f * density), subTextPaint)
+                    canvas.drawText("${downloadPercent}%", w * 0.5f, textY, textPaint)
                 }
-                "SLEEP" -> {
-                    textPaint.color = Color.parseColor("#F59E0B")
-                    canvas.drawText("ZZ", w * 0.5f, textY, textPaint)
+                TabVisualState.IDLE -> {
+                    when (state) {
+                        "ONLINE" -> {
+                            textPaint.color = Color.parseColor("#00F0FF")
+                            val display = if (pingMs in 0..999) "$pingMs" else if (pingMs > 999) String.format(Locale.US, "%.1fs", pingMs / 1000.0) else "—"
+                            canvas.drawText(display, w * 0.5f, textY, textPaint)
+                            if (pingMs in 0..999) {
+                                canvas.drawText("ms", w * 0.5f, textY + (12f * density), subTextPaint)
+                            }
+                        }
+                        "SLEEP" -> {
+                            textPaint.color = Color.parseColor("#F59E0B")
+                            canvas.drawText("ZZ", w * 0.5f, textY, textPaint)
+                        }
+                        else -> {
+                            textPaint.color = Color.parseColor("#EF4444")
+                            canvas.drawText("OFF", w * 0.5f, textY, textPaint)
+                        }
+                    }
                 }
-                else -> {
-                    textPaint.color = Color.parseColor("#EF4444")
-                    canvas.drawText("OFF", w * 0.5f, textY, textPaint)
-                }
+            }
+
+            // 5. Queue Badge (if queueCount > 0)
+            if (queueCount > 0) {
+                val badgeX = if (isLeft) w - (8f * density) else (8f * density)
+                val badgeY = 9f * density
+                val badgeR = 6.5f * density
+                canvas.drawCircle(badgeX, badgeY, badgeR, badgeBgPaint)
+                canvas.drawCircle(badgeX, badgeY, badgeR, badgeBorderPaint)
+                canvas.drawText("$queueCount", badgeX, badgeY + (3f * density), badgeTextPaint)
             }
         }
     }
@@ -2201,6 +2833,11 @@ class FloatingBubbleService : Service() {
             setWillNotDraw(false)
         }
 
+        fun setGlowColor(color: Int) {
+            bevelLightPaint.color = color
+            postInvalidate()
+        }
+
         override fun onDraw(canvas: Canvas) {
             val w = width.toFloat()
             val h = height.toFloat()
@@ -2209,7 +2846,7 @@ class FloatingBubbleService : Service() {
             val density = context.resources.displayMetrics.density
             val r = 18f * density
 
-            // 1. Opaque Dark Gunmetal Body Gradient (BUG FIX: NEVER translucent, NEVER red)
+            // 1. Opaque Dark Gunmetal Body Gradient
             bgPaint.shader = LinearGradient(0f, 0f, 0f, h, Color.parseColor("#0B0E14"), Color.parseColor("#151A24"), Shader.TileMode.CLAMP)
             val rect = RectF(0f, 0f, w, h)
             canvas.drawRoundRect(rect, r, r, bgPaint)
@@ -2249,6 +2886,7 @@ class FloatingBubbleService : Service() {
     class SegmentedProgressBar(context: Context) : View(context) {
         private var progressPercent: Int = 0
         private val totalSegments = 16
+        private var barColor: Int = Color.parseColor("#00F0FF")
         private val activePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             this.color = Color.parseColor("#00F0FF")
         }
@@ -2271,6 +2909,12 @@ class FloatingBubbleService : Service() {
             postInvalidate()
         }
 
+        fun setProgressColor(color: Int) {
+            barColor = color
+            activePaint.color = color
+            postInvalidate()
+        }
+
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             val w = width.toFloat()
@@ -2282,7 +2926,7 @@ class FloatingBubbleService : Service() {
             val segmentW = (w - (gap * (totalSegments - 1))) / totalSegments.toFloat()
             val activeCount = ((progressPercent / 100f) * totalSegments).toInt()
 
-            activePaint.color = if (progressPercent >= 100) Color.parseColor("#10B981") else Color.parseColor("#00F0FF")
+            activePaint.color = barColor
 
             for (i in 0 until totalSegments) {
                 val left = i * (segmentW + gap)

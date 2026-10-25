@@ -32,6 +32,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   repeatMode: 'off',
   floatingSide: 'right',
   floatingShowMs: true,
+  floatingAutoClear: true,
+  floatingVibrate: true,
 };
 
 export default function App() {
@@ -75,6 +77,8 @@ export default function App() {
         repeatMode: newSettings.repeatMode,
         floatingSide: newSettings.floatingSide,
         floatingShowMs: newSettings.floatingShowMs,
+        floatingAutoClear: newSettings.floatingAutoClear ?? true,
+        floatingVibrate: newSettings.floatingVibrate ?? true,
       }).catch(() => {});
     } catch {}
   };
@@ -90,6 +94,8 @@ export default function App() {
       repeatMode: settings.repeatMode,
       floatingSide: settings.floatingSide,
       floatingShowMs: settings.floatingShowMs,
+      floatingAutoClear: settings.floatingAutoClear ?? true,
+      floatingVibrate: settings.floatingVibrate ?? true,
     }).catch(() => {});
   }, []);
 

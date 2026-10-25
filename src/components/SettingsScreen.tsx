@@ -45,6 +45,8 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   const [isBubbleActive, setIsBubbleActive] = useState(settings.floatingBubbleEnabled || false);
   const [floatingSide, setFloatingSide] = useState<'left' | 'right'>(settings.floatingSide || 'right');
   const [floatingShowMs, setFloatingShowMs] = useState(settings.floatingShowMs ?? true);
+  const [floatingAutoClear, setFloatingAutoClear] = useState(settings.floatingAutoClear ?? true);
+  const [floatingVibrate, setFloatingVibrate] = useState(settings.floatingVibrate ?? true);
   const [hasOverlayPerm, setHasOverlayPerm] = useState<boolean>(false);
 
   // Connection test state
@@ -98,6 +100,8 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       floatingBubbleEnabled: isBubbleActive,
       floatingSide,
       floatingShowMs,
+      floatingAutoClear,
+      floatingVibrate,
     };
     onUpdateSettings(updated);
 
@@ -111,6 +115,8 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       repeatMode,
       floatingSide,
       floatingShowMs,
+      floatingAutoClear,
+      floatingVibrate,
     }).catch(() => {});
 
     setIsSaved(true);
@@ -454,6 +460,20 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             'Display live server ping counter on floating edge handle',
             floatingShowMs,
             () => setFloatingShowMs(!floatingShowMs)
+          )}
+
+          {renderMechanicalToggle(
+            'AUTO-CLEAR AFTER DOWNLOAD',
+            'Automatically clear link field and progress 4s after success',
+            floatingAutoClear,
+            () => setFloatingAutoClear(!floatingAutoClear)
+          )}
+
+          {renderMechanicalToggle(
+            'VIBRATE WHEN FINISHED',
+            'Short haptic pulse on download success or failure',
+            floatingVibrate,
+            () => setFloatingVibrate(!floatingVibrate)
           )}
 
           {/* Overlay Permission Status Bar */}

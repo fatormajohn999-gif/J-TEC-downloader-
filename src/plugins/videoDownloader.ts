@@ -40,6 +40,8 @@ export interface VideoDownloaderPlugin {
     repeatMode?: 'off' | 'one' | 'all';
     floatingSide?: 'left' | 'right';
     floatingShowMs?: boolean;
+    floatingAutoClear?: boolean;
+    floatingVibrate?: boolean;
   }): Promise<{ saved: boolean }>;
   clearMetadataCache(): Promise<{ cleared: boolean }>;
   getLastCrash(): Promise<{ crash: string }>;

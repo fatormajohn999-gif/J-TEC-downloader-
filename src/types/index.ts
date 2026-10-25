@@ -67,4 +67,6 @@ export interface AppSettings {
   repeatMode?: 'off' | 'one' | 'all';
   floatingSide?: 'left' | 'right';
   floatingShowMs?: boolean;
+  floatingAutoClear?: boolean;
+  floatingVibrate?: boolean;
 }

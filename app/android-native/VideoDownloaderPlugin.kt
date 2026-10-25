@@ -443,6 +443,8 @@ class VideoDownloaderPlugin : Plugin() {
         val repeatMode = call.getString("repeatMode") ?: "off"
         val floatingSide = call.getString("floatingSide") ?: "right"
         val floatingShowMs = call.getBoolean("floatingShowMs", true) ?: true
+        val floatingAutoClear = call.getBoolean("floatingAutoClear", true) ?: true
+        val floatingVibrate = call.getBoolean("floatingVibrate", true) ?: true
 
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().apply {
@@ -455,10 +457,12 @@ class VideoDownloaderPlugin : Plugin() {
             this.putString("repeat_mode", repeatMode)
             this.putString("floating_side", floatingSide)
             this.putBoolean("floating_show_ms", floatingShowMs)
+            this.putBoolean("floating_auto_clear", floatingAutoClear)
+            this.putBoolean("floating_vibrate", floatingVibrate)
             this.apply()
         }
 
-        FloatingBubbleService.instance?.updateSettings(backendUrl, apiKey, defaultQuality, autoDownload)
+        FloatingBubbleService.instance?.updateSettings(backendUrl, apiKey, defaultQuality, autoDownload, floatingAutoClear, floatingVibrate)
 
         val result = JSObject().apply {
             this.put("saved", true)
