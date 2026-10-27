@@ -111,6 +111,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import re
+          import os
 
           # ---- AndroidManifest.xml ----
           p = "android/app/src/main/AndroidManifest.xml"
@@ -122,6 +123,7 @@ jobs:
               '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n'
               '    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />\n'
               '    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />\n'
+              '    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />\n'
               '    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />\n'
           )
           comps = (
@@ -162,8 +164,11 @@ jobs:
               s = re.sub(r"android\s*\{", "android {\n    kotlinOptions { jvmTarget = '21' }", s, count=1)
           if "omnidrop-debug.keystore" not in s:
               s = re.sub(r"android\s*\{", "android {\n    signingConfigs {\n        debug {\n            storeFile file(System.getenv('GITHUB_WORKSPACE') + '/signing/omnidrop-debug.keystore')\n            storePassword 'omnidrop123'\n            keyAlias 'omnidrop'\n            keyPassword 'omnidrop123'\n        }\n    }", s, count=1)
+          run_no = os.environ.get("GITHUB_RUN_NUMBER", "1")
+          s = re.sub(r"versionCode\s+\d+", "versionCode " + run_no, s, count=1)
+          s = re.sub(r'versionName\s+"[^"]*"', 'versionName "1.0.' + run_no + '"', s, count=1)
           open(p, "w").write(s)
-          print("Patched manifest and gradle")
+          print("Patched manifest and gradle, version 1.0." + run_no)
           PY
 
       - name: Generate Custom App Icon
@@ -197,10 +202,22 @@ jobs:
         run: |
           cd android
           ./gradlew assembleDebug --console=plain > ../gradle-build.log 2>&1 || {
-            echo "=========== KEY ERRORS ==========="
-            grep -nE "^e: |error:|What went wrong|Execution failed|Caused by|Could not|Unresolved|incompatible" -A3 ../gradle-build.log | head -80
+            cd ..
+            # Compact list of the real compile errors: file, line, message
+            grep -E "^e: " gradle-build.log | sed -E 's#file:///home/runner/work/[^/]+/[^/]+/##' | sed -E 's#android/app/src/main/java/com/omnidrop/app/##' | sort -u > compile-errors.txt || true
             echo "=========== LAST 40 LINES ==========="
-            tail -40 ../gradle-build.log
+            tail -40 gradle-build.log
+            echo "=========== OTHER ERRORS ==========="
+            grep -nE "error:|What went wrong|Execution failed|Caused by|Could not|Unresolved|incompatible" -A2 gradle-build.log | head -40 || true
+            {
+              echo "### Kotlin compile errors (file:line:col message)"
+              echo '```'
+              head -60 compile-errors.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            head -25 compile-errors.txt | while IFS= read -r line; do echo "::error::${line}"; done
+            echo "=========== KOTLIN COMPILE ERRORS (send me these lines) ==========="
+            cat compile-errors.txt
             exit 1
           }
 
@@ -210,3 +227,15 @@ jobs:
           name: omnidrop-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 14
+
+      - name: Publish GitHub Release with APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk OmniDrop.apk
+          printf '%s\n' "${COMMIT_MSG:-Automatic build}" > release-notes.txt
+          gh release create "v1.0.${{ github.run_number }}" OmniDrop.apk \
+            --title "OmniDrop 1.0.${{ github.run_number }}" \
+            --notes-file release-notes.txt \
+            --latest
