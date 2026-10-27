@@ -943,7 +943,7 @@ class VideoPlayerActivity : Activity() {
     private fun buildBottomBar() {
         bottomBarLayout = LinearLayout(this).apply {
             this.orientation = LinearLayout.VERTICAL
-            this.setPadding(dp(16), dp(10), dp(16), dp(14))
+            this.setPadding(dp(12), dp(8), dp(12), dp(12))
             this.background = GradientDrawable(
                 GradientDrawable.Orientation.BOTTOM_TOP,
                 intArrayOf(Color.parseColor("#F5080B10"), Color.TRANSPARENT)
@@ -1092,8 +1092,8 @@ class VideoPlayerActivity : Activity() {
         seekRow.addView(totalTimeTextView)
         bottomBarLayout.addView(seekRow)
 
-        // Bottom Controls Row: Previous (⏮), -10s, Play/Pause, +10s, Next (⏭), FIT/FILL, Repeat, Speed, Rotate
-        val controlsRow = LinearLayout(this).apply {
+        // Row 1 (Transport): Previous (⏮), -10s, Play/Pause, +10s, Next (⏭)
+        val transportRow = LinearLayout(this).apply {
             this.orientation = LinearLayout.HORIZONTAL
             this.gravity = Gravity.CENTER_VERTICAL
             val lp = LinearLayout.LayoutParams(
@@ -1109,18 +1109,14 @@ class VideoPlayerActivity : Activity() {
         prevVideoBtn = TextView(this).apply {
             this.text = "⏮"
             this.setTextColor(Color.parseColor("#00F0FF"))
-            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             this.typeface = Typeface.DEFAULT_BOLD
             this.gravity = Gravity.CENTER
-            this.minHeight = dp(44)
-            this.minWidth = dp(44)
-            this.setPadding(dp(8), dp(6), dp(8), dp(6))
+            this.setSingleLine(true)
+            this.setPadding(dp(2), dp(2), dp(2), dp(2))
             this.background = createMechanicalButtonBackground(false)
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                this.rightMargin = dp(5)
+            val lp = LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+                this.rightMargin = dp(4)
             }
             this.layoutParams = lp
             this.setOnClickListener {
@@ -1128,7 +1124,7 @@ class VideoPlayerActivity : Activity() {
                 playPreviousVideo(userInitiated = true)
             }
         }
-        controlsRow.addView(prevVideoBtn)
+        transportRow.addView(prevVideoBtn)
 
         // -10s button
         skipBackwardButton = TextView(this).apply {
@@ -1137,15 +1133,11 @@ class VideoPlayerActivity : Activity() {
             this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             this.typeface = Typeface.MONOSPACE
             this.gravity = Gravity.CENTER
-            this.minHeight = dp(44)
-            this.minWidth = dp(44)
-            this.setPadding(dp(8), dp(6), dp(8), dp(6))
+            this.setSingleLine(true)
+            this.setPadding(dp(2), dp(2), dp(2), dp(2))
             this.background = createMechanicalButtonBackground(false)
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                this.rightMargin = dp(5)
+            val lp = LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+                this.rightMargin = dp(4)
             }
             this.layoutParams = lp
             this.setOnClickListener {
@@ -1155,24 +1147,20 @@ class VideoPlayerActivity : Activity() {
                 flashRippleIndicator(leftRippleView)
             }
         }
-        controlsRow.addView(skipBackwardButton)
+        transportRow.addView(skipBackwardButton)
 
         // Play/Pause button
         playPauseButton = TextView(this).apply {
             this.text = "❚❚"
             this.setTextColor(Color.parseColor("#00F0FF"))
-            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             this.typeface = Typeface.DEFAULT_BOLD
             this.gravity = Gravity.CENTER
-            this.minHeight = dp(44)
-            this.minWidth = dp(44)
-            this.setPadding(dp(12), dp(6), dp(12), dp(6))
+            this.setSingleLine(true)
+            this.setPadding(dp(2), dp(2), dp(2), dp(2))
             this.background = createMechanicalButtonBackground(false)
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                this.rightMargin = dp(5)
+            val lp = LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+                this.rightMargin = dp(4)
             }
             this.layoutParams = lp
             this.setOnClickListener {
@@ -1180,7 +1168,7 @@ class VideoPlayerActivity : Activity() {
                 togglePlayback()
             }
         }
-        controlsRow.addView(playPauseButton)
+        transportRow.addView(playPauseButton)
 
         // +10s button
         skipForwardButton = TextView(this).apply {
@@ -1189,15 +1177,11 @@ class VideoPlayerActivity : Activity() {
             this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             this.typeface = Typeface.MONOSPACE
             this.gravity = Gravity.CENTER
-            this.minHeight = dp(44)
-            this.minWidth = dp(44)
-            this.setPadding(dp(8), dp(6), dp(8), dp(6))
+            this.setSingleLine(true)
+            this.setPadding(dp(2), dp(2), dp(2), dp(2))
             this.background = createMechanicalButtonBackground(false)
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                this.rightMargin = dp(5)
+            val lp = LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+                this.rightMargin = dp(4)
             }
             this.layoutParams = lp
             this.setOnClickListener {
@@ -1207,24 +1191,20 @@ class VideoPlayerActivity : Activity() {
                 flashRippleIndicator(rightRippleView)
             }
         }
-        controlsRow.addView(skipForwardButton)
+        transportRow.addView(skipForwardButton)
 
         // Next Video Button (⏭)
         nextVideoBtn = TextView(this).apply {
             this.text = "⏭"
             this.setTextColor(Color.parseColor("#00F0FF"))
-            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             this.typeface = Typeface.DEFAULT_BOLD
             this.gravity = Gravity.CENTER
-            this.minHeight = dp(44)
-            this.minWidth = dp(44)
-            this.setPadding(dp(8), dp(6), dp(8), dp(6))
+            this.setSingleLine(true)
+            this.setPadding(dp(2), dp(2), dp(2), dp(2))
             this.background = createMechanicalButtonBackground(false)
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                this.rightMargin = dp(5)
+            val lp = LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+                this.rightMargin = 0
             }
             this.layoutParams = lp
             this.setOnClickListener {
@@ -1232,31 +1212,34 @@ class VideoPlayerActivity : Activity() {
                 playNextVideo(userInitiated = true)
             }
         }
-        controlsRow.addView(nextVideoBtn)
+        transportRow.addView(nextVideoBtn)
+        bottomBarLayout.addView(transportRow)
 
-        // Spacer
-        val spacer = View(this).apply {
-            val lp = LinearLayout.LayoutParams(0, 1, 1f)
+        // Row 2 (Options): FIT/FILL, Repeat, Speed, Rotate
+        val optionsRow = LinearLayout(this).apply {
+            this.orientation = LinearLayout.HORIZONTAL
+            this.gravity = Gravity.CENTER_VERTICAL
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                this.topMargin = dp(6)
+            }
             this.layoutParams = lp
         }
-        controlsRow.addView(spacer)
 
         // FIT / FILL Button
         fitFillButton = TextView(this).apply {
             this.text = if (sessionFillMode) "FILL" else "FIT"
             this.setTextColor(Color.parseColor("#00F0FF"))
-            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             this.typeface = Typeface.MONOSPACE
             this.gravity = Gravity.CENTER
-            this.minHeight = dp(44)
-            this.minWidth = dp(44)
-            this.setPadding(dp(8), dp(6), dp(8), dp(6))
+            this.setSingleLine(true)
+            this.setPadding(dp(2), dp(2), dp(2), dp(2))
             this.background = createMechanicalButtonBackground(sessionFillMode)
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                this.rightMargin = dp(5)
+            val lp = LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+                this.rightMargin = dp(4)
             }
             this.layoutParams = lp
             this.setOnClickListener {
@@ -1268,21 +1251,16 @@ class VideoPlayerActivity : Activity() {
                 flashTitleBanner(if (sessionFillMode) "MODE: FILL (CENTER CROP)" else "MODE: FIT (ENTIRE PICTURE)")
             }
         }
-        controlsRow.addView(fitFillButton)
+        optionsRow.addView(fitFillButton)
 
         // Repeat button with LED (Cycles Repeat Off / One / All)
         repeatButton = LinearLayout(this).apply {
             this.orientation = LinearLayout.HORIZONTAL
             this.gravity = Gravity.CENTER
-            this.minimumHeight = dp(44)
-            this.minimumWidth = dp(44)
-            this.setPadding(dp(8), dp(6), dp(8), dp(6))
+            this.setPadding(dp(2), dp(2), dp(2), dp(2))
             this.background = createMechanicalButtonBackground(false)
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                this.rightMargin = dp(5)
+            val lp = LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+                this.rightMargin = dp(4)
             }
             this.layoutParams = lp
             this.setOnClickListener {
@@ -1293,7 +1271,7 @@ class VideoPlayerActivity : Activity() {
 
         repeatLedView = View(this).apply {
             val ledLp = LinearLayout.LayoutParams(dp(6), dp(6)).apply {
-                this.rightMargin = dp(5)
+                this.rightMargin = dp(4)
             }
             this.layoutParams = ledLp
             this.background = GradientDrawable().apply {
@@ -1306,33 +1284,31 @@ class VideoPlayerActivity : Activity() {
         repeatLabelTextView = TextView(this).apply {
             this.text = "OFF"
             this.setTextColor(Color.parseColor("#94A3B8"))
-            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             this.typeface = Typeface.MONOSPACE
-            this.layoutParams = LinearLayout.LayoutParams(
+            this.setSingleLine(true)
+            val textLp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             )
+            this.layoutParams = textLp
         }
         repeatButton.addView(repeatLabelTextView)
-        controlsRow.addView(repeatButton)
+        optionsRow.addView(repeatButton)
         updateRepeatButtonUI()
 
         // Speed button
         speedButton = TextView(this).apply {
             this.text = speedLabels[currentSpeedIndex]
             this.setTextColor(Color.parseColor("#F59E0B"))
-            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             this.typeface = Typeface.MONOSPACE
             this.gravity = Gravity.CENTER
-            this.minHeight = dp(44)
-            this.minWidth = dp(44)
-            this.setPadding(dp(8), dp(6), dp(8), dp(6))
+            this.setSingleLine(true)
+            this.setPadding(dp(2), dp(2), dp(2), dp(2))
             this.background = createMechanicalButtonBackground(true)
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                this.rightMargin = dp(5)
+            val lp = LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+                this.rightMargin = dp(4)
             }
             this.layoutParams = lp
             this.setOnClickListener {
@@ -1340,32 +1316,30 @@ class VideoPlayerActivity : Activity() {
                 cyclePlaybackSpeed()
             }
         }
-        controlsRow.addView(speedButton)
+        optionsRow.addView(speedButton)
 
         // Rotate button
         rotateButton = TextView(this).apply {
-            this.text = "⛶ ROT"
+            this.text = "ROT"
             this.setTextColor(Color.parseColor("#00F0FF"))
-            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             this.typeface = Typeface.MONOSPACE
             this.gravity = Gravity.CENTER
-            this.minHeight = dp(44)
-            this.minWidth = dp(44)
-            this.setPadding(dp(8), dp(6), dp(8), dp(6))
+            this.setSingleLine(true)
+            this.setPadding(dp(2), dp(2), dp(2), dp(2))
             this.background = createMechanicalButtonBackground(false)
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
+            val lp = LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+                this.rightMargin = 0
+            }
             this.layoutParams = lp
             this.setOnClickListener {
                 resetAutoHideTimer()
                 toggleOrientation()
             }
         }
-        controlsRow.addView(rotateButton)
+        optionsRow.addView(rotateButton)
 
-        bottomBarLayout.addView(controlsRow)
+        bottomBarLayout.addView(optionsRow)
         hudOverlay.addView(bottomBarLayout)
     }
 
