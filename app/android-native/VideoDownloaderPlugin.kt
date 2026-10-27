@@ -628,57 +628,6 @@ class VideoDownloaderPlugin : Plugin() {
     }
 
     @PluginMethod
-    fun renameVideo(call: PluginCall) {
-        val uriStr = call.getString("uri")
-        val newTitle = call.getString("newTitle")?.trim() ?: ""
-        val newPlatform = call.getString("newPlatform")?.trim() ?: "Other"
-
-        if (uriStr.isNullOrBlank() || newTitle.isBlank()) {
-            call.reject("Missing required parameters: uri or newTitle")
-            return
-        }
-
-        Thread {
-            try {
-                val uri = Uri.parse(uriStr)
-                var fileName = ""
-                val cursor = context.contentResolver.query(uri, arrayOf(MediaStore.Video.Media.DISPLAY_NAME), null, null, null)
-                cursor?.use {
-                    if (it.moveToFirst()) {
-                        fileName = it.getString(it.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)) ?: ""
-                    }
-                }
-
-                val all = getAllMetadata(context)
-                val entry = if (fileName.isNotBlank() && all.has(fileName)) {
-                    all.getJSONObject(fileName)
-                } else {
-                    JSONObject().apply {
-                        this.put("fileName", fileName)
-                        this.put("fileUri", uriStr)
-                    }
-                }
-
-                entry.put("title", newTitle)
-                entry.put("platform", newPlatform)
-                entry.put("fileUri", uriStr)
-
-                val key = if (fileName.isNotBlank()) fileName else uriStr
-                saveVideoMetadata(context, key, entry)
-
-                val ret = JSObject().apply {
-                    this.put("success", true)
-                    this.put("title", newTitle)
-                    this.put("platform", newPlatform)
-                }
-                call.resolve(ret)
-            } catch (e: Exception) {
-                call.reject("Failed to rename video: ${e.message}")
-            }
-        }.start()
-    }
-
-    @PluginMethod
     fun getNativeHistory(call: PluginCall) {
         try {
             val jsonStr = getHistoryJson(context)

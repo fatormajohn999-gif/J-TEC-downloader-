@@ -1274,8 +1274,8 @@ class VideoPlayerActivity : Activity() {
         repeatButton = LinearLayout(this).apply {
             this.orientation = LinearLayout.HORIZONTAL
             this.gravity = Gravity.CENTER
-            this.minHeight = dp(44)
-            this.minWidth = dp(44)
+            this.minimumHeight = dp(44)
+            this.minimumWidth = dp(44)
             this.setPadding(dp(8), dp(6), dp(8), dp(6))
             this.background = createMechanicalButtonBackground(false)
             val lp = LinearLayout.LayoutParams(
