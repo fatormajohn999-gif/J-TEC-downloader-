@@ -204,7 +204,7 @@ jobs:
           ./gradlew assembleDebug --console=plain > ../gradle-build.log 2>&1 || {
             cd ..
             # Compact list of the real compile errors: file, line, message
-            grep -E "^e: " gradle-build.log | sed -E 's#file:///home/runner/work/[^/]+/[^/]+/##' | sed -E 's#android/app/src/main/java/com/omnidrop/app/##' | sort -u > compile-errors.txt || true
+            awk '/^e: /{p=1; print; next} p && /^[ \t]/{print; next} {p=0}' gradle-build.log | sed -E 's#file:///home/runner/work/[^/]+/[^/]+/##' | sed -E 's#android/app/src/main/java/com/omnidrop/app/##' | awk '!seen[$0]++' > compile-errors.txt || true
             echo "=========== LAST 40 LINES ==========="
             tail -40 gradle-build.log
             echo "=========== OTHER ERRORS ==========="
