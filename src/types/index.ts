@@ -69,4 +69,24 @@ export interface AppSettings {
   floatingShowMs?: boolean;
   floatingAutoClear?: boolean;
   floatingVibrate?: boolean;
+  floatingHideInsideApp?: boolean;
+  autoCheckUpdates?: boolean;
+  skippedUpdateVersion?: number;
+}
+
+export interface AppUpdateInfo {
+  versionName: string;
+  versionCode: number;
+  tagName: string;
+  releaseNotes: string;
+  publishedAt: string;
+  downloadUrl: string;
+  sizeBytes: number;
+}
+
+export interface UpdateProgressEvent {
+  percent: number;
+  bytesDownloaded: number;
+  totalBytes: number;
+  formattedMb: string;
 }

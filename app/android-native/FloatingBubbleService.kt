@@ -76,7 +76,21 @@ class FloatingBubbleService : Service() {
         private const val PREF_DEFAULT_QUALITY = "default_quality"
         private const val PREF_FLOATING_AUTO_CLEAR = "floating_auto_clear"
         private const val PREF_FLOATING_VIBRATE = "floating_vibrate"
+        private const val PREF_FLOATING_HIDE_INSIDE_APP = "floating_hide_inside_app"
+        private const val PREF_AUTO_CHECK_UPDATES = "auto_check_updates"
+        private const val PREF_SKIPPED_UPDATE_VERSION = "skipped_update_version"
+        private const val PREF_LAST_NOTIFIED_UPDATE_VERSION = "last_notified_update_version"
+        private const val GITHUB_REPO = "fatormajohn999-gif/J-TEC-downloader-"
+        const val UPDATE_CHANNEL_ID = "omnidrop_update_channel"
+        const val NOTIFICATION_ID_UPDATE = 1002
         const val PREF_HISTORY_KEY = "native_download_history"
+
+        @Volatile var isOmniDropInForeground: Boolean = false
+
+        fun setOmniDropForeground(inForeground: Boolean) {
+            isOmniDropInForeground = inForeground
+            instance?.onAppForegroundChanged(inForeground)
+        }
 
         val SUPPORTED_DOMAINS = arrayOf(
             "tiktok.com",
@@ -143,6 +157,7 @@ class FloatingBubbleService : Service() {
     private var autoDownloadEnabled: Boolean = true
     private var autoClearEnabled: Boolean = true
     private var vibrateEnabled: Boolean = true
+    private var hideInsideAppEnabled: Boolean = true
     private var backendUrl: String = ""
     private var apiKey: String = ""
     private var defaultQuality: String = "best"
@@ -184,9 +199,22 @@ class FloatingBubbleService : Service() {
     // Deduplication
     private val recentDownloads = ConcurrentHashMap<String, Long>()
 
+    // Auto-check updates state
+    private var autoCheckUpdatesEnabled: Boolean = true
+
     // Threading
     private val mainHandler = Handler(Looper.getMainLooper())
     private val backgroundExecutor = Executors.newFixedThreadPool(3)
+
+    // Periodic Update Check Runnable (5s after start, then every 4 hours)
+    private val updateCheckRunnable = object : Runnable {
+        override fun run() {
+            if (autoCheckUpdatesEnabled) {
+                checkAppUpdatesInBackground()
+            }
+            mainHandler.postDelayed(this, 4 * 3600 * 1000L)
+        }
+    }
 
     // Periodic Dual-Ping Runnable (every 5 seconds)
     private val dualPingRunnable = object : Runnable {
@@ -246,6 +274,7 @@ class FloatingBubbleService : Service() {
         initPanelOverlay()
 
         mainHandler.post(dualPingRunnable)
+        mainHandler.postDelayed(updateCheckRunnable, 5000L)
         resetIdleFade()
     }
 
@@ -259,6 +288,8 @@ class FloatingBubbleService : Service() {
             defaultQuality = p.getString(PREF_DEFAULT_QUALITY, "best") ?: "best"
             autoClearEnabled = p.getBoolean(PREF_FLOATING_AUTO_CLEAR, true)
             vibrateEnabled = p.getBoolean(PREF_FLOATING_VIBRATE, true)
+            hideInsideAppEnabled = p.getBoolean(PREF_FLOATING_HIDE_INSIDE_APP, true)
+            autoCheckUpdatesEnabled = p.getBoolean(PREF_AUTO_CHECK_UPDATES, true)
         }
     }
 
@@ -268,7 +299,9 @@ class FloatingBubbleService : Service() {
         newQuality: String,
         newAutoDownload: Boolean,
         newAutoClear: Boolean = true,
-        newVibrate: Boolean = true
+        newVibrate: Boolean = true,
+        newHideInsideApp: Boolean = true,
+        newAutoCheckUpdates: Boolean = true
     ) {
         backendUrl = newUrl.trim()
         apiKey = newApiKey.trim()
@@ -276,6 +309,8 @@ class FloatingBubbleService : Service() {
         autoDownloadEnabled = newAutoDownload
         autoClearEnabled = newAutoClear
         vibrateEnabled = newVibrate
+        hideInsideAppEnabled = newHideInsideApp
+        autoCheckUpdatesEnabled = newAutoCheckUpdates
         prefs?.edit()?.apply {
             this.putString(PREF_BACKEND_URL, backendUrl)
             this.putString(PREF_API_KEY, apiKey)
@@ -283,12 +318,32 @@ class FloatingBubbleService : Service() {
             this.putBoolean(PREF_AUTO_DOWNLOAD, autoDownloadEnabled)
             this.putBoolean(PREF_FLOATING_AUTO_CLEAR, autoClearEnabled)
             this.putBoolean(PREF_FLOATING_VIBRATE, vibrateEnabled)
+            this.putBoolean(PREF_FLOATING_HIDE_INSIDE_APP, hideInsideAppEnabled)
+            this.putBoolean(PREF_AUTO_CHECK_UPDATES, autoCheckUpdatesEnabled)
             this.apply()
         }
         mainHandler.post {
             updateAutoDownloadUI()
             measureDualPing()
+            updateForegroundVisibility()
             resetIdleFade()
+        }
+    }
+
+    fun onAppForegroundChanged(inForeground: Boolean) {
+        mainHandler.post {
+            updateForegroundVisibility()
+        }
+    }
+
+    fun updateForegroundVisibility() {
+        if (hideInsideAppEnabled && isOmniDropInForeground) {
+            if (isPanelOpen) {
+                closePanel()
+            }
+            tabRootView?.visibility = View.GONE
+        } else {
+            tabRootView?.visibility = View.VISIBLE
         }
     }
 
@@ -321,8 +376,16 @@ class FloatingBubbleService : Service() {
                 this.description = "Keeps the OmniDrop hardware edge download tool active"
                 this.setShowBadge(false)
             }
+            val updateChannel = NotificationChannel(
+                UPDATE_CHANNEL_ID,
+                "OmniDrop Updates",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                this.description = "Notifications for new OmniDrop app and firmware updates"
+            }
             val manager = getSystemService(NotificationManager::class.java)
             manager?.createNotificationChannel(channel)
+            manager?.createNotificationChannel(updateChannel)
         }
     }
 
@@ -352,7 +415,9 @@ class FloatingBubbleService : Service() {
         val tabWidth = (30 * density).toInt()
         val tabHeight = (74 * density).toInt()
 
-        val root = FrameLayout(this)
+        val root = FrameLayout(this).apply {
+            this.visibility = if (hideInsideAppEnabled && isOmniDropInForeground) View.GONE else View.VISIBLE
+        }
         tabRootView = root
 
         val latch = EdgeLatchTabView(this, isLeftEdge).apply {
@@ -2529,11 +2594,91 @@ class FloatingBubbleService : Service() {
         mainHandler.removeCallbacks(dualPingRunnable)
         mainHandler.removeCallbacks(trafficRunnable)
         mainHandler.removeCallbacks(idleFadeRunnable)
+        mainHandler.removeCallbacks(updateCheckRunnable)
         autoClearRunnable?.let { mainHandler.removeCallbacks(it) }
 
         tabRootView?.let { try { windowManager?.removeView(it) } catch (_: Exception) {} }
         panelRootOverlay?.let { try { windowManager?.removeView(it) } catch (_: Exception) {} }
         backgroundExecutor.shutdownNow()
+    }
+
+    private fun checkAppUpdatesInBackground() {
+        backgroundExecutor.execute {
+            try {
+                val url = URL("https://api.github.com/repos/$GITHUB_REPO/releases/latest")
+                val conn = (url.openConnection() as HttpURLConnection).apply {
+                    this.connectTimeout = 8000
+                    this.readTimeout = 8000
+                    this.setRequestProperty("Accept", "application/vnd.github.v3+json")
+                    this.setRequestProperty("User-Agent", "OmniDrop-Android")
+                }
+                if (conn.responseCode == HttpURLConnection.HTTP_OK) {
+                    val responseText = conn.inputStream.bufferedReader().use { it.readText() }
+                    conn.disconnect()
+                    val releaseObj = JSONObject(responseText)
+                    val tagName = releaseObj.optString("tag_name", "")
+                    val body = releaseObj.optString("body", "")
+
+                    val remoteVersionStr = tagName.substringAfterLast(".").filter { it.isDigit() }
+                    val remoteCode = remoteVersionStr.toIntOrNull() ?: 0
+
+                    val currentCode = try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                            packageManager.getPackageInfo(packageName, 0).longVersionCode.toInt()
+                        } else {
+                            @Suppress("DEPRECATION")
+                            packageManager.getPackageInfo(packageName, 0).versionCode
+                        }
+                    } catch (_: Exception) { 0 }
+
+                    val skippedVersion = prefs?.getInt(PREF_SKIPPED_UPDATE_VERSION, 0) ?: 0
+                    val lastNotified = prefs?.getInt(PREF_LAST_NOTIFIED_UPDATE_VERSION, 0) ?: 0
+
+                    if (remoteCode > currentCode && remoteCode != skippedVersion && remoteCode != lastNotified) {
+                        showUpdateNotification(tagName, body, remoteCode)
+                    }
+                } else {
+                    conn.disconnect()
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun showUpdateNotification(tagName: String, releaseNotes: String, remoteCode: Int) {
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+            val mainClass = Class.forName("com.omnidrop.app.MainActivity")
+            val intent = Intent(this, mainClass).apply {
+                this.action = Intent.ACTION_VIEW
+                this.putExtra("open_tab", "settings")
+                this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            }
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            } else {
+                PendingIntent.FLAG_UPDATE_CURRENT
+            }
+            val pi = PendingIntent.getActivity(this, NOTIFICATION_ID_UPDATE, intent, flags)
+
+            val noteSnippet = if (releaseNotes.isNotBlank()) releaseNotes.take(280) else "New version $tagName is ready to install."
+
+            val notif = NotificationCompat.Builder(this, UPDATE_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                .setContentTitle("OmniDrop update ready: $tagName")
+                .setContentText(noteSnippet)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(if (releaseNotes.isNotBlank()) releaseNotes else "New version $tagName is ready to install. Tap to download and install."))
+                .setContentIntent(pi)
+                .setAutoCancel(true)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                .build()
+
+            nm.notify(NOTIFICATION_ID_UPDATE, notif)
+
+            prefs?.edit()?.apply {
+                this.putInt(PREF_LAST_NOTIFIED_UPDATE_VERSION, remoteCode)
+                this.apply()
+            }
+        } catch (_: Exception) {}
     }
 
     // -------------------------------------------------------------------------

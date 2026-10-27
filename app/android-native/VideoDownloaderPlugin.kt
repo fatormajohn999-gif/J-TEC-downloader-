@@ -44,6 +44,9 @@ class VideoDownloaderPlugin : Plugin() {
         const val PREFS_METADATA_NAME = "omnidrop_video_metadata"
         const val PREF_METADATA_MAP = "video_metadata_map"
 
+        const val REQUEST_CODE_DELETE = 7101
+        const val REQUEST_CODE_RENAME = 7102
+
         // In-flight download lock keyed by normalized sourceUrl
         val inFlightDownloads = ConcurrentHashMap<String, Boolean>()
 
@@ -250,6 +253,12 @@ class VideoDownloaderPlugin : Plugin() {
     override fun load() {
         super.load()
         instance = this
+        try {
+            val updatesDir = java.io.File(context.cacheDir, "updates")
+            if (updatesDir.exists()) {
+                updatesDir.deleteRecursively()
+            }
+        } catch (_: Exception) {}
         val intent = activity.intent
         handleIncomingIntent(intent)
     }
@@ -277,6 +286,289 @@ class VideoDownloaderPlugin : Plugin() {
                 val normalized = normalizeUrl(url)
                 lastReceivedUrl = normalized
                 notifyUrlReceived(normalized)
+            }
+        }
+
+        if (intent.getStringExtra("open_tab") == "settings") {
+            val ret = JSObject().apply {
+                this.put("tab", "settings")
+            }
+            notifyListeners("openSettingsTab", ret, true)
+        }
+    }
+
+    private var savedDeleteCall: PluginCall? = null
+    private var savedDeleteDirectCount: Int = 0
+    private var savedDeletePendingUris: List<String> = emptyList()
+
+    private var savedRenameCall: PluginCall? = null
+    private var savedRenameUri: String? = null
+    private var savedRenameNewTitle: String? = null
+    private var savedRenameNewPlatform: String? = null
+
+    override fun handleOnResume() {
+        super.handleOnResume()
+        FloatingBubbleService.setOmniDropForeground(true)
+    }
+
+    override fun handleOnPause() {
+        super.handleOnPause()
+        FloatingBubbleService.setOmniDropForeground(false)
+    }
+
+    override fun handleOnActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.handleOnActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQUEST_CODE_DELETE) {
+            val call = savedDeleteCall
+            savedDeleteCall = null
+            if (call != null) {
+                if (resultCode == Activity.RESULT_OK) {
+                    for (u in savedDeletePendingUris) {
+                        removeHistoryByUri(context, u)
+                    }
+                    val totalDeleted = savedDeleteDirectCount + savedDeletePendingUris.size
+                    val ret = JSObject().apply {
+                        this.put("deleted", totalDeleted)
+                        this.put("count", totalDeleted)
+                        this.put("failed", 0)
+                        this.put("cancelled", false)
+                    }
+                    call.resolve(ret)
+                } else {
+                    val ret = JSObject().apply {
+                        this.put("deleted", savedDeleteDirectCount)
+                        this.put("count", savedDeleteDirectCount)
+                        this.put("failed", savedDeletePendingUris.size)
+                        this.put("cancelled", true)
+                    }
+                    call.resolve(ret)
+                }
+            }
+            savedDeletePendingUris = emptyList()
+            savedDeleteDirectCount = 0
+        } else if (requestCode == REQUEST_CODE_RENAME) {
+            val call = savedRenameCall
+            val uriStr = savedRenameUri
+            val newTitle = savedRenameNewTitle ?: ""
+            val newPlatform = savedRenameNewPlatform ?: "Other"
+            savedRenameCall = null
+            savedRenameUri = null
+            savedRenameNewTitle = null
+            savedRenameNewPlatform = null
+
+            if (call != null) {
+                if (resultCode == Activity.RESULT_OK && !uriStr.isNullOrBlank()) {
+                    applyRenameSuccess(call, uriStr, newTitle, newPlatform)
+                } else {
+                    val ret = JSObject().apply {
+                        this.put("success", false)
+                        this.put("cancelled", true)
+                    }
+                    call.resolve(ret)
+                }
+            }
+        }
+    }
+
+    private fun performMediaDelete(call: PluginCall, uriStrings: List<String>) {
+        if (uriStrings.isEmpty()) {
+            val ret = JSObject().apply {
+                this.put("deleted", 0)
+                this.put("count", 0)
+                this.put("failed", 0)
+                this.put("cancelled", false)
+            }
+            call.resolve(ret)
+            return
+        }
+
+        Thread {
+            var directDeleted = 0
+            val securityExceptionUris = mutableListOf<Uri>()
+            var recoverableException: android.app.RecoverableSecurityException? = null
+
+            for (uStr in uriStrings) {
+                val uri = try {
+                    Uri.parse(uStr)
+                } catch (_: Exception) {
+                    null
+                } ?: continue
+
+                try {
+                    val rows = context.contentResolver.delete(uri, null, null)
+                    if (rows > 0) {
+                        directDeleted++
+                        removeHistoryByUri(context, uStr)
+                    } else {
+                        val cursor = context.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns._ID), null, null, null)
+                        val exists = (cursor?.count ?: 0) > 0
+                        cursor?.close()
+                        if (exists) {
+                            securityExceptionUris.add(uri)
+                        } else {
+                            directDeleted++
+                            removeHistoryByUri(context, uStr)
+                        }
+                    }
+                } catch (sec: SecurityException) {
+                    if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q && sec is android.app.RecoverableSecurityException) {
+                        recoverableException = sec
+                    }
+                    securityExceptionUris.add(uri)
+                } catch (_: Exception) {}
+            }
+
+            if (securityExceptionUris.isEmpty()) {
+                val ret = JSObject().apply {
+                    this.put("deleted", directDeleted)
+                    this.put("count", directDeleted)
+                    this.put("failed", 0)
+                    this.put("cancelled", false)
+                }
+                call.resolve(ret)
+                return@Thread
+            }
+
+            activity.runOnUiThread {
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        val pendingIntent = MediaStore.createDeleteRequest(context.contentResolver, securityExceptionUris)
+                        savedDeleteCall = call
+                        savedDeleteDirectCount = directDeleted
+                        savedDeletePendingUris = securityExceptionUris.map { it.toString() }
+                        activity.startIntentSenderForResult(
+                            pendingIntent.intentSender,
+                            REQUEST_CODE_DELETE,
+                            null,
+                            0,
+                            0,
+                            0
+                        )
+                    } else if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q && recoverableException != null) {
+                        savedDeleteCall = call
+                        savedDeleteDirectCount = directDeleted
+                        savedDeletePendingUris = securityExceptionUris.map { it.toString() }
+                        activity.startIntentSenderForResult(
+                            recoverableException.userAction.actionIntent.intentSender,
+                            REQUEST_CODE_DELETE,
+                            null,
+                            0,
+                            0,
+                            0
+                        )
+                    } else {
+                        val ret = JSObject().apply {
+                            this.put("deleted", directDeleted)
+                            this.put("count", directDeleted)
+                            this.put("failed", securityExceptionUris.size)
+                            this.put("cancelled", false)
+                        }
+                        call.resolve(ret)
+                    }
+                } catch (e: Exception) {
+                    val ret = JSObject().apply {
+                        this.put("deleted", directDeleted)
+                        this.put("count", directDeleted)
+                        this.put("failed", securityExceptionUris.size)
+                        this.put("cancelled", false)
+                    }
+                    call.resolve(ret)
+                }
+            }
+        }.start()
+    }
+
+    private fun applyRenameSuccess(call: PluginCall, uriStr: String, newTitle: String, newPlatform: String) {
+        Thread {
+            try {
+                val uri = Uri.parse(uriStr)
+                val cv = ContentValues().apply {
+                    this.put(MediaStore.Video.Media.TITLE, newTitle)
+                }
+                context.contentResolver.update(uri, cv, null, null)
+
+                var displayName = ""
+                context.contentResolver.query(uri, arrayOf(MediaStore.Video.Media.DISPLAY_NAME), null, null, null)?.use { c ->
+                    if (c.moveToFirst()) {
+                        displayName = c.getString(0) ?: ""
+                    }
+                }
+
+                val meta = (if (displayName.isNotBlank()) getMetadataForFileName(context, displayName) else null) ?: JSONObject()
+                meta.put("title", newTitle)
+                meta.put("platform", newPlatform)
+                meta.put("fileUri", uriStr)
+                if (displayName.isNotBlank()) {
+                    saveVideoMetadata(context, displayName, meta)
+                }
+
+                val ret = JSObject().apply {
+                    this.put("success", true)
+                    this.put("title", newTitle)
+                    this.put("platform", newPlatform)
+                    this.put("cancelled", false)
+                }
+                call.resolve(ret)
+            } catch (e: Exception) {
+                val ret = JSObject().apply {
+                    this.put("success", false)
+                    this.put("cancelled", false)
+                }
+                call.resolve(ret)
+            }
+        }.start()
+    }
+
+    private fun requestWritePermissionForRename(
+        call: PluginCall,
+        uri: Uri,
+        uriStr: String,
+        newTitle: String,
+        newPlatform: String,
+        sec: SecurityException? = null
+    ) {
+        activity.runOnUiThread {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    val pendingIntent = MediaStore.createWriteRequest(context.contentResolver, listOf(uri))
+                    savedRenameCall = call
+                    savedRenameUri = uriStr
+                    savedRenameNewTitle = newTitle
+                    savedRenameNewPlatform = newPlatform
+                    activity.startIntentSenderForResult(
+                        pendingIntent.intentSender,
+                        REQUEST_CODE_RENAME,
+                        null,
+                        0,
+                        0,
+                        0
+                    )
+                } else if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q && sec is android.app.RecoverableSecurityException) {
+                    savedRenameCall = call
+                    savedRenameUri = uriStr
+                    savedRenameNewTitle = newTitle
+                    savedRenameNewPlatform = newPlatform
+                    activity.startIntentSenderForResult(
+                        sec.userAction.actionIntent.intentSender,
+                        REQUEST_CODE_RENAME,
+                        null,
+                        0,
+                        0,
+                        0
+                    )
+                } else {
+                    val ret = JSObject().apply {
+                        this.put("success", false)
+                        this.put("cancelled", false)
+                    }
+                    call.resolve(ret)
+                }
+            } catch (e: Exception) {
+                val ret = JSObject().apply {
+                    this.put("success", false)
+                    this.put("cancelled", false)
+                }
+                call.resolve(ret)
             }
         }
     }
@@ -445,6 +737,8 @@ class VideoDownloaderPlugin : Plugin() {
         val floatingShowMs = call.getBoolean("floatingShowMs", true) ?: true
         val floatingAutoClear = call.getBoolean("floatingAutoClear", true) ?: true
         val floatingVibrate = call.getBoolean("floatingVibrate", true) ?: true
+        val floatingHideInsideApp = call.getBoolean("floatingHideInsideApp", true) ?: true
+        val autoCheckUpdates = call.getBoolean("autoCheckUpdates", true) ?: true
 
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().apply {
@@ -459,10 +753,21 @@ class VideoDownloaderPlugin : Plugin() {
             this.putBoolean("floating_show_ms", floatingShowMs)
             this.putBoolean("floating_auto_clear", floatingAutoClear)
             this.putBoolean("floating_vibrate", floatingVibrate)
+            this.putBoolean("floating_hide_inside_app", floatingHideInsideApp)
+            this.putBoolean("auto_check_updates", autoCheckUpdates)
             this.apply()
         }
 
-        FloatingBubbleService.instance?.updateSettings(backendUrl, apiKey, defaultQuality, autoDownload, floatingAutoClear, floatingVibrate)
+        FloatingBubbleService.instance?.updateSettings(
+            backendUrl,
+            apiKey,
+            defaultQuality,
+            autoDownload,
+            floatingAutoClear,
+            floatingVibrate,
+            floatingHideInsideApp,
+            autoCheckUpdates
+        )
 
         val result = JSObject().apply {
             this.put("saved", true)
@@ -1175,22 +1480,53 @@ class VideoDownloaderPlugin : Plugin() {
 
     @PluginMethod
     fun deleteVideo(call: PluginCall) {
-        val uriStr = call.getString("uri")
-        if (uriStr.isNullOrBlank()) {
+        val urisArray = call.getArray("uris")
+        val singleUri = call.getString("uri")
+        val targetUris = mutableListOf<String>()
+
+        if (urisArray != null) {
+            for (i in 0 until urisArray.length()) {
+                val u = urisArray.optString(i)
+                if (!u.isNullOrBlank()) targetUris.add(u)
+            }
+        } else if (!singleUri.isNullOrBlank()) {
+            targetUris.add(singleUri)
+        }
+
+        if (targetUris.isEmpty()) {
             call.reject("Missing required parameter: uri")
             return
         }
+        performMediaDelete(call, targetUris)
+    }
+
+    @PluginMethod
+    fun renameVideo(call: PluginCall) {
+        val uriStr = call.getString("uri")
+        val newTitle = call.getString("newTitle")?.trim() ?: ""
+        val newPlatform = call.getString("newPlatform")?.trim() ?: "Other"
+
+        if (uriStr.isNullOrBlank() || newTitle.isBlank()) {
+            call.reject("Missing required parameters: uri or newTitle")
+            return
+        }
+
         Thread {
             try {
                 val uri = Uri.parse(uriStr)
-                val rows = context.contentResolver.delete(uri, null, null)
-                removeHistoryByUri(context, uriStr)
-                val ret = JSObject().apply {
-                    this.put("deleted", rows > 0)
+                val cv = ContentValues().apply {
+                    this.put(MediaStore.Video.Media.TITLE, newTitle)
                 }
-                call.resolve(ret)
+                val updated = context.contentResolver.update(uri, cv, null, null)
+                if (updated > 0) {
+                    applyRenameSuccess(call, uriStr, newTitle, newPlatform)
+                } else {
+                    requestWritePermissionForRename(call, uri, uriStr, newTitle, newPlatform)
+                }
+            } catch (sec: SecurityException) {
+                requestWritePermissionForRename(call, Uri.parse(uriStr), uriStr, newTitle, newPlatform, sec)
             } catch (e: Exception) {
-                call.reject("Failed to delete video: ${e.message ?: "Unknown error"}")
+                call.reject("Failed to rename video: ${e.message ?: "Unknown error"}")
             }
         }.start()
     }
@@ -1418,25 +1754,7 @@ class VideoDownloaderPlugin : Plugin() {
             return
         }
 
-        Thread {
-            try {
-                var deletedCount = 0
-                for (u in targetUris) {
-                    try {
-                        val uri = Uri.parse(u)
-                        val count = context.contentResolver.delete(uri, null, null)
-                        if (count > 0) deletedCount++
-                    } catch (_: Exception) {}
-                }
-                val ret = JSObject().apply {
-                    this.put("deleted", deletedCount > 0)
-                    this.put("count", deletedCount)
-                }
-                call.resolve(ret)
-            } catch (e: Exception) {
-                call.reject("Failed to delete photos: ${e.message ?: "Unknown error"}")
-            }
-        }.start()
+        performMediaDelete(call, targetUris)
     }
 
     @PluginMethod
@@ -1478,6 +1796,216 @@ class VideoDownloaderPlugin : Plugin() {
         } catch (e: Exception) {
             call.reject("Failed to launch PhotoViewerActivity: ${e.message ?: "Unknown error"}")
         }
+    }
+
+    @PluginMethod
+    fun getAppVersion(call: PluginCall) {
+        try {
+            val pInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.packageManager.getPackageInfo(context.packageName, android.content.pm.PackageManager.PackageInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                context.packageManager.getPackageInfo(context.packageName, 0)
+            }
+            val versionName = pInfo.versionName ?: "1.0.0"
+            val versionCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                pInfo.longVersionCode.toInt()
+            } else {
+                @Suppress("DEPRECATION")
+                pInfo.versionCode
+            }
+            val ret = JSObject().apply {
+                this.put("versionName", versionName)
+                this.put("versionCode", versionCode)
+            }
+            call.resolve(ret)
+        } catch (e: Exception) {
+            val ret = JSObject().apply {
+                this.put("versionName", "1.0.0")
+                this.put("versionCode", 1)
+            }
+            call.resolve(ret)
+        }
+    }
+
+    @PluginMethod
+    fun downloadAndInstallUpdate(call: PluginCall) {
+        val downloadUrl = call.getString("url")
+        val expectedSize = call.getLong("size") ?: (call.getInt("size")?.toLong() ?: 0L)
+
+        if (downloadUrl.isNullOrBlank()) {
+            call.reject("Missing required parameter: url")
+            return
+        }
+
+        Thread {
+            var connection: HttpURLConnection? = null
+            var inputStream: InputStream? = null
+            var outputStream: OutputStream? = null
+
+            try {
+                val updatesDir = java.io.File(context.cacheDir, "updates")
+                if (!updatesDir.exists()) {
+                    updatesDir.mkdirs()
+                }
+                val apkFile = java.io.File(updatesDir, "OmniDrop.apk")
+
+                // If file already exists with exact size, skip re-download
+                val alreadyDownloaded = apkFile.exists() && (expectedSize > 0 && apkFile.length() == expectedSize)
+
+                if (!alreadyDownloaded) {
+                    if (apkFile.exists()) {
+                        apkFile.delete()
+                    }
+
+                    var currentUrl = downloadUrl
+                    var redirectCount = 0
+                    val maxRedirects = 6
+
+                    while (redirectCount < maxRedirects) {
+                        val u = URL(currentUrl)
+                        connection = (u.openConnection() as HttpURLConnection).apply {
+                            this.instanceFollowRedirects = true
+                            this.connectTimeout = 15000
+                            this.readTimeout = 30000
+                            this.setRequestProperty("User-Agent", "OmniDrop-Android")
+                            this.setRequestProperty("Accept", "application/octet-stream")
+                        }
+
+                        val code = connection.responseCode
+                        if (code == HttpURLConnection.HTTP_MOVED_PERM ||
+                            code == HttpURLConnection.HTTP_MOVED_TEMP ||
+                            code == HttpURLConnection.HTTP_SEE_OTHER ||
+                            code == 307 || code == 308) {
+                            val location = connection.getHeaderField("Location")
+                            connection.disconnect()
+                            if (location.isNullOrBlank()) {
+                                throw java.io.IOException("Redirect with empty Location header")
+                            }
+                            currentUrl = if (location.startsWith("http")) location else URL(u, location).toString()
+                            redirectCount++
+                        } else if (code == HttpURLConnection.HTTP_OK) {
+                            break
+                        } else {
+                            throw java.io.IOException("HTTP error $code from update server")
+                        }
+                    }
+
+                    val serverContentLength = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        connection!!.contentLengthLong
+                    } else {
+                        connection!!.contentLength.toLong()
+                    }
+                    val totalBytes = if (expectedSize > 0) expectedSize else (if (serverContentLength > 0) serverContentLength else 0L)
+
+                    inputStream = connection!!.inputStream
+                    outputStream = java.io.FileOutputStream(apkFile)
+
+                    val buffer = ByteArray(8192)
+                    var bytesDownloaded = 0L
+                    var bytesRead: Int
+                    var lastReportPercent = -1
+
+                    while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                        outputStream.write(buffer, 0, bytesRead)
+                        bytesDownloaded += bytesRead
+
+                        val percent = if (totalBytes > 0) {
+                            ((bytesDownloaded * 100) / totalBytes).toInt().coerceIn(0, 100)
+                        } else {
+                            0
+                        }
+
+                        if (percent != lastReportPercent || bytesDownloaded == totalBytes) {
+                            lastReportPercent = percent
+                            val mbDownloaded = bytesDownloaded / (1024.0 * 1024.0)
+                            val mbTotal = totalBytes / (1024.0 * 1024.0)
+                            val formattedMb = if (totalBytes > 0) {
+                                String.format(Locale.US, "%.1f / %.1f MB", mbDownloaded, mbTotal)
+                            } else {
+                                String.format(Locale.US, "%.1f MB", mbDownloaded)
+                            }
+
+                            val progressObj = JSObject().apply {
+                                this.put("percent", percent)
+                                this.put("bytesDownloaded", bytesDownloaded)
+                                this.put("totalBytes", totalBytes)
+                                this.put("formattedMb", formattedMb)
+                            }
+                            notifyListeners("updateProgress", progressObj, true)
+                        }
+                    }
+
+                    outputStream.flush()
+                }
+
+                // Check final file size
+                val finalLength = apkFile.length()
+                if (expectedSize > 0 && finalLength != expectedSize) {
+                    apkFile.delete()
+                    throw java.io.IOException("Download incomplete: file size ($finalLength) does not match expected size ($expectedSize)")
+                } else if (finalLength < 1000) {
+                    apkFile.delete()
+                    throw java.io.IOException("Downloaded APK file is corrupted or too small ($finalLength bytes)")
+                }
+
+                // Final 100% progress report
+                val mbFinal = finalLength / (1024.0 * 1024.0)
+                val finalProgress = JSObject().apply {
+                    this.put("percent", 100)
+                    this.put("bytesDownloaded", finalLength)
+                    this.put("totalBytes", finalLength)
+                    this.put("formattedMb", String.format(Locale.US, "%.1f / %.1f MB", mbFinal, mbFinal))
+                }
+                notifyListeners("updateProgress", finalProgress, true)
+
+                // Check install permission (API 26+)
+                val canInstall = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.packageManager.canRequestPackageInstalls()
+                } else {
+                    true
+                }
+
+                if (!canInstall) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        val manageIntent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
+                            this.data = Uri.parse("package:${context.packageName}")
+                            this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        activity.startActivity(manageIntent)
+                    }
+                    val ret = JSObject().apply {
+                        this.put("started", false)
+                        this.put("needPermission", true)
+                        this.put("message", "Turn on Allow from this source, then come back and tap Install again")
+                    }
+                    call.resolve(ret)
+                    return@Thread
+                }
+
+                // Trigger package installer through FileProvider
+                val authority = "${context.packageName}.fileprovider"
+                val apkUri = androidx.core.content.FileProvider.getUriForFile(context, authority, apkFile)
+
+                val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                    this.setDataAndType(apkUri, "application/vnd.android.package-archive")
+                    this.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                activity.startActivity(installIntent)
+
+                val ret = JSObject().apply {
+                    this.put("started", true)
+                    this.put("needPermission", false)
+                }
+                call.resolve(ret)
+            } catch (e: Exception) {
+                call.reject("Update install failed: ${e.message ?: "Unknown error"}")
+            } finally {
+                try { inputStream?.close() } catch (_: Exception) {}
+                try { outputStream?.close() } catch (_: Exception) {}
+                connection?.disconnect()
+            }
+        }.start()
     }
 
     @PluginMethod

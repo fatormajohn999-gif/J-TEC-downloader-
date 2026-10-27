@@ -16,6 +16,7 @@ import { ClipboardPromptModal } from './components/ClipboardPromptModal';
 import { AppSettings, DownloadHistoryItem, PlatformType } from './types';
 import { checkServerHealth, isSupportedUrl } from './services/api';
 import { VideoDownloader } from './plugins/videoDownloader';
+import { checkForAppUpdate } from './services/updateService';
 
 const STORAGE_KEY_SETTINGS = 'omnidrop_settings_v1';
 const STORAGE_KEY_HISTORY = 'omnidrop_history_v1';
@@ -34,10 +35,13 @@ const DEFAULT_SETTINGS: AppSettings = {
   floatingShowMs: true,
   floatingAutoClear: true,
   floatingVibrate: true,
+  floatingHideInsideApp: true,
+  autoCheckUpdates: true,
 };
 
 export default function App() {
   const [currentTab, setCurrentTab] = useState<NavTab>('home');
+  const [hasUpdateWaiting, setHasUpdateWaiting] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY_SETTINGS);
@@ -79,6 +83,8 @@ export default function App() {
         floatingShowMs: newSettings.floatingShowMs,
         floatingAutoClear: newSettings.floatingAutoClear ?? true,
         floatingVibrate: newSettings.floatingVibrate ?? true,
+        floatingHideInsideApp: newSettings.floatingHideInsideApp ?? true,
+        autoCheckUpdates: newSettings.autoCheckUpdates ?? true,
       }).catch(() => {});
     } catch {}
   };
@@ -96,7 +102,34 @@ export default function App() {
       floatingShowMs: settings.floatingShowMs,
       floatingAutoClear: settings.floatingAutoClear ?? true,
       floatingVibrate: settings.floatingVibrate ?? true,
+      floatingHideInsideApp: settings.floatingHideInsideApp ?? true,
+      autoCheckUpdates: settings.autoCheckUpdates ?? true,
     }).catch(() => {});
+
+    // Check updates on app open (throttled to at most once per hour)
+    checkForAppUpdate(false)
+      .then((res) => {
+        if (res.hasUpdate && !res.isSkipped) {
+          setHasUpdateWaiting(true);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Listen to native openSettingsTab event (from notification click)
+  useEffect(() => {
+    let handle: any = null;
+    VideoDownloader.addListener('openSettingsTab', () => {
+      setCurrentTab('settings');
+    })
+      .then((h) => {
+        handle = h;
+      })
+      .catch(() => {});
+
+    return () => {
+      if (handle && handle.remove) handle.remove();
+    };
   }, []);
 
   const mergeNativeItems = useCallback((nativeItems: DownloadHistoryItem[]) => {
@@ -332,6 +365,7 @@ export default function App() {
             settings={settings}
             onUpdateSettings={handleUpdateSettings}
             onRefreshHealth={refreshHealth}
+            onUpdateAvailableChange={setHasUpdateWaiting}
           />
         )}
 
@@ -351,11 +385,12 @@ export default function App() {
         onDismiss={() => setDetectedClipboardUrl('')}
       />
 
-      {/* 4-Tab Bottom Navigation (Download, Videos, Settings, About) */}
+      {/* Bottom Navigation with Update Notification Badge */}
       <BottomNav
         currentTab={currentTab}
         onSelectTab={setCurrentTab}
         videoCount={history.length}
+        hasUpdate={hasUpdateWaiting}
       />
     </div>
   );

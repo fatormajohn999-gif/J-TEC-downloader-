@@ -29,6 +29,20 @@ export const AboutScreen: React.FC = () => {
   const [activeSubScreen, setActiveSubScreen] = useState<SubScreen>(null);
   const [crashLog, setCrashLog] = useState<string>('');
   const [isCopied, setIsCopied] = useState(false);
+  const [appVersion, setAppVersion] = useState<{ versionName: string; versionCode: number }>({
+    versionName: '1.0.0',
+    versionCode: 1,
+  });
+
+  React.useEffect(() => {
+    VideoDownloader.getAppVersion()
+      .then((ver) => {
+        if (ver && ver.versionCode) {
+          setAppVersion(ver);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   React.useEffect(() => {
     if (activeSubScreen === 'info') {
@@ -88,10 +102,10 @@ export const AboutScreen: React.FC = () => {
       id: 'info' as SubScreen,
       code: 'SYS // 04',
       title: 'App Specifications',
-      subtitle: 'v2.4.0 (Build 240) • Hybrid runtime & open-source stack',
+      subtitle: `v1.0.${appVersion.versionCode} (Build ${appVersion.versionCode}) • Hybrid runtime & open-source stack`,
       icon: Info,
       color: 'text-purple-400',
-      badge: 'v2.4.0',
+      badge: `v1.0.${appVersion.versionCode}`,
     },
   ];
 
@@ -483,10 +497,10 @@ export const AboutScreen: React.FC = () => {
           <div className="flex items-center justify-between pb-3 border-b border-slate-800">
             <div>
               <div className="font-mono font-bold text-white text-sm">OmniDrop Personal Downloader</div>
-              <div className="font-mono text-[11px] text-cyan-400">PRODUCTION BUILD 240</div>
+              <div className="font-mono text-[11px] text-cyan-400">PRODUCTION BUILD {appVersion.versionCode}</div>
             </div>
             <span className="px-2.5 py-1 rounded-lg bg-cyan-950 border border-cyan-500/40 text-cyan-300 font-mono text-xs font-bold">
-              v2.4.0
+              v1.0.{appVersion.versionCode}
             </span>
           </div>
 
@@ -593,7 +607,7 @@ export const AboutScreen: React.FC = () => {
           <p className="text-xs text-slate-400 mt-0.5">Documentation, privacy audit & developer profile</p>
         </div>
         <div className="font-mono text-[10px] px-2 py-0.5 rounded bg-cyan-950/60 border border-cyan-500/30 text-cyan-300 font-bold">
-          BUILD 2.4.0
+          BUILD v1.0.{appVersion.versionCode}
         </div>
       </div>
 

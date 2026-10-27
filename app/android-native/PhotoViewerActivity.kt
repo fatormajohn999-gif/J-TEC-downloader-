@@ -659,21 +659,41 @@ class PhotoViewerActivity : Activity() {
             try {
                 val uri = Uri.parse(targetUriStr)
                 contentResolver.delete(uri, null, null)
+            } catch (e: SecurityException) {
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                    try {
+                        val pending = android.provider.MediaStore.createDeleteRequest(contentResolver, listOf(Uri.parse(targetUriStr)))
+                        startIntentSenderForResult(pending.intentSender, 7103, null, 0, 0, 0)
+                        return@Thread
+                    } catch (_: Exception) {}
+                }
             } catch (_: Exception) {}
 
             mainHandler.post {
-                photoUris.removeAt(currentIndex)
-                if (photoUris.isEmpty()) {
-                    Toast.makeText(this@PhotoViewerActivity, "All photos deleted", Toast.LENGTH_SHORT).show()
-                    finish()
-                } else {
-                    if (currentIndex >= photoUris.size) {
-                        currentIndex = photoUris.size - 1
-                    }
-                    loadCurrentPhoto(animate = false, slideLeft = false)
-                }
+                removePhotoAtCurrentIndex()
             }
         }.start()
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 7103 && resultCode == Activity.RESULT_OK) {
+            removePhotoAtCurrentIndex()
+        }
+    }
+
+    private fun removePhotoAtCurrentIndex() {
+        if (photoUris.isEmpty()) return
+        photoUris.removeAt(currentIndex)
+        if (photoUris.isEmpty()) {
+            Toast.makeText(this@PhotoViewerActivity, "All photos deleted", Toast.LENGTH_SHORT).show()
+            finish()
+        } else {
+            if (currentIndex >= photoUris.size) {
+                currentIndex = photoUris.size - 1
+            }
+            loadCurrentPhoto(animate = false, slideLeft = false)
+        }
     }
 
     private fun flashTitleBanner(text: String) {
@@ -725,8 +745,19 @@ class PhotoViewerActivity : Activity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        FloatingBubbleService.setOmniDropForeground(true)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        FloatingBubbleService.setOmniDropForeground(false)
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        FloatingBubbleService.setOmniDropForeground(false)
         mainHandler.removeCallbacksAndMessages(null)
     }
 }

@@ -7,11 +7,11 @@ export interface VideoDownloaderPlugin {
   hasVideoPermission(): Promise<{ granted: boolean }>;
   requestVideoPermission(): Promise<{ requested: boolean }>;
   getVideoLibrary(): Promise<{ videos: VideoLibraryItem[] }>;
-  deleteVideo(options: { uri: string }): Promise<{ deleted: boolean }>;
+  deleteVideo(options: { uri?: string; uris?: string[] }): Promise<{ deleted: number | boolean; count?: number; failed?: number; cancelled?: boolean }>;
   getPhotoLibrary(): Promise<{ photos: PhotoLibraryItem[] }>;
-  deletePhotos(options: { uris: string[] }): Promise<{ deleted: boolean; count: number }>;
+  deletePhotos(options: { uris?: string[]; uri?: string }): Promise<{ deleted: number | boolean; count?: number; failed?: number; cancelled?: boolean }>;
   openPhotoViewer(options: { uris: string[]; index?: number; postTitle?: string }): Promise<{ started: boolean }>;
-  renameVideo(options: { uri: string; newTitle: string; newPlatform: string }): Promise<{ success: boolean; title: string; platform: string }>;
+  renameVideo(options: { uri: string; newTitle: string; newPlatform: string }): Promise<{ success: boolean; title?: string; platform?: string; cancelled?: boolean }>;
   checkDuplicate(options: { url: string }): Promise<{ exists: boolean; uri?: string; title?: string; fileName?: string }>;
   playVideo(options: {
     uri: string;
@@ -42,10 +42,17 @@ export interface VideoDownloaderPlugin {
     floatingShowMs?: boolean;
     floatingAutoClear?: boolean;
     floatingVibrate?: boolean;
+    floatingHideInsideApp?: boolean;
+    autoCheckUpdates?: boolean;
   }): Promise<{ saved: boolean }>;
   clearMetadataCache(): Promise<{ cleared: boolean }>;
   getLastCrash(): Promise<{ crash: string }>;
   clearLastCrash(): Promise<{ cleared: boolean }>;
+  getAppVersion(): Promise<{ versionName: string; versionCode: number }>;
+  downloadAndInstallUpdate(options: {
+    url: string;
+    size?: number;
+  }): Promise<{ started: boolean; needPermission?: boolean; message?: string }>;
   downloadAndSave(options: {
     url: string;
     quality: string;
@@ -66,6 +73,14 @@ export interface VideoDownloaderPlugin {
   addListener(
     eventName: 'nativeDownloadFinished',
     listenerFunc: (entry: DownloadHistoryItem) => void
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'updateProgress',
+    listenerFunc: (data: { percent: number; bytesDownloaded: number; totalBytes: number; formattedMb: string }) => void
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'openSettingsTab',
+    listenerFunc: (data: { tab: string }) => void
   ): Promise<PluginListenerHandle>;
 }
 
@@ -162,6 +177,12 @@ const VideoDownloaderWeb: VideoDownloaderPlugin = {
   },
   async clearLastCrash() {
     return { cleared: true };
+  },
+  async getAppVersion() {
+    return { versionName: '1.0.1', versionCode: 1 };
+  },
+  async downloadAndInstallUpdate() {
+    return { started: false, needPermission: false, message: 'In-app update installation is only supported on Android native devices.' };
   },
   async downloadAndSave() {
     throw new Error('downloadAndSave native method is only available on Android platform.');

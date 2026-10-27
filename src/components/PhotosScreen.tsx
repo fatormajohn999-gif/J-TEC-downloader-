@@ -38,6 +38,16 @@ export const PhotosScreen: React.FC<PhotosScreenProps> = ({ onRefreshTrigger }) 
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
 
+  // Dark Robotic Notice / Error Modal (no window.alert)
+  const [roboticNotice, setRoboticNotice] = useState<{
+    title: string;
+    message: string;
+    isError?: boolean;
+  } | null>(null);
+
+  // Styled permission hint toast/banner
+  const [permissionNotice, setPermissionNotice] = useState<string | null>(null);
+
   // Load photos from MediaStore
   const loadLibrary = useCallback(async () => {
     setIsLoading(true);
@@ -246,18 +256,36 @@ export const PhotosScreen: React.FC<PhotosScreenProps> = ({ onRefreshTrigger }) 
 
   const handleDeleteSelected = async () => {
     if (selectedUris.size === 0) return;
+    const urisArray = Array.from(selectedUris);
     setIsDeleting(true);
+    setPermissionNotice(`Android will ask your permission to delete ${urisArray.length} photos`);
+
     try {
-      const urisArray = Array.from(selectedUris);
-      await VideoDownloader.deletePhotos({ uris: urisArray });
-      setPhotos((prev) => prev.filter((p) => !selectedUris.has(p.uri)));
-      setSelectedUris(new Set());
-      setIsSelectMode(false);
-      setDeleteConfirmOpen(false);
+      const res = await VideoDownloader.deletePhotos({ uris: urisArray });
+      setPermissionNotice(null);
+      if (res && res.cancelled) {
+        setRoboticNotice({
+          title: 'DELETION CANCELLED',
+          message: 'Permission was not granted to delete these photo files.',
+          isError: true,
+        });
+      } else {
+        setPhotos((prev) => prev.filter((p) => !selectedUris.has(p.uri)));
+        setSelectedUris(new Set());
+        setIsSelectMode(false);
+        setDeleteConfirmOpen(false);
+        await loadLibrary();
+      }
     } catch (e) {
-      alert('Error deleting photos: ' + e);
+      setPermissionNotice(null);
+      setRoboticNotice({
+        title: 'DELETE ERROR',
+        message: 'Error deleting photos: ' + (e instanceof Error ? e.message : String(e)),
+        isError: true,
+      });
     } finally {
       setIsDeleting(false);
+      setPermissionNotice(null);
     }
   };
 
@@ -270,8 +298,10 @@ export const PhotosScreen: React.FC<PhotosScreenProps> = ({ onRefreshTrigger }) 
         title: 'OmniDrop Photo',
       });
     } else {
-      // Open viewer on first image or prompt
-      alert(`Sharing ${urisArray.length} photos. Select an image in the viewer to share.`);
+      setRoboticNotice({
+        title: 'BATCH SHARE',
+        message: `Sharing ${urisArray.length} photos. Select an image in the viewer to share individually.`,
+      });
     }
   };
 
@@ -664,6 +694,47 @@ export const PhotosScreen: React.FC<PhotosScreenProps> = ({ onRefreshTrigger }) 
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Styled Dark Robotic Modal for System Messages & Errors (never window.alert) */}
+      {roboticNotice && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="machine-surface w-full max-w-sm rounded-xl p-5 space-y-4 shadow-2xl border border-cyan-500/30">
+            <div className="flex items-center gap-2.5">
+              <span
+                className={`inline-block w-2.5 h-2.5 rounded-full ${
+                  roboticNotice.isError
+                    ? 'bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.6)]'
+                    : 'bg-cyan-400 shadow-[0_0_8px_rgba(0,240,255,0.6)]'
+                }`}
+              />
+              <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider flex-1">
+                {roboticNotice.title}
+              </h3>
+            </div>
+            <p className="font-mono text-xs text-slate-300 leading-relaxed bg-slate-950/60 p-3 rounded-lg border border-slate-800">
+              {roboticNotice.message}
+            </p>
+            <div className="flex justify-end pt-1">
+              <button
+                onClick={() => setRoboticNotice(null)}
+                className="machine-btn-primary px-4 py-1.5 rounded-lg font-mono text-xs font-bold uppercase"
+              >
+                ACKNOWLEDGE
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Styled Permission Notice Banner */}
+      {permissionNotice && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[70] px-4 py-2.5 rounded-xl bg-slate-950/95 border border-cyan-500/60 shadow-[0_0_20px_rgba(0,240,255,0.25)] flex items-center gap-2.5 animate-in slide-in-from-top duration-200">
+          <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
+          <span className="font-mono text-xs text-cyan-300 font-bold uppercase tracking-wider">
+            {permissionNotice}
+          </span>
         </div>
       )}
     </div>

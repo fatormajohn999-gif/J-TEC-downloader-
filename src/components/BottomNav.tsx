@@ -8,6 +8,7 @@ interface BottomNavProps {
   onSelectTab: (tab: NavTab) => void;
   videoCount?: number;
   photoCount?: number;
+  hasUpdate?: boolean;
 }
 
 export const BottomNav: React.FC<BottomNavProps> = ({
@@ -15,6 +16,7 @@ export const BottomNav: React.FC<BottomNavProps> = ({
   onSelectTab,
   videoCount,
   photoCount,
+  hasUpdate,
 }) => {
   const tabs = [
     {
@@ -78,6 +80,9 @@ export const BottomNav: React.FC<BottomNavProps> = ({
                   <span className="absolute -top-1 -right-2.5 px-1 py-0.2 text-[9px] font-mono font-bold rounded-full bg-cyan-400 text-slate-950 min-w-3.5 text-center shadow-[0_0_6px_rgba(0,240,255,0.8)]">
                     {tab.badge > 99 ? '99+' : tab.badge}
                   </span>
+                )}
+                {tab.id === 'settings' && hasUpdate && (
+                  <span className="absolute -top-1 -right-1.5 w-2.5 h-2.5 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(245,158,11,0.95)] animate-pulse" />
                 )}
               </div>
 

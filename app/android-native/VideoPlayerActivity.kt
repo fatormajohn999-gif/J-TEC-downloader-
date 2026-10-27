@@ -10,6 +10,7 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
@@ -22,6 +23,7 @@ import android.view.GestureDetector
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.view.animation.AlphaAnimation
 import android.widget.FrameLayout
@@ -39,13 +41,13 @@ import org.json.JSONObject
  * Built with pure Android SDK (VideoView + Canvas/Drawables).
  * Features:
  * - Playlist support: seamlessly browse filtered library clips.
+ * - Previous (⏮) and Next (⏭) mechanical keys cycling playlist.
+ * - Custom navy/cyan seekbar and round cyan/white thumb.
+ * - Center-crop FIT / FILL scaling.
+ * - Left vertical drag brightness & right vertical drag volume HUD.
  * - Swipe left/right gestures for next/previous video with smooth slide animations.
  * - Flash HUD banner ("X / Y - Title") and thumbnail placeholder during loading.
- * - Single-time "SWIPE FOR NEXT" onboarding hint.
  * - Autoplay & Repeat modes: OFF, ONE, ALL with cycling mechanical button & LED indicator.
- * - Unobstructed central picture with auto-hiding dark robotic HUD controls.
- * - Target time tooltip above seekbar during drag.
- * - Double-tap left/right 10s skip ripple indicators.
  * - Auto-rotation from video aspect ratio + manual orientation lock.
  * - Persistent per-video playback resumption saved in SharedPreferences.
  */
@@ -57,6 +59,7 @@ class VideoPlayerActivity : Activity() {
         private const val KEY_SWIPE_HINT_SHOWN = "swipe_hint_shown"
 
         private val sharedPlaylist = ArrayList<PlaylistItem>()
+        var sessionFillMode: Boolean = false
 
         fun setPlaylist(items: List<PlaylistItem>) {
             sharedPlaylist.clear()
@@ -99,6 +102,8 @@ class VideoPlayerActivity : Activity() {
 
     private lateinit var titleTextView: TextView
     private lateinit var playlistCounterTextView: TextView
+    private lateinit var prevVideoBtn: TextView
+    private lateinit var nextVideoBtn: TextView
     private lateinit var playPauseButton: TextView
     private lateinit var skipBackwardButton: TextView
     private lateinit var skipForwardButton: TextView
@@ -106,6 +111,7 @@ class VideoPlayerActivity : Activity() {
     private lateinit var totalTimeTextView: TextView
     private lateinit var seekBar: SeekBar
     private lateinit var seekTooltipTextView: TextView
+    private lateinit var fitFillButton: TextView
     private lateinit var speedButton: TextView
     private lateinit var rotateButton: TextView
     private lateinit var repeatButton: LinearLayout
@@ -119,6 +125,27 @@ class VideoPlayerActivity : Activity() {
     private lateinit var titleFlashBannerView: TextView
     private lateinit var swipeHintOverlay: LinearLayout
     private lateinit var errorOverlay: LinearLayout
+
+    // Brightness and Volume Robotic HUD
+    private lateinit var gestureHudCard: LinearLayout
+    private lateinit var gestureHudIcon: TextView
+    private lateinit var gestureHudValue: TextView
+    private lateinit var gestureHudProgress: View
+    private lateinit var audioManager: AudioManager
+    private var touchSlop: Int = 16
+
+    private enum class TouchMode { NONE, VERTICAL_BRIGHTNESS, VERTICAL_VOLUME, HORIZONTAL_FLING }
+    private var activeTouchMode = TouchMode.NONE
+    private var touchDownX: Float = 0f
+    private var touchDownY: Float = 0f
+    private var initialBrightness: Float = 0.5f
+    private var initialVolume: Int = 0
+
+    private val hideGestureHudRunnable = Runnable {
+        gestureHudCard.animate().alpha(0f).setDuration(250).withEndAction {
+            gestureHudCard.visibility = View.GONE
+        }.start()
+    }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var mediaPlayer: MediaPlayer? = null
@@ -171,6 +198,8 @@ class VideoPlayerActivity : Activity() {
         super.onCreate(savedInstanceState)
         try {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            touchSlop = ViewConfiguration.get(this).scaledTouchSlop
 
             parseIntentData()
             loadNativeSettings()
@@ -201,17 +230,23 @@ class VideoPlayerActivity : Activity() {
         playlist.clear()
         val fromHolder = getPlaylist()
         if (fromHolder.isNotEmpty()) {
-            playlist.addAll(fromHolder)
+            val seen = HashSet<String>()
+            for (it in fromHolder) {
+                if (it.uri.isNotBlank() && seen.add(it.uri)) {
+                    playlist.add(it)
+                }
+            }
         }
 
         if (playlist.isEmpty() && initialUri != null) {
             playlist.add(PlaylistItem(initialUri.toString(), initialTitle, "Other"))
         }
 
-        currentIndex = if (playlist.isNotEmpty()) {
-            targetIndex.coerceIn(0, playlist.size - 1)
+        if (initialUri != null) {
+            val foundIdx = playlist.indexOfFirst { it.uri == initialUri.toString() }
+            currentIndex = if (foundIdx >= 0) foundIdx else targetIndex.coerceIn(0, (playlist.size - 1).coerceAtLeast(0))
         } else {
-            0
+            currentIndex = targetIndex.coerceIn(0, (playlist.size - 1).coerceAtLeast(0))
         }
     }
 
@@ -229,13 +264,57 @@ class VideoPlayerActivity : Activity() {
         ).toInt()
     }
 
+    private fun applyVideoSizing() {
+        val mp = mediaPlayer ?: return
+        val vw = mp.videoWidth
+        val vh = mp.videoHeight
+        if (vw <= 0 || vh <= 0) return
+
+        val cw = rootContainer.width
+        val ch = rootContainer.height
+        if (cw <= 0 || ch <= 0) return
+
+        if (!sessionFillMode) {
+            val lp = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ).apply {
+                this.gravity = Gravity.CENTER
+            }
+            videoView.layoutParams = lp
+        } else {
+            val videoAspect = vw.toFloat() / vh.toFloat()
+            val containerAspect = cw.toFloat() / ch.toFloat()
+
+            val targetWidth: Int
+            val targetHeight: Int
+            if (videoAspect > containerAspect) {
+                targetHeight = ch
+                targetWidth = (ch * videoAspect).toInt()
+            } else {
+                targetWidth = cw
+                targetHeight = (cw / videoAspect).toInt()
+            }
+
+            val lp = FrameLayout.LayoutParams(targetWidth, targetHeight).apply {
+                this.gravity = Gravity.CENTER
+            }
+            videoView.layoutParams = lp
+        }
+    }
+
     private fun buildPlayerUI() {
         rootContainer = FrameLayout(this).apply {
             this.setBackgroundColor(Color.BLACK)
         }
+        rootContainer.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            applyVideoSizing()
+        }
 
         // 1. Video Container (VideoView + Thumbnail placeholder for smooth slide animations)
         videoContentContainer = FrameLayout(this).apply {
+            this.clipChildren = true
+            this.clipToPadding = true
             val lp = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
@@ -514,8 +593,82 @@ class VideoPlayerActivity : Activity() {
             )
         }
         swipeHintOverlay.addView(hintText)
-
         rootContainer.addView(swipeHintOverlay)
+
+        // Robotic Gesture HUD for Brightness & Volume
+        gestureHudCard = LinearLayout(this).apply {
+            this.orientation = LinearLayout.VERTICAL
+            this.gravity = Gravity.CENTER
+            this.setPadding(dp(16), dp(12), dp(16), dp(12))
+            this.background = GradientDrawable().apply {
+                this.shape = GradientDrawable.RECTANGLE
+                this.cornerRadius = dp(8).toFloat()
+                this.setColor(Color.parseColor("#E60B0E14"))
+                this.setStroke(dp(1), Color.parseColor("#00F0FF"))
+            }
+            this.visibility = View.GONE
+            val lp = FrameLayout.LayoutParams(dp(110), dp(84)).apply {
+                this.gravity = Gravity.CENTER
+            }
+            this.layoutParams = lp
+        }
+
+        gestureHudIcon = TextView(this).apply {
+            this.text = "☀"
+            this.setTextColor(Color.parseColor("#00F0FF"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+            this.gravity = Gravity.CENTER
+        }
+        gestureHudCard.addView(gestureHudIcon)
+
+        gestureHudValue = TextView(this).apply {
+            this.text = "100%"
+            this.setTextColor(Color.WHITE)
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            this.typeface = Typeface.MONOSPACE
+            this.gravity = Gravity.CENTER
+            this.setPadding(0, dp(4), 0, dp(4))
+        }
+        gestureHudCard.addView(gestureHudValue)
+
+        val progressTrack = FrameLayout(this).apply {
+            val lp = LinearLayout.LayoutParams(dp(72), dp(5)).apply {
+                this.topMargin = dp(2)
+            }
+            this.layoutParams = lp
+            this.background = GradientDrawable().apply {
+                this.shape = GradientDrawable.RECTANGLE
+                this.cornerRadius = dp(2).toFloat()
+                this.setColor(Color.parseColor("#16202E"))
+            }
+        }
+        gestureHudProgress = View(this).apply {
+            val lp = FrameLayout.LayoutParams(dp(72), dp(5))
+            this.layoutParams = lp
+            this.background = GradientDrawable().apply {
+                this.shape = GradientDrawable.RECTANGLE
+                this.cornerRadius = dp(2).toFloat()
+                this.setColor(Color.parseColor("#00F0FF"))
+            }
+        }
+        progressTrack.addView(gestureHudProgress)
+        gestureHudCard.addView(progressTrack)
+
+        rootContainer.addView(gestureHudCard)
+    }
+
+    private fun showGestureHud(icon: String, percent: Int) {
+        mainHandler.removeCallbacks(hideGestureHudRunnable)
+        gestureHudIcon.text = icon
+        gestureHudValue.text = "$percent%"
+        val totalWidth = dp(72)
+        val fillWidth = (totalWidth * (percent.coerceIn(0, 100) / 100f)).toInt()
+        val lp = gestureHudProgress.layoutParams as FrameLayout.LayoutParams
+        lp.width = fillWidth
+        gestureHudProgress.layoutParams = lp
+
+        gestureHudCard.visibility = View.VISIBLE
+        gestureHudCard.alpha = 1f
     }
 
     private fun checkAndShowSwipeHint() {
@@ -594,8 +747,77 @@ class VideoPlayerActivity : Activity() {
         })
 
         rootContainer.setOnTouchListener { _, event ->
-            gestureDetector.onTouchEvent(event)
-            true
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    touchDownX = event.x
+                    touchDownY = event.y
+                    activeTouchMode = TouchMode.NONE
+                    initialBrightness = window.attributes.screenBrightness
+                    if (initialBrightness < 0f) initialBrightness = 0.5f
+                    initialVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                    gestureDetector.onTouchEvent(event)
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = event.x - touchDownX
+                    val dy = event.y - touchDownY
+
+                    if (activeTouchMode == TouchMode.NONE) {
+                        if (Math.hypot(dx.toDouble(), dy.toDouble()) > touchSlop) {
+                            if (Math.abs(dy) > Math.abs(dx)) {
+                                if (touchDownX < rootContainer.width / 2) {
+                                    activeTouchMode = TouchMode.VERTICAL_BRIGHTNESS
+                                } else {
+                                    activeTouchMode = TouchMode.VERTICAL_VOLUME
+                                }
+                            } else {
+                                activeTouchMode = TouchMode.HORIZONTAL_FLING
+                            }
+                        }
+                    }
+
+                    when (activeTouchMode) {
+                        TouchMode.VERTICAL_BRIGHTNESS -> {
+                            val height = rootContainer.height.toFloat().coerceAtLeast(1f)
+                            val deltaY = touchDownY - event.y
+                            val newB = (initialBrightness + (deltaY / height)).coerceIn(0.01f, 1.0f)
+                            val lp = window.attributes
+                            lp.screenBrightness = newB
+                            window.attributes = lp
+                            showGestureHud("☀", (newB * 100).toInt())
+                            true
+                        }
+                        TouchMode.VERTICAL_VOLUME -> {
+                            val height = rootContainer.height.toFloat().coerceAtLeast(1f)
+                            val deltaY = touchDownY - event.y
+                            val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                            val stepChange = ((deltaY / height) * maxVol).toInt()
+                            val newVol = (initialVolume + stepChange).coerceIn(0, maxVol)
+                            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, newVol, 0)
+                            showGestureHud("🔊", (newVol * 100 / maxVol))
+                            true
+                        }
+                        else -> {
+                            gestureDetector.onTouchEvent(event)
+                            true
+                        }
+                    }
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    if (activeTouchMode == TouchMode.VERTICAL_BRIGHTNESS || activeTouchMode == TouchMode.VERTICAL_VOLUME) {
+                        mainHandler.removeCallbacks(hideGestureHudRunnable)
+                        mainHandler.postDelayed(hideGestureHudRunnable, 1200)
+                    } else {
+                        gestureDetector.onTouchEvent(event)
+                    }
+                    activeTouchMode = TouchMode.NONE
+                    true
+                }
+                else -> {
+                    gestureDetector.onTouchEvent(event)
+                    true
+                }
+            }
         }
     }
 
@@ -652,6 +874,9 @@ class VideoPlayerActivity : Activity() {
             this.setTextColor(Color.parseColor("#00F0FF"))
             this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             this.typeface = Typeface.MONOSPACE
+            this.gravity = Gravity.CENTER
+            this.minHeight = dp(44)
+            this.minWidth = dp(44)
             this.setPadding(dp(12), dp(6), dp(12), dp(6))
             this.background = createMechanicalButtonBackground(false)
             this.setOnClickListener {
@@ -693,6 +918,8 @@ class VideoPlayerActivity : Activity() {
             this.setTextColor(Color.parseColor("#94A3B8"))
             this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             this.typeface = Typeface.MONOSPACE
+            this.gravity = Gravity.CENTER
+            this.minHeight = dp(44)
             this.setPadding(dp(8), dp(4), dp(8), dp(4))
             this.background = GradientDrawable().apply {
                 this.shape = GradientDrawable.RECTANGLE
@@ -716,7 +943,7 @@ class VideoPlayerActivity : Activity() {
     private fun buildBottomBar() {
         bottomBarLayout = LinearLayout(this).apply {
             this.orientation = LinearLayout.VERTICAL
-            this.setPadding(dp(16), dp(14), dp(16), dp(18))
+            this.setPadding(dp(16), dp(10), dp(16), dp(14))
             this.background = GradientDrawable(
                 GradientDrawable.Orientation.BOTTOM_TOP,
                 intArrayOf(Color.parseColor("#F5080B10"), Color.TRANSPARENT)
@@ -774,14 +1001,61 @@ class VideoPlayerActivity : Activity() {
         }
         seekRow.addView(currentTimeTextView)
 
+        // Custom Seekbar Drawables: track = navy #16202E 6dp rounded; progress = cyan #00F0FF with soft glow; thumb = 18dp cyan circle with 6dp white core
+        val trackBg = GradientDrawable().apply {
+            this.shape = GradientDrawable.RECTANGLE
+            this.cornerRadius = dp(3).toFloat()
+            this.setColor(Color.parseColor("#16202E"))
+            this.setSize(-1, dp(6))
+        }
+
+        val progressGlow = GradientDrawable().apply {
+            this.shape = GradientDrawable.RECTANGLE
+            this.cornerRadius = dp(3).toFloat()
+            this.setColor(Color.parseColor("#00F0FF"))
+            this.setStroke(dp(1), Color.parseColor("#8000F0FF"))
+            this.setSize(-1, dp(6))
+        }
+
+        val progressClip = android.graphics.drawable.ClipDrawable(
+            progressGlow,
+            Gravity.START,
+            android.graphics.drawable.ClipDrawable.HORIZONTAL
+        )
+
+        val customProgressDrawable = LayerDrawable(arrayOf(trackBg, progressClip)).apply {
+            this.setId(0, android.R.id.background)
+            this.setId(1, android.R.id.progress)
+        }
+
+        val thumbOuter = GradientDrawable().apply {
+            this.shape = GradientDrawable.OVAL
+            this.setSize(dp(18), dp(18))
+            this.setColor(Color.parseColor("#00F0FF"))
+            this.setStroke(dp(2), Color.parseColor("#8000F0FF"))
+        }
+
+        val thumbInner = GradientDrawable().apply {
+            this.shape = GradientDrawable.OVAL
+            this.setSize(dp(6), dp(6))
+            this.setColor(Color.WHITE)
+        }
+
+        val customThumb = LayerDrawable(arrayOf(thumbOuter, thumbInner)).apply {
+            val inset = dp(6)
+            this.setLayerInset(1, inset, inset, inset, inset)
+        }
+
         seekBar = SeekBar(this).apply {
             val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
                 this.leftMargin = dp(8)
                 this.rightMargin = dp(8)
             }
             this.layoutParams = lp
-            this.progressTintList = ColorStateList.valueOf(Color.parseColor("#00F0FF"))
-            this.thumbTintList = ColorStateList.valueOf(Color.parseColor("#38BDF8"))
+            this.progressDrawable = customProgressDrawable
+            this.thumb = customThumb
+            this.splitTrack = false
+            this.thumbOffset = dp(9)
             this.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
                     if (fromUser) {
@@ -818,7 +1092,7 @@ class VideoPlayerActivity : Activity() {
         seekRow.addView(totalTimeTextView)
         bottomBarLayout.addView(seekRow)
 
-        // Bottom Controls Row: -10s, Play/Pause, +10s, Repeat, Speed, Rotate
+        // Bottom Controls Row: Previous (⏮), -10s, Play/Pause, +10s, Next (⏭), FIT/FILL, Repeat, Speed, Rotate
         val controlsRow = LinearLayout(this).apply {
             this.orientation = LinearLayout.HORIZONTAL
             this.gravity = Gravity.CENTER_VERTICAL
@@ -831,6 +1105,31 @@ class VideoPlayerActivity : Activity() {
             this.layoutParams = lp
         }
 
+        // Previous Video Button (⏮)
+        prevVideoBtn = TextView(this).apply {
+            this.text = "⏮"
+            this.setTextColor(Color.parseColor("#00F0FF"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            this.typeface = Typeface.DEFAULT_BOLD
+            this.gravity = Gravity.CENTER
+            this.minHeight = dp(44)
+            this.minWidth = dp(44)
+            this.setPadding(dp(8), dp(6), dp(8), dp(6))
+            this.background = createMechanicalButtonBackground(false)
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                this.rightMargin = dp(5)
+            }
+            this.layoutParams = lp
+            this.setOnClickListener {
+                resetAutoHideTimer()
+                playPreviousVideo(userInitiated = true)
+            }
+        }
+        controlsRow.addView(prevVideoBtn)
+
         // -10s button
         skipBackwardButton = TextView(this).apply {
             this.text = "-10s"
@@ -838,13 +1137,15 @@ class VideoPlayerActivity : Activity() {
             this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             this.typeface = Typeface.MONOSPACE
             this.gravity = Gravity.CENTER
-            this.setPadding(dp(10), dp(6), dp(10), dp(6))
+            this.minHeight = dp(44)
+            this.minWidth = dp(44)
+            this.setPadding(dp(8), dp(6), dp(8), dp(6))
             this.background = createMechanicalButtonBackground(false)
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                this.rightMargin = dp(6)
+                this.rightMargin = dp(5)
             }
             this.layoutParams = lp
             this.setOnClickListener {
@@ -863,13 +1164,15 @@ class VideoPlayerActivity : Activity() {
             this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             this.typeface = Typeface.DEFAULT_BOLD
             this.gravity = Gravity.CENTER
-            this.setPadding(dp(14), dp(6), dp(14), dp(6))
+            this.minHeight = dp(44)
+            this.minWidth = dp(44)
+            this.setPadding(dp(12), dp(6), dp(12), dp(6))
             this.background = createMechanicalButtonBackground(false)
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                this.rightMargin = dp(6)
+                this.rightMargin = dp(5)
             }
             this.layoutParams = lp
             this.setOnClickListener {
@@ -886,13 +1189,15 @@ class VideoPlayerActivity : Activity() {
             this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             this.typeface = Typeface.MONOSPACE
             this.gravity = Gravity.CENTER
-            this.setPadding(dp(10), dp(6), dp(10), dp(6))
+            this.minHeight = dp(44)
+            this.minWidth = dp(44)
+            this.setPadding(dp(8), dp(6), dp(8), dp(6))
             this.background = createMechanicalButtonBackground(false)
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                this.rightMargin = dp(6)
+                this.rightMargin = dp(5)
             }
             this.layoutParams = lp
             this.setOnClickListener {
@@ -904,6 +1209,31 @@ class VideoPlayerActivity : Activity() {
         }
         controlsRow.addView(skipForwardButton)
 
+        // Next Video Button (⏭)
+        nextVideoBtn = TextView(this).apply {
+            this.text = "⏭"
+            this.setTextColor(Color.parseColor("#00F0FF"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            this.typeface = Typeface.DEFAULT_BOLD
+            this.gravity = Gravity.CENTER
+            this.minHeight = dp(44)
+            this.minWidth = dp(44)
+            this.setPadding(dp(8), dp(6), dp(8), dp(6))
+            this.background = createMechanicalButtonBackground(false)
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                this.rightMargin = dp(5)
+            }
+            this.layoutParams = lp
+            this.setOnClickListener {
+                resetAutoHideTimer()
+                playNextVideo(userInitiated = true)
+            }
+        }
+        controlsRow.addView(nextVideoBtn)
+
         // Spacer
         val spacer = View(this).apply {
             val lp = LinearLayout.LayoutParams(0, 1, 1f)
@@ -911,17 +1241,48 @@ class VideoPlayerActivity : Activity() {
         }
         controlsRow.addView(spacer)
 
+        // FIT / FILL Button
+        fitFillButton = TextView(this).apply {
+            this.text = if (sessionFillMode) "FILL" else "FIT"
+            this.setTextColor(Color.parseColor("#00F0FF"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            this.typeface = Typeface.MONOSPACE
+            this.gravity = Gravity.CENTER
+            this.minHeight = dp(44)
+            this.minWidth = dp(44)
+            this.setPadding(dp(8), dp(6), dp(8), dp(6))
+            this.background = createMechanicalButtonBackground(sessionFillMode)
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                this.rightMargin = dp(5)
+            }
+            this.layoutParams = lp
+            this.setOnClickListener {
+                resetAutoHideTimer()
+                sessionFillMode = !sessionFillMode
+                this.text = if (sessionFillMode) "FILL" else "FIT"
+                this.background = createMechanicalButtonBackground(sessionFillMode)
+                applyVideoSizing()
+                flashTitleBanner(if (sessionFillMode) "MODE: FILL (CENTER CROP)" else "MODE: FIT (ENTIRE PICTURE)")
+            }
+        }
+        controlsRow.addView(fitFillButton)
+
         // Repeat button with LED (Cycles Repeat Off / One / All)
         repeatButton = LinearLayout(this).apply {
             this.orientation = LinearLayout.HORIZONTAL
-            this.gravity = Gravity.CENTER_VERTICAL
+            this.gravity = Gravity.CENTER
+            this.minHeight = dp(44)
+            this.minWidth = dp(44)
             this.setPadding(dp(8), dp(6), dp(8), dp(6))
             this.background = createMechanicalButtonBackground(false)
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                this.rightMargin = dp(6)
+                this.rightMargin = dp(5)
             }
             this.layoutParams = lp
             this.setOnClickListener {
@@ -963,13 +1324,15 @@ class VideoPlayerActivity : Activity() {
             this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
             this.typeface = Typeface.MONOSPACE
             this.gravity = Gravity.CENTER
+            this.minHeight = dp(44)
+            this.minWidth = dp(44)
             this.setPadding(dp(8), dp(6), dp(8), dp(6))
             this.background = createMechanicalButtonBackground(true)
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                this.rightMargin = dp(6)
+                this.rightMargin = dp(5)
             }
             this.layoutParams = lp
             this.setOnClickListener {
@@ -986,6 +1349,8 @@ class VideoPlayerActivity : Activity() {
             this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
             this.typeface = Typeface.MONOSPACE
             this.gravity = Gravity.CENTER
+            this.minHeight = dp(44)
+            this.minWidth = dp(44)
             this.setPadding(dp(8), dp(6), dp(8), dp(6))
             this.background = createMechanicalButtonBackground(false)
             val lp = LinearLayout.LayoutParams(
@@ -1094,6 +1459,7 @@ class VideoPlayerActivity : Activity() {
         videoView.setOnPreparedListener { mp ->
             mediaPlayer = mp
             applyPlaybackSpeed()
+            applyVideoSizing()
 
             val duration = videoView.duration
             if (duration > 0) {
@@ -1410,6 +1776,7 @@ class VideoPlayerActivity : Activity() {
 
     override fun onPause() {
         super.onPause()
+        FloatingBubbleService.setOmniDropForeground(false)
         saveCurrentPlaybackPosition()
         if (videoView.isPlaying) {
             videoView.pause()
@@ -1422,6 +1789,7 @@ class VideoPlayerActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        FloatingBubbleService.setOmniDropForeground(true)
         if (isControlsVisible) {
             scheduleControlsAutoHide()
         } else {
@@ -1439,6 +1807,7 @@ class VideoPlayerActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        FloatingBubbleService.setOmniDropForeground(false)
         saveCurrentPlaybackPosition()
         mainHandler.removeCallbacksAndMessages(null)
         videoView.stopPlayback()

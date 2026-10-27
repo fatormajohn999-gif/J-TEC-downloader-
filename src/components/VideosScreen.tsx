@@ -52,6 +52,19 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
   const [newPlatform, setNewPlatform] = useState<string>('Other');
   const [isRenaming, setIsRenaming] = useState(false);
 
+  // Dark Robotic Notice / Error Modal (no window.alert)
+  const [roboticNotice, setRoboticNotice] = useState<{
+    title: string;
+    message: string;
+    isError?: boolean;
+  } | null>(null);
+
+  // Styled permission hint toast/banner
+  const [permissionNotice, setPermissionNotice] = useState<string | null>(null);
+
+  // Purge result status
+  const [purgeResultText, setPurgeResultText] = useState<string | null>(null);
+
   // Close 3-dot menu when clicking outside
   useEffect(() => {
     const handleGlobalClick = () => setActiveMenuId(null);
@@ -127,8 +140,18 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
 
   const handlePlay = async (video: VideoLibraryItem) => {
     try {
-      const initialIndex = filteredVideos.findIndex((v) => v.uri === video.uri);
-      const playlist = filteredVideos.map((v) => ({
+      // Strictly deduplicate filteredVideos by URI so playlist matches visible filtered clips exactly
+      const seen = new Set<string>();
+      const dedupedPlaylist: VideoLibraryItem[] = [];
+      for (const v of filteredVideos) {
+        if (v.uri && !seen.has(v.uri)) {
+          seen.add(v.uri);
+          dedupedPlaylist.push(v);
+        }
+      }
+
+      const initialIndex = dedupedPlaylist.findIndex((v) => v.uri === video.uri);
+      const playlist = dedupedPlaylist.map((v) => ({
         uri: v.uri,
         title: v.title,
         platform: v.platform,
@@ -157,14 +180,41 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
 
   const handleDelete = async (video: VideoLibraryItem) => {
     setIsDeleting(true);
+    setPermissionNotice('Android will ask your permission to delete 1 file');
     try {
-      await VideoDownloader.deleteVideo({ uri: video.uri });
-      setVideos((prev) => prev.filter((v) => v.uri !== video.uri));
-      setDeleteConfirmId(null);
+      const res = await VideoDownloader.deleteVideo({ uri: video.uri });
+      setPermissionNotice(null);
+      if (res && res.cancelled) {
+        setRoboticNotice({
+          title: 'DELETION CANCELLED',
+          message: 'Permission was not granted to delete this video file.',
+          isError: true,
+        });
+      } else if (res && (res.deleted || (res.count && res.count > 0))) {
+        setVideos((prev) => prev.filter((v) => v.uri !== video.uri));
+        setDeleteConfirmId(null);
+        await loadLibrary();
+      } else if (res && res.failed && res.failed > 0) {
+        setRoboticNotice({
+          title: 'DELETE FAILED',
+          message: 'Android restricted deletion of this media file.',
+          isError: true,
+        });
+      } else {
+        setVideos((prev) => prev.filter((v) => v.uri !== video.uri));
+        setDeleteConfirmId(null);
+        await loadLibrary();
+      }
     } catch (e) {
-      alert('Could not delete video: ' + e);
+      setPermissionNotice(null);
+      setRoboticNotice({
+        title: 'DELETE ERROR',
+        message: 'Could not delete video: ' + (e instanceof Error ? e.message : String(e)),
+        isError: true,
+      });
     } finally {
       setIsDeleting(false);
+      setPermissionNotice(null);
     }
   };
 
@@ -200,24 +250,47 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
     }
 
     setDuplicateGroups(groups);
+    setPurgeResultText(null);
     setDuplicateModalOpen(true);
   };
 
   const handleDeleteDuplicates = async () => {
+    const extraVideos = duplicateGroups.flatMap((g) => g.extraVideos);
+    const targetUris = extraVideos.map((v) => v.uri);
+    if (targetUris.length === 0) return;
+
     setIsDeletingDuplicates(true);
+    setPurgeResultText(null);
+    setPermissionNotice(`Android will ask your permission to delete ${targetUris.length} files`);
+
     try {
-      const extraVideos = duplicateGroups.flatMap((g) => g.extraVideos);
-      for (const v of extraVideos) {
-        await VideoDownloader.deleteVideo({ uri: v.uri });
+      const res = await VideoDownloader.deleteVideo({ uris: targetUris });
+      setPermissionNotice(null);
+      const deletedCount =
+        typeof res.deleted === 'number'
+          ? res.deleted
+          : (res.count ?? (res.deleted ? targetUris.length : 0));
+
+      setPurgeResultText(`Deleted ${deletedCount} of ${targetUris.length}`);
+      if (res && res.cancelled) {
+        setRoboticNotice({
+          title: 'PURGE CANCELLED',
+          message: `Permission was cancelled. Deleted ${deletedCount} of ${targetUris.length} duplicate copies.`,
+          isError: true,
+        });
       }
-      const removedUris = new Set(extraVideos.map((v) => v.uri));
-      setVideos((prev) => prev.filter((v) => !removedUris.has(v.uri)));
-      setDuplicateModalOpen(false);
-      setDuplicateGroups([]);
+      await loadLibrary();
     } catch (e) {
-      alert('Error deleting duplicate copies: ' + e);
+      setPermissionNotice(null);
+      setPurgeResultText(`Deleted 0 of ${targetUris.length}`);
+      setRoboticNotice({
+        title: 'PURGE ERROR',
+        message: 'Error deleting duplicate copies: ' + (e instanceof Error ? e.message : String(e)),
+        isError: true,
+      });
     } finally {
       setIsDeletingDuplicates(false);
+      setPermissionNotice(null);
     }
   };
 
@@ -234,13 +307,21 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
     if (!trimmedTitle) return;
 
     setIsRenaming(true);
+    setPermissionNotice('Android will ask your permission to rename this file');
     try {
       const res = await VideoDownloader.renameVideo({
         uri: renameModalVideo.uri,
         newTitle: trimmedTitle,
         newPlatform: newPlatform || 'Other',
       });
-      if (res && res.success) {
+      setPermissionNotice(null);
+      if (res && res.cancelled) {
+        setRoboticNotice({
+          title: 'RENAME CANCELLED',
+          message: 'Permission was not granted to rename this video file.',
+          isError: true,
+        });
+      } else if (res && res.success) {
         setVideos((prev) =>
           prev.map((v) =>
             v.uri === renameModalVideo.uri
@@ -248,12 +329,19 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
               : v
           )
         );
+        await loadLibrary();
       }
       setRenameModalVideo(null);
     } catch (e) {
-      alert('Failed to rename video: ' + e);
+      setPermissionNotice(null);
+      setRoboticNotice({
+        title: 'RENAME ERROR',
+        message: 'Failed to rename video: ' + (e instanceof Error ? e.message : String(e)),
+        isError: true,
+      });
     } finally {
       setIsRenaming(false);
+      setPermissionNotice(null);
     }
   };
 
@@ -726,9 +814,13 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
                 <button
                   onClick={handleDeleteDuplicates}
                   disabled={isDeletingDuplicates}
-                  className="machine-btn-danger px-4 py-1.5 rounded-lg font-mono text-xs font-bold uppercase"
+                  className="machine-btn-danger px-4 py-1.5 rounded-lg font-mono text-xs font-bold uppercase transition-all"
                 >
-                  {isDeletingDuplicates ? 'PURGING...' : `PURGE ${totalExtraDuplicates} COPIES`}
+                  {isDeletingDuplicates
+                    ? 'PURGING...'
+                    : purgeResultText
+                    ? purgeResultText
+                    : `PURGE ${totalExtraDuplicates} COPIES`}
                 </button>
               </div>
             )}
@@ -803,6 +895,47 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Styled Dark Robotic Modal for System Messages & Errors (never window.alert) */}
+      {roboticNotice && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="machine-surface w-full max-w-sm rounded-xl p-5 space-y-4 shadow-2xl border border-cyan-500/30">
+            <div className="flex items-center gap-2.5">
+              <span
+                className={`inline-block w-2.5 h-2.5 rounded-full ${
+                  roboticNotice.isError
+                    ? 'bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.6)]'
+                    : 'bg-cyan-400 shadow-[0_0_8px_rgba(0,240,255,0.6)]'
+                }`}
+              />
+              <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider flex-1">
+                {roboticNotice.title}
+              </h3>
+            </div>
+            <p className="font-mono text-xs text-slate-300 leading-relaxed bg-slate-950/60 p-3 rounded-lg border border-slate-800">
+              {roboticNotice.message}
+            </p>
+            <div className="flex justify-end pt-1">
+              <button
+                onClick={() => setRoboticNotice(null)}
+                className="machine-btn-primary px-4 py-1.5 rounded-lg font-mono text-xs font-bold uppercase"
+              >
+                ACKNOWLEDGE
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Styled Permission Notice Banner */}
+      {permissionNotice && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[70] px-4 py-2.5 rounded-xl bg-slate-950/95 border border-cyan-500/60 shadow-[0_0_20px_rgba(0,240,255,0.25)] flex items-center gap-2.5 animate-in slide-in-from-top duration-200">
+          <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
+          <span className="font-mono text-xs text-cyan-300 font-bold uppercase tracking-wider">
+            {permissionNotice}
+          </span>
         </div>
       )}
     </div>
