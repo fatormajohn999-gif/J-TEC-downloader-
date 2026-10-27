@@ -1272,7 +1272,7 @@ class FloatingBubbleService : Service() {
                     try {
                         val playerIntent = Intent(this@FloatingBubbleService, VideoPlayerActivity::class.java).apply {
                             this.action = Intent.ACTION_VIEW
-                            this.data = Uri.parse(fileUri)
+                            this.setData(Uri.parse(fileUri))
                             this.putExtra("video_title", title)
                             this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
                         }
@@ -1676,7 +1676,7 @@ class FloatingBubbleService : Service() {
                     try {
                         val intent = Intent(this@FloatingBubbleService, VideoPlayerActivity::class.java).apply {
                             this.action = Intent.ACTION_VIEW
-                            this.data = Uri.parse(fileUri)
+                            this.setData(Uri.parse(fileUri))
                             this.putExtra("video_title", title)
                             this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
                         }
@@ -2376,7 +2376,7 @@ class FloatingBubbleService : Service() {
             try {
                 val playerIntent = Intent(this, VideoPlayerActivity::class.java).apply {
                     this.action = Intent.ACTION_VIEW
-                    this.data = Uri.parse(uriStr)
+                    this.setData(Uri.parse(uriStr))
                     this.putExtra("video_title", "OmniDrop Video")
                     this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }

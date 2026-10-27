@@ -431,6 +431,7 @@ class VideoDownloaderPlugin : Plugin() {
 
             activity.runOnUiThread {
                 try {
+                    val recSec = recoverableException
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                         val pendingIntent = MediaStore.createDeleteRequest(context.contentResolver, securityExceptionUris)
                         savedDeleteCall = call
@@ -444,12 +445,12 @@ class VideoDownloaderPlugin : Plugin() {
                             0,
                             0
                         )
-                    } else if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q && recoverableException != null) {
+                    } else if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q && recSec != null) {
                         savedDeleteCall = call
                         savedDeleteDirectCount = directDeleted
                         savedDeletePendingUris = securityExceptionUris.map { it.toString() }
                         activity.startIntentSenderForResult(
-                            recoverableException.userAction.actionIntent.intentSender,
+                            recSec.userAction.actionIntent.intentSender,
                             REQUEST_CODE_DELETE,
                             null,
                             0,
@@ -529,6 +530,7 @@ class VideoDownloaderPlugin : Plugin() {
     ) {
         activity.runOnUiThread {
             try {
+                val recSec = sec as? android.app.RecoverableSecurityException
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     val pendingIntent = MediaStore.createWriteRequest(context.contentResolver, listOf(uri))
                     savedRenameCall = call
@@ -543,13 +545,13 @@ class VideoDownloaderPlugin : Plugin() {
                         0,
                         0
                     )
-                } else if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q && sec is android.app.RecoverableSecurityException) {
+                } else if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q && recSec != null) {
                     savedRenameCall = call
                     savedRenameUri = uriStr
                     savedRenameNewTitle = newTitle
                     savedRenameNewPlatform = newPlatform
                     activity.startIntentSenderForResult(
-                        sec.userAction.actionIntent.intentSender,
+                        recSec.userAction.actionIntent.intentSender,
                         REQUEST_CODE_RENAME,
                         null,
                         0,
@@ -1802,7 +1804,7 @@ class VideoDownloaderPlugin : Plugin() {
     fun getAppVersion(call: PluginCall) {
         try {
             val pInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                context.packageManager.getPackageInfo(context.packageName, android.content.pm.PackageManager.PackageInfoFlags.of(0))
+                context.packageManager.getPackageInfo(context.packageName, android.content.pm.PackageManager.PackageInfoFlags.of(0L))
             } else {
                 @Suppress("DEPRECATION")
                 context.packageManager.getPackageInfo(context.packageName, 0)
@@ -1969,7 +1971,7 @@ class VideoDownloaderPlugin : Plugin() {
                 if (!canInstall) {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                         val manageIntent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
-                            this.data = Uri.parse("package:${context.packageName}")
+                            this.setData(Uri.parse("package:${context.packageName}"))
                             this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                         }
                         activity.startActivity(manageIntent)
