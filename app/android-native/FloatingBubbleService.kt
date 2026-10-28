@@ -86,10 +86,47 @@ class FloatingBubbleService : Service() {
         const val PREF_HISTORY_KEY = "native_download_history"
 
         @Volatile var isOmniDropInForeground: Boolean = false
+        @Volatile private var forceShowUntil: Long = 0L
 
         fun setOmniDropForeground(inForeground: Boolean) {
             isOmniDropInForeground = inForeground
             instance?.onAppForegroundChanged(inForeground)
+        }
+
+        fun ensureNotificationChannel(context: Context) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(
+                    CHANNEL_ID,
+                    "OmniDrop Edge Tab Service",
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    this.description = "Keeps the OmniDrop hardware edge download tool active"
+                    this.setShowBadge(false)
+                }
+                val updateChannel = NotificationChannel(
+                    UPDATE_CHANNEL_ID,
+                    "OmniDrop Updates",
+                    NotificationManager.IMPORTANCE_DEFAULT
+                ).apply {
+                    this.description = "Notifications for new OmniDrop app and firmware updates"
+                }
+                val manager = context.getSystemService(NotificationManager::class.java)
+                manager?.createNotificationChannel(channel)
+                manager?.createNotificationChannel(updateChannel)
+            }
+        }
+
+        fun testTabNow(durationMs: Long = 5000L) {
+            forceShowUntil = System.currentTimeMillis() + durationMs
+            instance?.let { s ->
+                s.mainHandler.post {
+                    s.updateForegroundVisibility()
+                    s.resetIdleFade()
+                }
+                s.mainHandler.postDelayed({
+                    s.updateForegroundVisibility()
+                }, durationMs + 100L)
+            }
         }
 
         val SUPPORTED_DOMAINS = arrayOf(
@@ -257,12 +294,21 @@ class FloatingBubbleService : Service() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        isOmniDropInForeground = false
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
         loadSavedSettings()
-        createNotificationChannel()
-        startForeground(1001, buildServiceNotification())
+        ensureNotificationChannel(this)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(1001, buildServiceNotification(), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(1001, buildServiceNotification())
+            }
+        } catch (_: Exception) {
+            startForeground(1001, buildServiceNotification())
+        }
 
         val filter = IntentFilter().apply {
             this.addAction(Intent.ACTION_SCREEN_ON)
@@ -337,7 +383,8 @@ class FloatingBubbleService : Service() {
     }
 
     fun updateForegroundVisibility() {
-        if (hideInsideAppEnabled && isOmniDropInForeground) {
+        val forceShow = System.currentTimeMillis() < forceShowUntil
+        if (hideInsideAppEnabled && isOmniDropInForeground && !forceShow) {
             if (isPanelOpen) {
                 closePanel()
             }
@@ -367,26 +414,7 @@ class FloatingBubbleService : Service() {
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "OmniDrop Edge Tab Service",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                this.description = "Keeps the OmniDrop hardware edge download tool active"
-                this.setShowBadge(false)
-            }
-            val updateChannel = NotificationChannel(
-                UPDATE_CHANNEL_ID,
-                "OmniDrop Updates",
-                NotificationManager.IMPORTANCE_DEFAULT
-            ).apply {
-                this.description = "Notifications for new OmniDrop app and firmware updates"
-            }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.createNotificationChannel(channel)
-            manager?.createNotificationChannel(updateChannel)
-        }
+        ensureNotificationChannel(this)
     }
 
     private fun buildServiceNotification(): Notification {

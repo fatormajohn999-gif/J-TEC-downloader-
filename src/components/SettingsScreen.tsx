@@ -63,6 +63,8 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   const [floatingVibrate, setFloatingVibrate] = useState(settings.floatingVibrate ?? true);
   const [floatingHideInsideApp, setFloatingHideInsideApp] = useState(settings.floatingHideInsideApp ?? true);
   const [hasOverlayPerm, setHasOverlayPerm] = useState<boolean>(false);
+  const [tabServiceStatus, setTabServiceStatus] = useState<'RUNNING' | 'STOPPED' | 'NO PERMISSION'>('STOPPED');
+  const [isTestingTab, setIsTestingTab] = useState<boolean>(false);
 
   // Update firmware state
   const [installedVersion, setInstalledVersion] = useState<{ versionName: string; versionCode: number }>({
@@ -110,14 +112,26 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   const [isClearingCache, setIsClearingCache] = useState(false);
   const [cacheClearMsg, setCacheClearMsg] = useState<string | null>(null);
 
-  // Check overlay permission
-  const checkOverlayPermission = async () => {
+  // Check overlay permission & tab service running status
+  const refreshTabServiceStatus = async () => {
     try {
-      const res = await VideoDownloader.hasOverlayPermission();
-      setHasOverlayPerm(res.granted);
+      const perm = await VideoDownloader.hasOverlayPermission();
+      setHasOverlayPerm(perm.granted);
+      if (!perm.granted) {
+        setTabServiceStatus('NO PERMISSION');
+        return;
+      }
+      const runningRes = await VideoDownloader.isBubbleRunning();
+      const isRunning = !!runningRes.running;
+      setIsBubbleActive(isRunning);
+      setTabServiceStatus(isRunning ? 'RUNNING' : 'STOPPED');
     } catch {
-      setHasOverlayPerm(false);
+      setTabServiceStatus('STOPPED');
     }
+  };
+
+  const checkOverlayPermission = async () => {
+    await refreshTabServiceStatus();
   };
 
   // Check storage size
@@ -307,6 +321,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         const perm = await VideoDownloader.hasOverlayPermission();
         if (!perm.granted) {
           await VideoDownloader.requestOverlayPermission();
+          setTabServiceStatus('NO PERMISSION');
           setModalState({
             isOpen: true,
             title: 'SYSTEM OVERLAY ACCESS',
@@ -316,21 +331,89 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
           });
           return;
         }
-        await VideoDownloader.startBubble();
-        setIsBubbleActive(true);
+
+        try {
+          const res = await VideoDownloader.startBubble();
+          if (res.status === 'no_permission') {
+            setTabServiceStatus('NO PERMISSION');
+            setModalState({
+              isOpen: true,
+              title: 'SYSTEM OVERLAY ACCESS',
+              message: 'Please grant "Display over other apps" permission in system settings, then toggle again.',
+              actionLabel: 'OK',
+              onAction: () => setModalState((prev) => ({ ...prev, isOpen: false })),
+            });
+            return;
+          }
+          setIsBubbleActive(true);
+          setTabServiceStatus('RUNNING');
+          const updated = {
+            ...settings,
+            floatingBubbleEnabled: true,
+          };
+          onUpdateSettings(updated);
+
+          setModalState({
+            isOpen: true,
+            title: 'FLOATING TAB ACTIVE',
+            message: 'Floating tab is ON. It appears when you leave OmniDrop.',
+            actionLabel: 'GOT IT',
+            onAction: () => setModalState((prev) => ({ ...prev, isOpen: false })),
+          });
+        } catch (err: any) {
+          setModalState({
+            isOpen: true,
+            title: 'SERVICE ERROR',
+            message: `Could not start floating edge tab: ${err?.message || 'Unknown error'}`,
+            isError: true,
+            actionLabel: 'DISMISS',
+            onAction: () => setModalState((prev) => ({ ...prev, isOpen: false })),
+          });
+        }
       } else {
         await VideoDownloader.stopBubble();
         setIsBubbleActive(false);
+        setTabServiceStatus('STOPPED');
+        const updated = {
+          ...settings,
+          floatingBubbleEnabled: false,
+        };
+        onUpdateSettings(updated);
       }
-    } catch {
-      setIsBubbleActive(!isBubbleActive);
+    } catch (e: any) {
+      setModalState({
+        isOpen: true,
+        title: 'TOGGLE FAILED',
+        message: e?.message || 'Unable to update floating tab state.',
+        isError: true,
+        actionLabel: 'DISMISS',
+        onAction: () => setModalState((prev) => ({ ...prev, isOpen: false })),
+      });
+    }
+  };
+
+  const handleTestTabNow = async () => {
+    try {
+      setIsTestingTab(true);
+      await VideoDownloader.testBubbleNow();
+      setTimeout(() => setIsTestingTab(false), 5000);
+    } catch (err: any) {
+      setIsTestingTab(false);
+      setModalState({
+        isOpen: true,
+        title: 'TEST FAILED',
+        message: `Could not test floating tab: ${err?.message || 'Is tab service running?'}`,
+        isError: true,
+        actionLabel: 'DISMISS',
+        onAction: () => setModalState((prev) => ({ ...prev, isOpen: false })),
+      });
     }
   };
 
   const handleGrantOverlay = async () => {
     try {
       await VideoDownloader.requestOverlayPermission();
-      setTimeout(checkOverlayPermission, 1500);
+      setTimeout(refreshTabServiceStatus, 1500);
     } catch {}
   };
 
@@ -811,30 +894,54 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             () => setFloatingHideInsideApp(!floatingHideInsideApp)
           )}
 
-          {/* Overlay Permission Status Bar */}
+          {/* Service Status LED & Test Tab Key */}
           <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-between">
             <div className="min-w-0 pr-2">
-              <div className="font-mono text-xs text-white uppercase font-bold flex items-center gap-1.5">
+              <div className="font-mono text-xs text-white uppercase font-bold flex items-center gap-2">
                 <span
-                  className={`w-2 h-2 rounded-full ${
-                    hasOverlayPerm ? 'led-emerald' : 'led-amber'
+                  className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                    tabServiceStatus === 'RUNNING'
+                      ? 'led-emerald'
+                      : tabServiceStatus === 'NO PERMISSION'
+                      ? 'led-amber'
+                      : 'bg-slate-700'
                   }`}
                 />
-                <span>SYSTEM OVERLAY STATUS</span>
+                <span>TAB SERVICE: {tabServiceStatus}</span>
               </div>
               <div className="text-[11px] text-slate-400 mt-0.5">
-                {hasOverlayPerm ? 'Granted • Ready for drawer service' : 'Required for edge tab display'}
+                {tabServiceStatus === 'RUNNING'
+                  ? 'Edge tab active • Appears when leaving OmniDrop'
+                  : tabServiceStatus === 'NO PERMISSION'
+                  ? 'Display over other apps permission required'
+                  : 'Tab service stopped • Toggle ON above to start'}
               </div>
             </div>
 
-            {!hasOverlayPerm && (
-              <button
-                onClick={handleGrantOverlay}
-                className="machine-btn px-2.5 py-1 rounded text-[11px] font-mono text-cyan-300 font-bold shrink-0"
-              >
-                GRANT ACCESS
-              </button>
-            )}
+            <div className="flex items-center gap-2 shrink-0">
+              {tabServiceStatus === 'NO PERMISSION' ? (
+                <button
+                  onClick={handleGrantOverlay}
+                  className="machine-btn px-2.5 py-1 rounded text-[11px] font-mono text-cyan-300 font-bold"
+                >
+                  GRANT ACCESS
+                </button>
+              ) : (
+                <button
+                  onClick={handleTestTabNow}
+                  disabled={isTestingTab || tabServiceStatus !== 'RUNNING'}
+                  className={`machine-btn px-3 py-1.5 rounded-lg text-xs font-mono font-bold transition-all duration-200 ${
+                    isTestingTab
+                      ? 'machine-btn-primary bg-cyan-500 border-cyan-400 text-slate-950 shadow-[0_0_12px_rgba(0,240,255,0.8)]'
+                      : tabServiceStatus === 'RUNNING'
+                      ? 'text-cyan-300 border-cyan-500/40 hover:border-cyan-400'
+                      : 'text-slate-600 border-slate-800 cursor-not-allowed opacity-50'
+                  }`}
+                >
+                  {isTestingTab ? 'TESTING (5s)...' : 'TEST TAB NOW'}
+                </button>
+              )}
+            </div>
           </div>
         </div>
       </div>

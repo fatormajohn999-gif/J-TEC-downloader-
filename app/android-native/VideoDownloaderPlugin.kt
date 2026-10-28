@@ -316,6 +316,16 @@ class VideoDownloaderPlugin : Plugin() {
         FloatingBubbleService.setOmniDropForeground(false)
     }
 
+    override fun handleOnStop() {
+        super.handleOnStop()
+        FloatingBubbleService.setOmniDropForeground(false)
+    }
+
+    override fun handleOnDestroy() {
+        super.handleOnDestroy()
+        FloatingBubbleService.setOmniDropForeground(false)
+    }
+
     override fun handleOnActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.handleOnActivityResult(requestCode, resultCode, data)
         if (requestCode == REQUEST_CODE_DELETE) {
@@ -759,19 +769,54 @@ class VideoDownloaderPlugin : Plugin() {
     fun startBubble(call: PluginCall) {
         val ctx = context
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(ctx)) {
-            call.reject("Overlay permission not granted. Please request permission first.")
+            val intent = Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:" + ctx.packageName)
+            ).apply {
+                this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            activity.startActivity(intent)
+            val res = JSObject().apply {
+                this.put("status", "no_permission")
+                this.put("needPermission", true)
+            }
+            call.resolve(res)
             return
         }
 
-        val serviceIntent = Intent(ctx, FloatingBubbleService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            ctx.startForegroundService(serviceIntent)
-        } else {
-            ctx.startService(serviceIntent)
-        }
+        try {
+            FloatingBubbleService.ensureNotificationChannel(ctx)
+            val serviceIntent = Intent(ctx, FloatingBubbleService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                ctx.startForegroundService(serviceIntent)
+            } else {
+                ctx.startService(serviceIntent)
+            }
 
+            val res = JSObject().apply {
+                this.put("status", "running")
+                this.put("needPermission", false)
+            }
+            call.resolve(res)
+        } catch (e: Exception) {
+            call.reject("Failed to start Edge Tab service: ${e.message ?: "Unknown error"}")
+        }
+    }
+
+    @PluginMethod
+    fun isBubbleRunning(call: PluginCall) {
+        val isRunning = FloatingBubbleService.instance != null
         val res = JSObject().apply {
-            this.put("status", "running")
+            this.put("running", isRunning)
+        }
+        call.resolve(res)
+    }
+
+    @PluginMethod
+    fun testBubbleNow(call: PluginCall) {
+        FloatingBubbleService.testTabNow(5000L)
+        val res = JSObject().apply {
+            this.put("success", true)
         }
         call.resolve(res)
     }

@@ -24,8 +24,10 @@ export interface VideoDownloaderPlugin {
     initialIndex?: number;
   }): Promise<{ started: boolean }>;
   shareVideo(options: { uri: string; title?: string }): Promise<{ shared: boolean }>;
-  startBubble(): Promise<{ status: string }>;
+  startBubble(): Promise<{ status: string; needPermission?: boolean }>;
   stopBubble(): Promise<{ status: string }>;
+  isBubbleRunning(): Promise<{ running: boolean }>;
+  testBubbleNow(): Promise<{ success: boolean }>;
   showPersistentNotification(options?: { title?: string; message?: string }): Promise<void>;
   dismissPersistentNotification(): Promise<void>;
   showDownloadNotification(options: { title: string; message: string; filePath?: string }): Promise<void>;
@@ -141,6 +143,12 @@ const VideoDownloaderWeb: VideoDownloaderPlugin = {
   },
   async stopBubble() {
     return { status: 'stopped' };
+  },
+  async isBubbleRunning() {
+    return { running: false };
+  },
+  async testBubbleNow() {
+    return { success: true };
   },
   async showPersistentNotification() {
     // Web persistent notifications not supported without web worker push

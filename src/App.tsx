@@ -113,7 +113,22 @@ export default function App() {
           setHasUpdateWaiting(true);
         }
       })
-      .catch(() => {});
+    // Auto-start floating tab service on app open if toggle is ON, permission granted, and not running
+    if (settings.floatingBubbleEnabled) {
+      VideoDownloader.hasOverlayPermission()
+        .then((perm) => {
+          if (perm.granted) {
+            VideoDownloader.isBubbleRunning()
+              .then((runningRes) => {
+                if (!runningRes.running) {
+                  VideoDownloader.startBubble().catch(() => {});
+                }
+              })
+              .catch(() => {});
+          }
+        })
+        .catch(() => {});
+    }
   }, []);
 
   // Listen to native openSettingsTab event (from notification click)

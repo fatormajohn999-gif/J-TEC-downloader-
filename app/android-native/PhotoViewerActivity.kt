@@ -755,6 +755,11 @@ class PhotoViewerActivity : Activity() {
         FloatingBubbleService.setOmniDropForeground(false)
     }
 
+    override fun onStop() {
+        super.onStop()
+        FloatingBubbleService.setOmniDropForeground(false)
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         FloatingBubbleService.setOmniDropForeground(false)

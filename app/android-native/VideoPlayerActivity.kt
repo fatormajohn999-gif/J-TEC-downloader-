@@ -142,9 +142,11 @@ class VideoPlayerActivity : Activity() {
     private var initialVolume: Int = 0
 
     private val hideGestureHudRunnable = Runnable {
-        gestureHudCard.animate().alpha(0f).setDuration(250).withEndAction {
-            gestureHudCard.visibility = View.GONE
-        }.start()
+        try {
+            gestureHudCard.animate().alpha(0f).setDuration(250).withEndAction {
+                try { gestureHudCard.visibility = View.GONE } catch (_: Throwable) {}
+            }.start()
+        } catch (_: Throwable) {}
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -159,38 +161,48 @@ class VideoPlayerActivity : Activity() {
     // Repeat modes: "off", "one", "all"
     private var currentRepeatMode = "off"
     private var autoPlayNext = true
+    private var consecutiveLoadFailures = 0
 
     private var currentVideoUri: Uri? = null
     private var currentVideoTitle: String = "OmniDrop Video"
     private lateinit var gestureDetector: GestureDetector
 
     private val hideControlsRunnable = Runnable {
-        hideControls()
+        try { hideControls() } catch (_: Throwable) {}
     }
 
     private val hideTitleFlashRunnable = Runnable {
-        titleFlashBannerView.animate().alpha(0f).setDuration(300).withEndAction {
-            titleFlashBannerView.visibility = View.GONE
-        }.start()
+        try {
+            titleFlashBannerView.animate().alpha(0f).setDuration(300).withEndAction {
+                try { titleFlashBannerView.visibility = View.GONE } catch (_: Throwable) {}
+            }.start()
+        } catch (_: Throwable) {}
     }
 
     private val hideSwipeHintRunnable = Runnable {
-        dismissSwipeHint()
+        try { dismissSwipeHint() } catch (_: Throwable) {}
     }
 
     private val updateProgressRunnable = object : Runnable {
         override fun run() {
-            if (!isUserTrackingSeek && videoView.isPlaying) {
-                val current = videoView.currentPosition
-                val total = videoView.duration
-                if (total > 0) {
-                    seekBar.max = total
-                    seekBar.progress = current
-                    currentTimeTextView.text = formatTime(current)
-                    totalTimeTextView.text = formatTime(total)
+            try {
+                if (isFinishing || isDestroyed) return
+                if (!isUserTrackingSeek && videoView.isPlaying) {
+                    val current = videoView.currentPosition
+                    val total = videoView.duration
+                    if (total > 0) {
+                        seekBar.max = total
+                        seekBar.progress = current
+                        currentTimeTextView.text = formatTime(current)
+                        totalTimeTextView.text = formatTime(total)
+                    }
                 }
-            }
-            mainHandler.postDelayed(this, 300)
+            } catch (_: Throwable) {}
+            try {
+                if (!isFinishing && !isDestroyed) {
+                    mainHandler.postDelayed(this, 300)
+                }
+            } catch (_: Throwable) {}
         }
     }
 
@@ -1381,119 +1393,223 @@ class VideoPlayerActivity : Activity() {
     }
 
     private fun loadVideoAtCurrentIndex(animate: Boolean = false, slideLeft: Boolean = true) {
-        if (playlist.isEmpty()) {
-            finish()
-            return
+        try {
+            if (isFinishing || isDestroyed) return
+            if (playlist.isEmpty()) {
+                finish()
+                return
+            }
+
+            // Guard index within valid bounds
+            currentIndex = currentIndex.coerceIn(0, playlist.size - 1)
+
+            // 1. Before switching videos call stopPlayback() and reset state
+            try {
+                saveCurrentPlaybackPosition()
+            } catch (t: Throwable) {
+                recordCrash(this, t)
+            }
+
+            try {
+                videoView.stopPlayback()
+            } catch (t: Throwable) {
+                recordCrash(this, t)
+            }
+
+            // Reset progress and seekbar state
+            try {
+                mainHandler.removeCallbacks(updateProgressRunnable)
+                seekBar.progress = 0
+                currentTimeTextView.text = "00:00"
+            } catch (_: Throwable) {}
+
+            val item = playlist[currentIndex]
+            currentVideoUri = try { Uri.parse(item.uri) } catch (_: Throwable) { null }
+            currentVideoTitle = item.title
+
+            titleTextView.text = currentVideoTitle
+            playlistCounterTextView.text = "${currentIndex + 1}/${playlist.size}"
+
+            flashTitleBanner("${currentIndex + 1} / ${playlist.size} - $currentVideoTitle")
+
+            if (animate) {
+                val width = rootContainer.width.toFloat().coerceAtLeast(600f)
+                val exitTranslation = if (slideLeft) -width else width
+                val enterTranslation = if (slideLeft) width else -width
+
+                videoContentContainer.animate()
+                    .translationX(exitTranslation)
+                    .alpha(0.3f)
+                    .setDuration(160)
+                    .withEndAction {
+                        try {
+                            if (!isFinishing && !isDestroyed) {
+                                prepareAndStartVideo(item)
+                                videoContentContainer.translationX = enterTranslation
+                                videoContentContainer.animate()
+                                    .translationX(0f)
+                                    .alpha(1f)
+                                    .setDuration(220)
+                                    .start()
+                            }
+                        } catch (t: Throwable) {
+                            recordCrash(this, t)
+                            handleLoadFailure(t)
+                        }
+                    }
+                    .start()
+            } else {
+                prepareAndStartVideo(item)
+            }
+        } catch (t: Throwable) {
+            recordCrash(this, t)
+            handleLoadFailure(t)
         }
-
-        saveCurrentPlaybackPosition()
-
-        val item = playlist[currentIndex]
-        currentVideoUri = Uri.parse(item.uri)
-        currentVideoTitle = item.title
-
-        titleTextView.text = currentVideoTitle
-        playlistCounterTextView.text = "${currentIndex + 1}/${playlist.size}"
-
-        if (animate) {
-            val width = rootContainer.width.toFloat().coerceAtLeast(600f)
-            val exitTranslation = if (slideLeft) -width else width
-            val enterTranslation = if (slideLeft) width else -width
-
-            videoContentContainer.animate()
-                .translationX(exitTranslation)
-                .alpha(0.3f)
-                .setDuration(160)
-                .withEndAction {
-                    prepareAndStartVideo(item)
-                    videoContentContainer.translationX = enterTranslation
-                    videoContentContainer.animate()
-                        .translationX(0f)
-                        .alpha(1f)
-                        .setDuration(220)
-                        .start()
-                }
-                .start()
-        } else {
-            prepareAndStartVideo(item)
-        }
-
-        flashTitleBanner("${currentIndex + 1} / ${playlist.size} - $currentVideoTitle")
     }
 
     private fun prepareAndStartVideo(item: PlaylistItem) {
-        errorOverlay.visibility = View.GONE
+        try {
+            if (isFinishing || isDestroyed) return
+            errorOverlay.visibility = View.GONE
 
-        // Show thumbnail placeholder while video loads
-        loadThumbnailIntoPlaceholder(item.uri)
+            // Reset video view safely
+            try {
+                videoView.stopPlayback()
+            } catch (_: Throwable) {}
 
-        videoView.stopPlayback()
-        videoView.setVideoURI(Uri.parse(item.uri))
+            // Show thumbnail placeholder while video loads (optional, catches all exceptions)
+            loadThumbnailIntoPlaceholder(item.uri)
 
-        videoView.setOnPreparedListener { mp ->
-            mediaPlayer = mp
-            applyPlaybackSpeed()
-            applyVideoSizing()
+            val parsedUri = Uri.parse(item.uri)
+            videoView.setVideoURI(parsedUri)
 
-            val duration = videoView.duration
-            if (duration > 0) {
-                seekBar.max = duration
-                totalTimeTextView.text = formatTime(duration)
+            videoView.setOnPreparedListener { mp ->
+                try {
+                    if (isFinishing || isDestroyed) return@setOnPreparedListener
+                    consecutiveLoadFailures = 0
+                    mediaPlayer = mp
+                    applyPlaybackSpeed()
+                    applyVideoSizing()
+
+                    val duration = try { videoView.duration } catch (_: Throwable) { 0 }
+                    if (duration > 0) {
+                        seekBar.max = duration
+                        totalTimeTextView.text = formatTime(duration)
+                    }
+
+                    // Auto orientation from video aspect ratio if not manually locked
+                    val width = try { mp.videoWidth } catch (_: Throwable) { 0 }
+                    val height = try { mp.videoHeight } catch (_: Throwable) { 0 }
+                    if (width > 0 && height > 0 && !isOrientationLockedByUser) {
+                        if (width > height) {
+                            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                        } else {
+                            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                        }
+                    }
+
+                    // Restore saved playback position
+                    val uriStr = item.uri
+                    if (uriStr.isNotBlank()) {
+                        val prefs = getSharedPreferences(PREFS_PLAYBACK, Context.MODE_PRIVATE)
+                        val savedPos = prefs.getInt(uriStr, 0)
+                        if (savedPos > 1000 && duration > 0 && savedPos < duration - 3000) {
+                            try { videoView.seekTo(savedPos) } catch (_: Throwable) {}
+                        }
+                    }
+
+                    try {
+                        videoView.start()
+                        playPauseButton.text = "❚❚"
+                    } catch (_: Throwable) {}
+
+                    // Hide thumbnail placeholder once playback starts
+                    try {
+                        thumbnailImageView.animate().alpha(0f).setDuration(250).withEndAction {
+                            thumbnailImageView.visibility = View.GONE
+                        }.start()
+                    } catch (_: Throwable) {}
+
+                    mainHandler.removeCallbacks(updateProgressRunnable)
+                    mainHandler.post(updateProgressRunnable)
+                } catch (t: Throwable) {
+                    recordCrash(this, t)
+                    handleLoadFailure(t)
+                }
             }
 
-            // Auto orientation from video aspect ratio if not manually locked
-            val width = mp.videoWidth
-            val height = mp.videoHeight
-            if (width > 0 && height > 0 && !isOrientationLockedByUser) {
-                if (width > height) {
-                    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            videoView.setOnCompletionListener {
+                try {
+                    handleVideoCompletion()
+                } catch (t: Throwable) {
+                    recordCrash(this, t)
+                }
+            }
+
+            videoView.setOnErrorListener { _, what, extra ->
+                recordCrash(this, RuntimeException("VideoView error what=$what extra=$extra on uri=${item.uri}"))
+                handleLoadFailure()
+                true
+            }
+        } catch (t: Throwable) {
+            recordCrash(this, t)
+            handleLoadFailure(t)
+        }
+    }
+
+    private fun handleLoadFailure(t: Throwable? = null) {
+        if (t != null) {
+            recordCrash(this, t)
+        }
+        mainHandler.post {
+            try {
+                if (isFinishing || isDestroyed) return@post
+                consecutiveLoadFailures++
+                if (consecutiveLoadFailures <= 3 && playlist.size > 1) {
+                    mainHandler.postDelayed({
+                        try {
+                            if (!isFinishing && !isDestroyed) {
+                                playNextVideo(userInitiated = false)
+                            }
+                        } catch (e: Throwable) {
+                            recordCrash(this, e)
+                            showErrorScreen()
+                        }
+                    }, 400L)
                 } else {
-                    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    consecutiveLoadFailures = 0
+                    showErrorScreen()
                 }
+            } catch (e: Throwable) {
+                recordCrash(this, e)
             }
+        }
+    }
 
-            // Restore saved playback position
-            val uriStr = item.uri
-            if (uriStr.isNotBlank()) {
-                val prefs = getSharedPreferences(PREFS_PLAYBACK, Context.MODE_PRIVATE)
-                val savedPos = prefs.getInt(uriStr, 0)
-                if (savedPos > 1000 && duration > 0 && savedPos < duration - 3000) {
-                    videoView.seekTo(savedPos)
-                }
-            }
-
-            videoView.start()
-            playPauseButton.text = "❚❚"
-
-            // Hide thumbnail placeholder once playback starts
-            thumbnailImageView.animate().alpha(0f).setDuration(250).withEndAction {
+    private fun showErrorScreen() {
+        mainHandler.post {
+            try {
+                if (isFinishing || isDestroyed) return@post
                 thumbnailImageView.visibility = View.GONE
-            }.start()
-
-            mainHandler.post(updateProgressRunnable)
-        }
-
-        videoView.setOnCompletionListener {
-            handleVideoCompletion()
-        }
-
-        videoView.setOnErrorListener { _, _, _ ->
-            showControls()
-            thumbnailImageView.visibility = View.GONE
-            errorOverlay.visibility = View.VISIBLE
-            true
+                errorOverlay.visibility = View.VISIBLE
+                showControls()
+            } catch (_: Throwable) {}
         }
     }
 
     private fun loadThumbnailIntoPlaceholder(uriStr: String?) {
         if (uriStr.isNullOrBlank()) {
-            thumbnailImageView.setImageDrawable(null)
-            thumbnailImageView.visibility = View.GONE
+            try {
+                thumbnailImageView.setImageDrawable(null)
+                thumbnailImageView.visibility = View.GONE
+            } catch (_: Throwable) {}
             return
         }
 
-        thumbnailImageView.alpha = 1f
-        thumbnailImageView.visibility = View.VISIBLE
+        try {
+            thumbnailImageView.alpha = 1f
+            thumbnailImageView.visibility = View.VISIBLE
+        } catch (_: Throwable) {}
 
         Thread {
             try {
@@ -1501,86 +1617,108 @@ class VideoPlayerActivity : Activity() {
                     val uri = Uri.parse(uriStr)
                     val bm = contentResolver.loadThumbnail(uri, android.util.Size(512, 512), null)
                     mainHandler.post {
-                        thumbnailImageView.setImageBitmap(bm)
+                        try {
+                            if (!isFinishing && !isDestroyed) {
+                                thumbnailImageView.setImageBitmap(bm)
+                            }
+                        } catch (_: Throwable) {}
                     }
                 } else {
                     mainHandler.post {
-                        thumbnailImageView.setImageDrawable(null)
+                        try {
+                            thumbnailImageView.setImageDrawable(null)
+                        } catch (_: Throwable) {}
                     }
                 }
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
                 mainHandler.post {
-                    thumbnailImageView.setImageDrawable(null)
+                    try {
+                        thumbnailImageView.setImageDrawable(null)
+                    } catch (_: Throwable) {}
                 }
             }
         }.start()
     }
 
     private fun handleVideoCompletion() {
-        // Clear saved position as video reached completion
-        currentVideoUri?.toString()?.let { uriStr ->
-            if (uriStr.isNotBlank()) {
-                getSharedPreferences(PREFS_PLAYBACK, Context.MODE_PRIVATE)
-                    .edit()
-                    .apply {
-                        this.remove(uriStr)
-                        this.apply()
-                    }
+        try {
+            // Clear saved position as video reached completion
+            currentVideoUri?.toString()?.let { uriStr ->
+                if (uriStr.isNotBlank()) {
+                    getSharedPreferences(PREFS_PLAYBACK, Context.MODE_PRIVATE)
+                        .edit()
+                        .apply {
+                            this.remove(uriStr)
+                            this.apply()
+                        }
+                }
             }
-        }
 
-        when (currentRepeatMode) {
-            "one" -> {
-                // Repeat single clip
-                videoView.seekTo(0)
-                videoView.start()
-                playPauseButton.text = "❚❚"
-            }
-            "all" -> {
-                if (currentIndex < playlist.size - 1) {
-                    playNextVideo(userInitiated = false)
-                } else {
-                    // Loop back to first video in playlist
-                    currentIndex = 0
-                    loadVideoAtCurrentIndex(animate = true, slideLeft = true)
+            when (currentRepeatMode) {
+                "one" -> {
+                    // Repeat single clip
+                    videoView.seekTo(0)
+                    videoView.start()
+                    playPauseButton.text = "❚❚"
+                }
+                "all" -> {
+                    if (currentIndex < playlist.size - 1) {
+                        playNextVideo(userInitiated = false)
+                    } else {
+                        // Loop back to first video in playlist
+                        currentIndex = 0
+                        loadVideoAtCurrentIndex(animate = true, slideLeft = true)
+                    }
+                }
+                else -> {
+                    // Repeat Mode OFF: check autoPlayNext
+                    if (autoPlayNext && currentIndex < playlist.size - 1) {
+                        playNextVideo(userInitiated = false)
+                    } else {
+                        // Stop and show replay button
+                        playPauseButton.text = "▶"
+                        showControls()
+                    }
                 }
             }
-            else -> {
-                // Repeat Mode OFF: check autoPlayNext
-                if (autoPlayNext && currentIndex < playlist.size - 1) {
-                    playNextVideo(userInitiated = false)
-                } else {
-                    // Stop and show replay button
-                    playPauseButton.text = "▶"
-                    showControls()
-                }
-            }
+        } catch (t: Throwable) {
+            recordCrash(this, t)
         }
     }
 
     private fun playNextVideo(userInitiated: Boolean) {
-        if (playlist.isEmpty()) return
-        if (currentIndex < playlist.size - 1) {
-            currentIndex++
-            loadVideoAtCurrentIndex(animate = true, slideLeft = true)
-        } else if (userInitiated || currentRepeatMode == "all") {
-            currentIndex = 0
-            loadVideoAtCurrentIndex(animate = true, slideLeft = true)
-        } else {
-            // Reached end of playlist without repeat
-            showControls()
-            flashTitleBanner("END OF PLAYLIST")
+        try {
+            if (playlist.isEmpty()) return
+            if (currentIndex < playlist.size - 1) {
+                currentIndex++
+                loadVideoAtCurrentIndex(animate = true, slideLeft = true)
+            } else if (userInitiated || currentRepeatMode == "all") {
+                currentIndex = 0
+                loadVideoAtCurrentIndex(animate = true, slideLeft = true)
+            } else {
+                // Reached end of playlist without repeat
+                showControls()
+                flashTitleBanner("END OF PLAYLIST")
+            }
+        } catch (t: Throwable) {
+            recordCrash(this, t)
+            handleLoadFailure(t)
         }
     }
 
     private fun playPreviousVideo(userInitiated: Boolean) {
-        if (playlist.isEmpty()) return
-        if (currentIndex > 0) {
-            currentIndex--
-            loadVideoAtCurrentIndex(animate = true, slideLeft = false)
-        } else if (userInitiated) {
-            currentIndex = playlist.size - 1
-            loadVideoAtCurrentIndex(animate = true, slideLeft = false)
+        try {
+            if (playlist.isEmpty()) return
+            if (currentIndex > 0) {
+                currentIndex--
+                loadVideoAtCurrentIndex(animate = true, slideLeft = false)
+            } else if (userInitiated) {
+                currentIndex = playlist.size - 1
+                loadVideoAtCurrentIndex(animate = true, slideLeft = false)
+            }
+        } catch (t: Throwable) {
+            recordCrash(this, t)
+            handleLoadFailure(t)
         }
     }
 
@@ -1709,20 +1847,22 @@ class VideoPlayerActivity : Activity() {
     }
 
     private fun saveCurrentPlaybackPosition() {
-        val uriStr = currentVideoUri?.toString() ?: ""
-        if (uriStr.isNotBlank()) {
-            val current = videoView.currentPosition
-            val total = videoView.duration
-            val prefs = getSharedPreferences(PREFS_PLAYBACK, Context.MODE_PRIVATE)
-            prefs.edit().apply {
-                if (total > 0 && current < total - 2000 && current > 1000) {
-                    this.putInt(uriStr, current)
-                } else if (current >= total - 2000) {
-                    this.remove(uriStr)
+        try {
+            val uriStr = currentVideoUri?.toString() ?: ""
+            if (uriStr.isNotBlank()) {
+                val current = try { videoView.currentPosition } catch (_: Throwable) { 0 }
+                val total = try { videoView.duration } catch (_: Throwable) { 0 }
+                val prefs = getSharedPreferences(PREFS_PLAYBACK, Context.MODE_PRIVATE)
+                prefs.edit().apply {
+                    if (total > 0 && current < total - 2000 && current > 1000) {
+                        this.putInt(uriStr, current)
+                    } else if (current >= total - 2000) {
+                        this.remove(uriStr)
+                    }
+                    this.apply()
                 }
-                this.apply()
             }
-        }
+        } catch (_: Throwable) {}
     }
 
     private fun createMechanicalButtonBackground(isAmber: Boolean): LayerDrawable {
@@ -1759,6 +1899,11 @@ class VideoPlayerActivity : Activity() {
         mainHandler.removeCallbacks(updateProgressRunnable)
         mainHandler.removeCallbacks(hideControlsRunnable)
         mainHandler.removeCallbacks(hideTitleFlashRunnable)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        FloatingBubbleService.setOmniDropForeground(false)
     }
 
     override fun onResume() {
