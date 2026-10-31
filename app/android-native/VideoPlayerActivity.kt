@@ -163,6 +163,11 @@ class VideoPlayerActivity : Activity() {
     private var autoPlayNext = true
     private var consecutiveLoadFailures = 0
 
+    // Safe playback and video sizing state
+    @Volatile private var playerReady = false
+    private var videoW = 0
+    private var videoH = 0
+
     private var currentVideoUri: Uri? = null
     private var currentVideoTitle: String = "OmniDrop Video"
     private lateinit var gestureDetector: GestureDetector
@@ -186,10 +191,11 @@ class VideoPlayerActivity : Activity() {
     private val updateProgressRunnable = object : Runnable {
         override fun run() {
             try {
-                if (isFinishing || isDestroyed) return
-                if (!isUserTrackingSeek && videoView.isPlaying) {
-                    val current = videoView.currentPosition
-                    val total = videoView.duration
+                if (isFinishing || isDestroyed || !playerReady) return
+                val isPlaying = try { videoView.isPlaying } catch (_: Throwable) { false }
+                if (!isUserTrackingSeek && isPlaying) {
+                    val current = try { videoView.currentPosition } catch (_: Throwable) { 0 }
+                    val total = try { videoView.duration } catch (_: Throwable) { 0 }
                     if (total > 0) {
                         seekBar.max = total
                         seekBar.progress = current
@@ -197,7 +203,9 @@ class VideoPlayerActivity : Activity() {
                         totalTimeTextView.text = formatTime(total)
                     }
                 }
-            } catch (_: Throwable) {}
+            } catch (t: Throwable) {
+                recordCrash(this@VideoPlayerActivity, t)
+            }
             try {
                 if (!isFinishing && !isDestroyed) {
                     mainHandler.postDelayed(this, 300)
@@ -277,41 +285,51 @@ class VideoPlayerActivity : Activity() {
     }
 
     private fun applyVideoSizing() {
-        val mp = mediaPlayer ?: return
-        val vw = mp.videoWidth
-        val vh = mp.videoHeight
-        if (vw <= 0 || vh <= 0) return
+        try {
+            if (isFinishing || isDestroyed || !playerReady) return
+            val vw = videoW
+            val vh = videoH
+            if (vw <= 0 || vh <= 0) return
 
-        val cw = rootContainer.width
-        val ch = rootContainer.height
-        if (cw <= 0 || ch <= 0) return
-
-        if (!sessionFillMode) {
-            val lp = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            ).apply {
-                this.gravity = Gravity.CENTER
-            }
-            videoView.layoutParams = lp
-        } else {
-            val videoAspect = vw.toFloat() / vh.toFloat()
-            val containerAspect = cw.toFloat() / ch.toFloat()
+            val cw = rootContainer.width
+            val ch = rootContainer.height
+            if (cw <= 0 || ch <= 0) return
 
             val targetWidth: Int
             val targetHeight: Int
-            if (videoAspect > containerAspect) {
-                targetHeight = ch
-                targetWidth = (ch * videoAspect).toInt()
+
+            if (!sessionFillMode) {
+                targetWidth = FrameLayout.LayoutParams.MATCH_PARENT
+                targetHeight = FrameLayout.LayoutParams.MATCH_PARENT
             } else {
-                targetWidth = cw
-                targetHeight = (cw / videoAspect).toInt()
+                val videoAspect = vw.toFloat() / vh.toFloat()
+                val containerAspect = cw.toFloat() / ch.toFloat()
+
+                if (videoAspect > containerAspect) {
+                    targetHeight = ch
+                    targetWidth = (ch * videoAspect).toInt()
+                } else {
+                    targetWidth = cw
+                    targetHeight = (cw / videoAspect).toInt()
+                }
             }
 
-            val lp = FrameLayout.LayoutParams(targetWidth, targetHeight).apply {
-                this.gravity = Gravity.CENTER
+            val curLp = videoView.layoutParams as? FrameLayout.LayoutParams
+            if (curLp == null || curLp.width != targetWidth || curLp.height != targetHeight) {
+                videoView.post {
+                    try {
+                        if (isFinishing || isDestroyed || !playerReady) return@post
+                        val lp = FrameLayout.LayoutParams(targetWidth, targetHeight).apply {
+                            this.gravity = Gravity.CENTER
+                        }
+                        videoView.layoutParams = lp
+                    } catch (t: Throwable) {
+                        recordCrash(this, t)
+                    }
+                }
             }
-            videoView.layoutParams = lp
+        } catch (t: Throwable) {
+            recordCrash(this, t)
         }
     }
 
@@ -319,8 +337,15 @@ class VideoPlayerActivity : Activity() {
         rootContainer = FrameLayout(this).apply {
             this.setBackgroundColor(Color.BLACK)
         }
-        rootContainer.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
-            applyVideoSizing()
+        rootContainer.addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+            try {
+                if (!playerReady) return@addOnLayoutChangeListener
+                if (left != oldLeft || top != oldTop || right != oldRight || bottom != oldBottom) {
+                    applyVideoSizing()
+                }
+            } catch (t: Throwable) {
+                recordCrash(this, t)
+            }
         }
 
         // 1. Video Container (VideoView + Thumbnail placeholder for smooth slide animations)
@@ -717,16 +742,19 @@ class VideoPlayerActivity : Activity() {
             }
 
             override fun onDoubleTap(e: MotionEvent): Boolean {
+                if (!playerReady) return true
                 val screenWidth = rootContainer.width
+                val current = try { videoView.currentPosition } catch (_: Throwable) { 0 }
+                val total = try { videoView.duration } catch (_: Throwable) { 0 }
                 if (e.x < screenWidth / 2) {
                     // Double tap left: skip back 10s
-                    val target = (videoView.currentPosition - 10000).coerceAtLeast(0)
-                    videoView.seekTo(target)
+                    val target = (current - 10000).coerceAtLeast(0)
+                    try { videoView.seekTo(target) } catch (_: Throwable) {}
                     flashRippleIndicator(leftRippleView)
                 } else {
                     // Double tap right: skip forward 10s
-                    val target = (videoView.currentPosition + 10000).coerceAtMost(videoView.duration)
-                    videoView.seekTo(target)
+                    val target = if (total > 0) (current + 10000).coerceAtMost(total) else current + 10000
+                    try { videoView.seekTo(target) } catch (_: Throwable) {}
                     flashRippleIndicator(rightRippleView)
                 }
                 resetAutoHideTimer()
@@ -1070,6 +1098,7 @@ class VideoPlayerActivity : Activity() {
             this.thumbOffset = dp(9)
             this.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (!playerReady) return
                     if (fromUser) {
                         val formatted = formatTime(progress)
                         currentTimeTextView.text = formatted
@@ -1078,6 +1107,7 @@ class VideoPlayerActivity : Activity() {
                 }
 
                 override fun onStartTrackingTouch(sb: SeekBar?) {
+                    if (!playerReady) return
                     isUserTrackingSeek = true
                     seekTooltipTextView.visibility = View.VISIBLE
                     resetAutoHideTimer()
@@ -1086,8 +1116,9 @@ class VideoPlayerActivity : Activity() {
                 override fun onStopTrackingTouch(sb: SeekBar?) {
                     isUserTrackingSeek = false
                     seekTooltipTextView.visibility = View.INVISIBLE
+                    if (!playerReady) return
                     sb?.let {
-                        videoView.seekTo(it.progress)
+                        try { videoView.seekTo(it.progress) } catch (_: Throwable) {}
                     }
                     resetAutoHideTimer()
                 }
@@ -1154,8 +1185,10 @@ class VideoPlayerActivity : Activity() {
             this.layoutParams = lp
             this.setOnClickListener {
                 resetAutoHideTimer()
-                val target = (videoView.currentPosition - 10000).coerceAtLeast(0)
-                videoView.seekTo(target)
+                if (!playerReady) return@setOnClickListener
+                val current = try { videoView.currentPosition } catch (_: Throwable) { 0 }
+                val target = (current - 10000).coerceAtLeast(0)
+                try { videoView.seekTo(target) } catch (_: Throwable) {}
                 flashRippleIndicator(leftRippleView)
             }
         }
@@ -1177,6 +1210,7 @@ class VideoPlayerActivity : Activity() {
             this.layoutParams = lp
             this.setOnClickListener {
                 resetAutoHideTimer()
+                if (!playerReady) return@setOnClickListener
                 togglePlayback()
             }
         }
@@ -1198,8 +1232,11 @@ class VideoPlayerActivity : Activity() {
             this.layoutParams = lp
             this.setOnClickListener {
                 resetAutoHideTimer()
-                val target = (videoView.currentPosition + 10000).coerceAtMost(videoView.duration)
-                videoView.seekTo(target)
+                if (!playerReady) return@setOnClickListener
+                val current = try { videoView.currentPosition } catch (_: Throwable) { 0 }
+                val total = try { videoView.duration } catch (_: Throwable) { 0 }
+                val target = if (total > 0) (current + 10000).coerceAtMost(total) else current + 10000
+                try { videoView.seekTo(target) } catch (_: Throwable) {}
                 flashRippleIndicator(rightRippleView)
             }
         }
@@ -1403,6 +1440,11 @@ class VideoPlayerActivity : Activity() {
             // Guard index within valid bounds
             currentIndex = currentIndex.coerceIn(0, playlist.size - 1)
 
+            // Reset video sizing, ready state and previous playback
+            playerReady = false
+            videoW = 0
+            videoH = 0
+
             // 1. Before switching videos call stopPlayback() and reset state
             try {
                 saveCurrentPlaybackPosition()
@@ -1472,6 +1514,10 @@ class VideoPlayerActivity : Activity() {
             if (isFinishing || isDestroyed) return
             errorOverlay.visibility = View.GONE
 
+            playerReady = false
+            videoW = 0
+            videoH = 0
+
             // Reset video view safely
             try {
                 videoView.stopPlayback()
@@ -1488,6 +1534,25 @@ class VideoPlayerActivity : Activity() {
                     if (isFinishing || isDestroyed) return@setOnPreparedListener
                     consecutiveLoadFailures = 0
                     mediaPlayer = mp
+
+                    val w = try { mp.videoWidth } catch (_: Throwable) { 0 }
+                    val h = try { mp.videoHeight } catch (_: Throwable) { 0 }
+                    videoW = w
+                    videoH = h
+                    playerReady = true
+
+                    mp.setOnVideoSizeChangedListener { _, newW, newH ->
+                        try {
+                            if (newW > 0 && newH > 0) {
+                                videoW = newW
+                                videoH = newH
+                                applyVideoSizing()
+                            }
+                        } catch (t: Throwable) {
+                            recordCrash(this@VideoPlayerActivity, t)
+                        }
+                    }
+
                     applyPlaybackSpeed()
                     applyVideoSizing()
 
@@ -1498,10 +1563,8 @@ class VideoPlayerActivity : Activity() {
                     }
 
                     // Auto orientation from video aspect ratio if not manually locked
-                    val width = try { mp.videoWidth } catch (_: Throwable) { 0 }
-                    val height = try { mp.videoHeight } catch (_: Throwable) { 0 }
-                    if (width > 0 && height > 0 && !isOrientationLockedByUser) {
-                        if (width > height) {
+                    if (videoW > 0 && videoH > 0 && !isOrientationLockedByUser) {
+                        if (videoW > videoH) {
                             requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                         } else {
                             requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
@@ -1533,6 +1596,7 @@ class VideoPlayerActivity : Activity() {
                     mainHandler.removeCallbacks(updateProgressRunnable)
                     mainHandler.post(updateProgressRunnable)
                 } catch (t: Throwable) {
+                    playerReady = false
                     recordCrash(this, t)
                     handleLoadFailure(t)
                 }
@@ -1547,6 +1611,7 @@ class VideoPlayerActivity : Activity() {
             }
 
             videoView.setOnErrorListener { _, what, extra ->
+                playerReady = false
                 recordCrash(this, RuntimeException("VideoView error what=$what extra=$extra on uri=${item.uri}"))
                 handleLoadFailure()
                 true
@@ -1657,9 +1722,11 @@ class VideoPlayerActivity : Activity() {
             when (currentRepeatMode) {
                 "one" -> {
                     // Repeat single clip
-                    videoView.seekTo(0)
-                    videoView.start()
-                    playPauseButton.text = "❚❚"
+                    if (playerReady) {
+                        try { videoView.seekTo(0) } catch (_: Throwable) {}
+                        try { videoView.start() } catch (_: Throwable) {}
+                        playPauseButton.text = "❚❚"
+                    }
                 }
                 "all" -> {
                     if (currentIndex < playlist.size - 1) {
@@ -1723,18 +1790,20 @@ class VideoPlayerActivity : Activity() {
     }
 
     private fun togglePlayback() {
-        if (videoView.isPlaying) {
-            videoView.pause()
+        if (!playerReady) return
+        val isPlaying = try { videoView.isPlaying } catch (_: Throwable) { false }
+        if (isPlaying) {
+            try { videoView.pause() } catch (_: Throwable) {}
             playPauseButton.text = "▶"
             flashCenterIcon("▶")
         } else {
             // If near completion, restart
-            val total = videoView.duration
-            val current = videoView.currentPosition
+            val total = try { videoView.duration } catch (_: Throwable) { 0 }
+            val current = try { videoView.currentPosition } catch (_: Throwable) { 0 }
             if (total > 0 && current >= total - 500) {
-                videoView.seekTo(0)
+                try { videoView.seekTo(0) } catch (_: Throwable) {}
             }
-            videoView.start()
+            try { videoView.start() } catch (_: Throwable) {}
             playPauseButton.text = "❚❚"
             flashCenterIcon("❚❚")
             scheduleControlsAutoHide()
@@ -1791,7 +1860,8 @@ class VideoPlayerActivity : Activity() {
     }
 
     private fun hideControls() {
-        if (!videoView.isPlaying) return
+        val isPlaying = try { playerReady && videoView.isPlaying } catch (_: Throwable) { false }
+        if (!isPlaying) return
         isControlsVisible = false
         hudOverlay.visibility = View.GONE
         hideSystemUI()
@@ -1848,6 +1918,7 @@ class VideoPlayerActivity : Activity() {
 
     private fun saveCurrentPlaybackPosition() {
         try {
+            if (!playerReady) return
             val uriStr = currentVideoUri?.toString() ?: ""
             if (uriStr.isNotBlank()) {
                 val current = try { videoView.currentPosition } catch (_: Throwable) { 0 }
@@ -1892,8 +1963,9 @@ class VideoPlayerActivity : Activity() {
         super.onPause()
         FloatingBubbleService.setOmniDropForeground(false)
         saveCurrentPlaybackPosition()
-        if (videoView.isPlaying) {
-            videoView.pause()
+        val isPlaying = try { playerReady && videoView.isPlaying } catch (_: Throwable) { false }
+        if (isPlaying) {
+            try { videoView.pause() } catch (_: Throwable) {}
             playPauseButton.text = "▶"
         }
         mainHandler.removeCallbacks(updateProgressRunnable)
@@ -1926,9 +1998,12 @@ class VideoPlayerActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        playerReady = false
+        videoW = 0
+        videoH = 0
         FloatingBubbleService.setOmniDropForeground(false)
         saveCurrentPlaybackPosition()
         mainHandler.removeCallbacksAndMessages(null)
-        videoView.stopPlayback()
+        try { videoView.stopPlayback() } catch (_: Throwable) {}
     }
 }
