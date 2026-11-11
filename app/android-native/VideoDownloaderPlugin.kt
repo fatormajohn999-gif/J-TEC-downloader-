@@ -44,6 +44,12 @@ class VideoDownloaderPlugin : Plugin() {
         const val PREFS_METADATA_NAME = "omnidrop_video_metadata"
         const val PREF_METADATA_MAP = "video_metadata_map"
 
+        const val PREF_FAILED_LINKS_KEY = "native_failed_links"
+        const val PREF_FAVORITES_KEY = "native_favorites_set"
+        const val PREF_COLLECTIONS_KEY = "native_collections_list"
+        const val PREF_STATS_RECORDS_KEY = "native_download_stats_records"
+        const val PREF_STATS_SUMMARY_KEY = "native_download_stats_summary"
+
         const val REQUEST_CODE_DELETE = 7101
         const val REQUEST_CODE_RENAME = 7102
 
@@ -248,6 +254,408 @@ class VideoDownloaderPlugin : Plugin() {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             return prefs.getString(PREF_HISTORY_KEY, "[]") ?: "[]"
         }
+
+        // ==================== FAILED LINKS ====================
+        fun recordFailedLink(context: Context, url: String, platform: String, title: String, reason: String) {
+            try {
+                val norm = normalizeUrl(url)
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val jsonStr = prefs.getString(PREF_FAILED_LINKS_KEY, "[]") ?: "[]"
+                val existing = JSONArray(jsonStr)
+                var attempts = 1
+                var existingId = "fail_" + System.currentTimeMillis()
+                var existingTitle = title
+                val list = mutableListOf<JSONObject>()
+
+                for (i in 0 until existing.length()) {
+                    val item = existing.getJSONObject(i)
+                    val itemNorm = normalizeUrl(item.optString("url", ""))
+                    if (itemNorm == norm) {
+                        attempts = item.optInt("attempts", 1) + 1
+                        existingId = item.optString("id", existingId)
+                        if (existingTitle.isBlank() || existingTitle == "video") {
+                            existingTitle = item.optString("title", existingTitle)
+                        }
+                    } else {
+                        list.add(item)
+                    }
+                }
+
+                val newEntry = JSONObject().apply {
+                    this.put("id", existingId)
+                    this.put("url", norm)
+                    this.put("platform", if (platform.isNotBlank()) platform else detectPlatformName(norm))
+                    this.put("title", if (existingTitle.isNotBlank()) existingTitle else "Stream")
+                    this.put("reason", if (reason.isNotBlank()) reason else "Download failed")
+                    this.put("failedAt", System.currentTimeMillis())
+                    this.put("attempts", attempts)
+                }
+
+                val newArray = JSONArray()
+                newArray.put(newEntry)
+                for (item in list) {
+                    if (newArray.length() >= 100) break
+                    newArray.put(item)
+                }
+
+                prefs.edit().apply {
+                    this.putString(PREF_FAILED_LINKS_KEY, newArray.toString())
+                    this.apply()
+                }
+                instance?.notifyListeners("onFailedLinksChanged", JSObject(), true)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+
+        fun removeFailedLinkByUrl(context: Context, url: String) {
+            try {
+                val norm = normalizeUrl(url)
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val jsonStr = prefs.getString(PREF_FAILED_LINKS_KEY, "[]") ?: "[]"
+                val existing = JSONArray(jsonStr)
+                val newArray = JSONArray()
+                var changed = false
+                for (i in 0 until existing.length()) {
+                    val item = existing.getJSONObject(i)
+                    if (normalizeUrl(item.optString("url", "")) == norm) {
+                        changed = true
+                    } else {
+                        newArray.put(item)
+                    }
+                }
+                if (changed) {
+                    prefs.edit().apply {
+                        this.putString(PREF_FAILED_LINKS_KEY, newArray.toString())
+                        this.apply()
+                    }
+                    instance?.notifyListeners("onFailedLinksChanged", JSObject(), true)
+                }
+            } catch (_: Exception) {}
+        }
+
+        fun removeFailedLinkById(context: Context, id: String): Boolean {
+            try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val jsonStr = prefs.getString(PREF_FAILED_LINKS_KEY, "[]") ?: "[]"
+                val existing = JSONArray(jsonStr)
+                val newArray = JSONArray()
+                var changed = false
+                for (i in 0 until existing.length()) {
+                    val item = existing.getJSONObject(i)
+                    if (item.optString("id") == id) {
+                        changed = true
+                    } else {
+                        newArray.put(item)
+                    }
+                }
+                if (changed) {
+                    prefs.edit().apply {
+                        this.putString(PREF_FAILED_LINKS_KEY, newArray.toString())
+                        this.apply()
+                    }
+                    instance?.notifyListeners("onFailedLinksChanged", JSObject(), true)
+                }
+                return changed
+            } catch (_: Exception) {
+                return false
+            }
+        }
+
+        fun clearFailedLinks(context: Context) {
+            try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                prefs.edit().apply {
+                    this.putString(PREF_FAILED_LINKS_KEY, "[]")
+                    this.apply()
+                }
+                instance?.notifyListeners("onFailedLinksChanged", JSObject(), true)
+            } catch (_: Exception) {}
+        }
+
+        fun getFailedLinksArray(context: Context): JSONArray {
+            return try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                JSONArray(prefs.getString(PREF_FAILED_LINKS_KEY, "[]") ?: "[]")
+            } catch (_: Exception) {
+                JSONArray()
+            }
+        }
+
+        // ==================== FAVORITES & COLLECTIONS ====================
+        fun isFavorite(context: Context, mediaKey: String): Boolean {
+            if (mediaKey.isBlank()) return false
+            return try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val set = prefs.getStringSet(PREF_FAVORITES_KEY, emptySet()) ?: emptySet()
+                set.contains(mediaKey)
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        fun toggleFavorite(context: Context, mediaKey: String): Boolean {
+            if (mediaKey.isBlank()) return false
+            return try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val set = HashSet(prefs.getStringSet(PREF_FAVORITES_KEY, emptySet()) ?: emptySet())
+                val newState = if (set.contains(mediaKey)) {
+                    set.remove(mediaKey)
+                    false
+                } else {
+                    set.add(mediaKey)
+                    true
+                }
+                prefs.edit().apply {
+                    this.putStringSet(PREF_FAVORITES_KEY, set)
+                    this.apply()
+                }
+                instance?.notifyListeners("onFavoritesChanged", JSObject().apply {
+                    this.put("mediaKey", mediaKey)
+                    this.put("isFavorite", newState)
+                }, true)
+                newState
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        fun getFavoritesArray(context: Context): JSONArray {
+            val arr = JSONArray()
+            try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val set = prefs.getStringSet(PREF_FAVORITES_KEY, emptySet()) ?: emptySet()
+                for (k in set) {
+                    arr.put(k)
+                }
+            } catch (_: Exception) {}
+            return arr
+        }
+
+        fun getCollectionsArray(context: Context): JSONArray {
+            return try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                JSONArray(prefs.getString(PREF_COLLECTIONS_KEY, "[]") ?: "[]")
+            } catch (_: Exception) {
+                JSONArray()
+            }
+        }
+
+        fun saveCollectionsArray(context: Context, arr: JSONArray) {
+            try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                prefs.edit().apply {
+                    this.putString(PREF_COLLECTIONS_KEY, arr.toString())
+                    this.apply()
+                }
+                instance?.notifyListeners("onCollectionsChanged", JSObject(), true)
+            } catch (_: Exception) {}
+        }
+
+        fun cleanUpDeletedMediaKeys(context: Context, deletedKeys: Set<String>) {
+            if (deletedKeys.isEmpty()) return
+            try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val favSet = HashSet(prefs.getStringSet(PREF_FAVORITES_KEY, emptySet()) ?: emptySet())
+                var favChanged = false
+                for (k in deletedKeys) {
+                    if (favSet.remove(k)) favChanged = true
+                }
+                if (favChanged) {
+                    prefs.edit().apply {
+                        this.putStringSet(PREF_FAVORITES_KEY, favSet)
+                        this.apply()
+                    }
+                }
+
+                val collections = getCollectionsArray(context)
+                var colChanged = false
+                val newCols = JSONArray()
+                for (i in 0 until collections.length()) {
+                    val col = collections.getJSONObject(i)
+                    val vKeys = col.optJSONArray("videoKeys") ?: JSONArray()
+                    val newVKeys = JSONArray()
+                    for (j in 0 until vKeys.length()) {
+                        val k = vKeys.getString(j)
+                        if (deletedKeys.contains(k)) {
+                            colChanged = true
+                        } else {
+                            newVKeys.put(k)
+                        }
+                    }
+                    col.put("videoKeys", newVKeys)
+                    newCols.put(col)
+                }
+                if (colChanged) {
+                    saveCollectionsArray(context, newCols)
+                }
+            } catch (_: Exception) {}
+        }
+
+        fun cleanUpDeletedMediaUris(context: Context, uris: List<String>) {
+            if (uris.isEmpty()) return
+            try {
+                val keysToRemove = mutableSetOf<String>()
+                val resolver = context.contentResolver
+                for (uStr in uris) {
+                    try {
+                        val uri = Uri.parse(uStr)
+                        resolver.query(uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.SIZE), null, null, null)?.use { cursor ->
+                            if (cursor.moveToFirst()) {
+                                val nIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
+                                val sIdx = cursor.getColumnIndex(MediaStore.MediaColumns.SIZE)
+                                val name = if (nIdx >= 0) cursor.getString(nIdx) ?: "" else ""
+                                val size = if (sIdx >= 0) cursor.getLong(sIdx) else 0L
+                                if (name.isNotBlank()) {
+                                    keysToRemove.add("${name}_$size")
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {}
+                }
+                cleanUpDeletedMediaKeys(context, keysToRemove)
+            } catch (_: Exception) {}
+        }
+
+        // ==================== STATS ====================
+        fun recordDownloadStat(context: Context, platform: String, type: String, bytes: Long) {
+            try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+                val todayStr = sdf.format(Date())
+
+                val summaryStr = prefs.getString(PREF_STATS_SUMMARY_KEY, "{}") ?: "{}"
+                val summary = JSONObject(summaryStr)
+                val totalDl = summary.optLong("totalDownloads", 0L) + 1L
+                val totalBytes = summary.optLong("totalBytes", 0L) + bytes.coerceAtLeast(0L)
+                val vCount = summary.optLong("videoCount", 0L) + (if (type == "video" || type == "audio") 1L else 0L)
+                val pCount = summary.optLong("photoCount", 0L) + (if (type == "photo") 1L else 0L)
+                val fCount = summary.optLong("failedCount", 0L)
+
+                val platObj = summary.optJSONObject("platforms") ?: JSONObject()
+                val cleanPlat = cleanPlatformName(platform, "").ifBlank { "Other" }
+                platObj.put(cleanPlat, platObj.optLong(cleanPlat, 0L) + 1L)
+
+                summary.put("totalDownloads", totalDl)
+                summary.put("totalBytes", totalBytes)
+                summary.put("videoCount", vCount)
+                summary.put("photoCount", pCount)
+                summary.put("failedCount", fCount)
+                summary.put("platforms", platObj)
+
+                val recordsStr = prefs.getString(PREF_STATS_RECORDS_KEY, "[]") ?: "[]"
+                val recordsArr = JSONArray(recordsStr)
+                val newEntry = JSONObject().apply {
+                    this.put("date", todayStr)
+                    this.put("platform", cleanPlat)
+                    this.put("type", type)
+                    this.put("bytes", bytes)
+                    this.put("ts", System.currentTimeMillis())
+                }
+                val newArr = JSONArray()
+                newArr.put(newEntry)
+                for (i in 0 until recordsArr.length()) {
+                    if (newArr.length() >= 500) break
+                    newArr.put(recordsArr.getJSONObject(i))
+                }
+
+                prefs.edit().apply {
+                    this.putString(PREF_STATS_SUMMARY_KEY, summary.toString())
+                    this.putString(PREF_STATS_RECORDS_KEY, newArr.toString())
+                    this.apply()
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+
+        fun recordFailedStat(context: Context) {
+            try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val summaryStr = prefs.getString(PREF_STATS_SUMMARY_KEY, "{}") ?: "{}"
+                val summary = JSONObject(summaryStr)
+                val fCount = summary.optLong("failedCount", 0L) + 1L
+                summary.put("failedCount", fCount)
+                prefs.edit().apply {
+                    this.putString(PREF_STATS_SUMMARY_KEY, summary.toString())
+                    this.apply()
+                }
+            } catch (_: Exception) {}
+        }
+
+        fun getStatsJson(context: Context): JSONObject {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val summaryStr = prefs.getString(PREF_STATS_SUMMARY_KEY, "{}") ?: "{}"
+            val recordsStr = prefs.getString(PREF_STATS_RECORDS_KEY, "[]") ?: "[]"
+            val summary = try { JSONObject(summaryStr) } catch (_: Exception) { JSONObject() }
+            val records = try { JSONArray(recordsStr) } catch (_: Exception) { JSONArray() }
+
+            val ret = JSONObject()
+            val totalDl = summary.optLong("totalDownloads", 0L)
+            val totalBytes = summary.optLong("totalBytes", 0L)
+            val vCount = summary.optLong("videoCount", 0L)
+            val pCount = summary.optLong("photoCount", 0L)
+            val fCount = summary.optLong("failedCount", 0L)
+            val totalAttempts = totalDl + fCount
+            val successRate = if (totalAttempts > 0L) ((totalDl.toDouble() / totalAttempts.toDouble()) * 100.0) else 100.0
+
+            ret.put("totalDownloads", totalDl)
+            ret.put("totalBytes", totalBytes)
+            ret.put("videoCount", vCount)
+            ret.put("photoCount", pCount)
+            ret.put("failedCount", fCount)
+            ret.put("successRate", Math.round(successRate * 10.0) / 10.0)
+            ret.put("platformCounts", summary.optJSONObject("platforms") ?: JSONObject())
+
+            val dayDownloads = mutableMapOf<String, Long>()
+            val dayBytes = mutableMapOf<String, Long>()
+            for (i in 0 until records.length()) {
+                val r = records.getJSONObject(i)
+                val d = r.optString("date")
+                if (d.isNotBlank()) {
+                    dayDownloads[d] = (dayDownloads[d] ?: 0L) + 1L
+                    dayBytes[d] = (dayBytes[d] ?: 0L) + r.optLong("bytes", 0L)
+                }
+            }
+
+            var busiest = "None"
+            var maxDls = 0L
+            for ((d, count) in dayDownloads) {
+                if (count > maxDls) {
+                    maxDls = count
+                    busiest = d
+                }
+            }
+            ret.put("busiestDay", busiest)
+            ret.put("averageBytes", if (totalDl > 0L) (totalBytes / totalDl) else 0L)
+
+            val dailyArr = JSONArray()
+            val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+            for (offset in 13 downTo 0) {
+                val c = java.util.Calendar.getInstance()
+                c.add(java.util.Calendar.DAY_OF_YEAR, -offset)
+                val ds = sdf.format(c.time)
+                val dayObj = JSONObject().apply {
+                    this.put("date", ds)
+                    this.put("downloads", dayDownloads[ds] ?: 0L)
+                    this.put("bytes", dayBytes[ds] ?: 0L)
+                }
+                dailyArr.put(dayObj)
+            }
+            ret.put("dailyStats", dailyArr)
+            return ret
+        }
+
+        fun resetStats(context: Context) {
+            try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                prefs.edit().apply {
+                    this.putString(PREF_STATS_SUMMARY_KEY, "{}")
+                    this.putString(PREF_STATS_RECORDS_KEY, "[]")
+                    this.apply()
+                }
+            } catch (_: Exception) {}
+        }
     }
 
     override fun load() {
@@ -336,6 +744,7 @@ class VideoDownloaderPlugin : Plugin() {
                     for (u in savedDeletePendingUris) {
                         removeHistoryByUri(context, u)
                     }
+                    cleanUpDeletedMediaUris(context, savedDeletePendingUris)
                     val totalDeleted = savedDeleteDirectCount + savedDeletePendingUris.size
                     val ret = JSObject().apply {
                         this.put("deleted", totalDeleted)
@@ -429,6 +838,7 @@ class VideoDownloaderPlugin : Plugin() {
             }
 
             if (securityExceptionUris.isEmpty()) {
+                cleanUpDeletedMediaUris(context, uriStrings)
                 val ret = JSObject().apply {
                     this.put("deleted", directDeleted)
                     this.put("count", directDeleted)
@@ -869,8 +1279,8 @@ class VideoDownloaderPlugin : Plugin() {
     fun downloadAndSave(call: PluginCall) {
         val videoUrl = call.getString("url")
         val quality = call.getString("quality") ?: "best"
-        var rawTitle = call.getString("title") ?: "video"
-        var backendUrl = call.getString("backendUrl")
+        val rawTitle = call.getString("title") ?: "video"
+        val backendUrl = call.getString("backendUrl")
         val apiKey = call.getString("apiKey")
 
         if (videoUrl.isNullOrBlank()) {
@@ -891,7 +1301,18 @@ class VideoDownloaderPlugin : Plugin() {
             return
         }
 
-        backendUrl = backendUrl.trim().removeSuffix("/")
+        executeDownloadPipeline(normalizedUrl, quality, rawTitle, backendUrl, apiKey, call)
+    }
+
+    private fun executeDownloadPipeline(
+        normalizedUrl: String,
+        quality: String,
+        rawTitle: String,
+        rawBackendUrl: String,
+        apiKey: String?,
+        callToResolve: PluginCall? = null
+    ) {
+        val backendUrl = rawBackendUrl.trim().removeSuffix("/")
         val endpoint = if (backendUrl.startsWith("http://") || backendUrl.startsWith("https://")) {
             "$backendUrl/download"
         } else {
@@ -903,12 +1324,13 @@ class VideoDownloaderPlugin : Plugin() {
             var inputStream: InputStream? = null
             var outputStream: OutputStream? = null
             var targetUri: Uri? = null
+            var finalTitle = rawTitle
+            var cleanPlatform = "Other"
 
             try {
                 reportProgress(10, "Fetching video details...")
 
                 // Step 1: Pre-fetch video metadata via POST /info
-                var finalTitle = rawTitle
                 var thumbnail = ""
                 var uploader = "Creator"
                 var platform = ""
@@ -1125,6 +1547,8 @@ class VideoDownloaderPlugin : Plugin() {
                     }
                     saveHistoryEntry(context, entryObj)
                     emitNativeDownloadFinished(entryObj)
+                    removeFailedLinkByUrl(context, normalizedUrl)
+                    recordDownloadStat(context, "TikTok", "photo", (totalPhotos.toLong() * 800L * 1024L))
 
                     val res = JSObject().apply {
                         this.put("fileName", archiveFileName)
@@ -1132,7 +1556,7 @@ class VideoDownloaderPlugin : Plugin() {
                         this.put("type", "photo")
                         this.put("imageCount", totalPhotos)
                     }
-                    call.resolve(res)
+                    callToResolve?.resolve(res)
                     return@Thread
                 }
 
@@ -1166,13 +1590,13 @@ class VideoDownloaderPlugin : Plugin() {
 
                 targetUri = resolver.insert(collectionUri, contentValues)
                 if (targetUri == null) {
-                    call.reject("Failed to create MediaStore entry in phone gallery.")
+                    callToResolve?.reject("Failed to create MediaStore entry in phone gallery.")
                     return@Thread
                 }
 
                 outputStream = resolver.openOutputStream(targetUri)
                 if (outputStream == null) {
-                    call.reject("Failed to open output stream to phone gallery.")
+                    callToResolve?.reject("Failed to open output stream to phone gallery.")
                     return@Thread
                 }
 
@@ -1247,12 +1671,14 @@ class VideoDownloaderPlugin : Plugin() {
                 }
                 saveHistoryEntry(context, entryObj)
                 emitNativeDownloadFinished(entryObj)
+                removeFailedLinkByUrl(context, normalizedUrl)
+                recordDownloadStat(context, cleanPlatform, if (isAudio) "audio" else "video", bytesCopied)
 
                 val res = JSObject().apply {
                     this.put("fileName", fileName)
                     this.put("uri", targetUri.toString())
                 }
-                call.resolve(res)
+                callToResolve?.resolve(res)
 
             } catch (e: Exception) {
                 if (targetUri != null) {
@@ -1260,7 +1686,10 @@ class VideoDownloaderPlugin : Plugin() {
                         context.contentResolver.delete(targetUri, null, null)
                     } catch (_: Exception) {}
                 }
-                call.reject("Native download error: ${e.message ?: "Unknown error"}")
+                val rawErr = e.message ?: "Unknown error"
+                recordFailedLink(context, normalizedUrl, cleanPlatform, finalTitle, rawErr)
+                recordFailedStat(context)
+                callToResolve?.reject("Native download error: $rawErr")
             } finally {
                 inFlightDownloads.remove(normalizedUrl)
                 try { inputStream?.close() } catch (_: Exception) {}
@@ -1547,14 +1976,16 @@ class VideoDownloaderPlugin : Plugin() {
                         val u = obj.optString("uri", "")
                         val t = obj.optString("title", "Video ${i + 1}")
                         val p = obj.optString("platform", "Other")
+                        val fn = obj.optString("fileName", "")
+                        val sz = obj.optLong("size", 0L)
                         if (u.isNotBlank()) {
-                            list.add(VideoPlayerActivity.PlaylistItem(u, t, p))
+                            list.add(VideoPlayerActivity.PlaylistItem(u, t, p, if (fn.isNotBlank()) fn else null, sz))
                         }
                     }
                 }
             }
             if (list.isEmpty()) {
-                list.add(VideoPlayerActivity.PlaylistItem(uriStr, title, "Other"))
+                list.add(VideoPlayerActivity.PlaylistItem(uriStr, title, "Other", null, 0L))
             }
 
             // In-memory playlist holder to prevent TransactionTooLargeException
@@ -2038,6 +2469,358 @@ class VideoDownloaderPlugin : Plugin() {
             }
             call.resolve(ret)
         }
+    }
+
+    // ==================== FAILED LINKS PLUGIN METHODS ====================
+    @PluginMethod
+    fun getFailedLinks(call: PluginCall) {
+        val arr = getFailedLinksArray(context)
+        val ret = JSObject().apply {
+            val jsArr = JSArray()
+            for (i in 0 until arr.length()) {
+                val item = arr.getJSONObject(i)
+                val obj = JSObject().apply {
+                    this.put("id", item.optString("id"))
+                    this.put("url", item.optString("url"))
+                    this.put("platform", item.optString("platform"))
+                    this.put("title", item.optString("title"))
+                    this.put("reason", item.optString("reason"))
+                    this.put("failedAt", item.optLong("failedAt"))
+                    this.put("attempts", item.optInt("attempts", 1))
+                }
+                jsArr.put(obj)
+            }
+            this.put("failedLinks", jsArr)
+        }
+        call.resolve(ret)
+    }
+
+    @PluginMethod
+    fun removeFailedLink(call: PluginCall) {
+        val id = call.getString("id")
+        if (id.isNullOrBlank()) {
+            call.reject("Missing required parameter: id")
+            return
+        }
+        val removed = removeFailedLinkById(context, id)
+        val ret = JSObject().apply {
+            this.put("removed", removed)
+        }
+        call.resolve(ret)
+    }
+
+    @PluginMethod
+    fun clearFailedLinks(call: PluginCall) {
+        clearFailedLinks(context)
+        val ret = JSObject().apply {
+            this.put("cleared", true)
+        }
+        call.resolve(ret)
+    }
+
+    @PluginMethod
+    fun retryFailedLink(call: PluginCall) {
+        val id = call.getString("id")
+        if (id.isNullOrBlank()) {
+            call.reject("Missing required parameter: id")
+            return
+        }
+        val arr = getFailedLinksArray(context)
+        var targetUrl: String? = null
+        var targetTitle: String? = null
+        for (i in 0 until arr.length()) {
+            val item = arr.getJSONObject(i)
+            if (item.optString("id") == id) {
+                targetUrl = item.optString("url")
+                targetTitle = item.optString("title")
+                break
+            }
+        }
+        if (targetUrl.isNullOrBlank()) {
+            call.reject("Failed link not found: $id")
+            return
+        }
+
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val backendUrl = prefs.getString("backend_url", "") ?: ""
+        val apiKey = prefs.getString("api_key", "") ?: ""
+        val defaultQuality = prefs.getString("default_quality", "best") ?: "best"
+
+        if (backendUrl.isBlank()) {
+            call.reject("Please configure Render Backend URL in Settings before retrying.")
+            return
+        }
+
+        val normUrl = normalizeUrl(targetUrl)
+        if (inFlightDownloads.putIfAbsent(normUrl, true) != null) {
+            call.reject("Download already in progress for this link.")
+            return
+        }
+
+        executeDownloadPipeline(normUrl, defaultQuality, targetTitle ?: "video", backendUrl, apiKey, null)
+        val ret = JSObject().apply {
+            this.put("started", true)
+        }
+        call.resolve(ret)
+    }
+
+    // ==================== FAVORITES & COLLECTIONS PLUGIN METHODS ====================
+    @PluginMethod
+    fun getFavoritesAndCollections(call: PluginCall) {
+        val favs = getFavoritesArray(context)
+        val cols = getCollectionsArray(context)
+        val ret = JSObject().apply {
+            val favJsArr = JSArray()
+            for (i in 0 until favs.length()) {
+                favJsArr.put(favs.getString(i))
+            }
+            this.put("favorites", favJsArr)
+
+            val colsJsArr = JSArray()
+            for (i in 0 until cols.length()) {
+                val c = cols.getJSONObject(i)
+                val cObj = JSObject().apply {
+                    this.put("id", c.optString("id"))
+                    this.put("name", c.optString("name"))
+                    this.put("createdAt", c.optLong("createdAt"))
+                    val vkArr = JSArray()
+                    val vkJson = c.optJSONArray("videoKeys") ?: JSONArray()
+                    for (j in 0 until vkJson.length()) {
+                        vkArr.put(vkJson.getString(j))
+                    }
+                    this.put("videoKeys", vkArr)
+                }
+                colsJsArr.put(cObj)
+            }
+            this.put("collections", colsJsArr)
+        }
+        call.resolve(ret)
+    }
+
+    @PluginMethod
+    fun toggleFavorite(call: PluginCall) {
+        val mediaKey = call.getString("mediaKey")
+        if (mediaKey.isNullOrBlank()) {
+            call.reject("Missing required parameter: mediaKey")
+            return
+        }
+        val isFav = toggleFavorite(context, mediaKey)
+        val ret = JSObject().apply {
+            this.put("mediaKey", mediaKey)
+            this.put("isFavorite", isFav)
+        }
+        call.resolve(ret)
+    }
+
+    @PluginMethod
+    fun createCollection(call: PluginCall) {
+        val name = call.getString("name")?.trim()
+        if (name.isNullOrBlank()) {
+            call.reject("Missing required parameter: name")
+            return
+        }
+        val cols = getCollectionsArray(context)
+        val id = "col_" + System.currentTimeMillis()
+        val newCol = JSONObject().apply {
+            this.put("id", id)
+            this.put("name", name)
+            this.put("videoKeys", JSONArray())
+            this.put("createdAt", System.currentTimeMillis())
+        }
+        cols.put(newCol)
+        saveCollectionsArray(context, cols)
+
+        val ret = JSObject().apply {
+            val cObj = JSObject().apply {
+                this.put("id", id)
+                this.put("name", name)
+                this.put("videoKeys", JSArray())
+                this.put("createdAt", newCol.getLong("createdAt"))
+            }
+            this.put("collection", cObj)
+        }
+        call.resolve(ret)
+    }
+
+    @PluginMethod
+    fun renameCollection(call: PluginCall) {
+        val id = call.getString("id")
+        val name = call.getString("name")?.trim()
+        if (id.isNullOrBlank() || name.isNullOrBlank()) {
+            call.reject("Missing required parameters: id or name")
+            return
+        }
+        val cols = getCollectionsArray(context)
+        var renamed = false
+        for (i in 0 until cols.length()) {
+            val c = cols.getJSONObject(i)
+            if (c.optString("id") == id) {
+                c.put("name", name)
+                renamed = true
+                break
+            }
+        }
+        if (renamed) {
+            saveCollectionsArray(context, cols)
+        }
+        val ret = JSObject().apply {
+            this.put("renamed", renamed)
+        }
+        call.resolve(ret)
+    }
+
+    @PluginMethod
+    fun deleteCollection(call: PluginCall) {
+        val id = call.getString("id")
+        if (id.isNullOrBlank()) {
+            call.reject("Missing required parameter: id")
+            return
+        }
+        val cols = getCollectionsArray(context)
+        val newCols = JSONArray()
+        var deleted = false
+        for (i in 0 until cols.length()) {
+            val c = cols.getJSONObject(i)
+            if (c.optString("id") == id) {
+                deleted = true
+            } else {
+                newCols.put(c)
+            }
+        }
+        if (deleted) {
+            saveCollectionsArray(context, newCols)
+        }
+        val ret = JSObject().apply {
+            this.put("deleted", deleted)
+        }
+        call.resolve(ret)
+    }
+
+    @PluginMethod
+    fun addToCollection(call: PluginCall) {
+        val collectionId = call.getString("collectionId")
+        val mediaKeys = call.getArray("mediaKeys")
+        if (collectionId.isNullOrBlank() || mediaKeys == null) {
+            call.reject("Missing required parameters: collectionId or mediaKeys")
+            return
+        }
+        val cols = getCollectionsArray(context)
+        var changed = false
+        for (i in 0 until cols.length()) {
+            val c = cols.getJSONObject(i)
+            if (c.optString("id") == collectionId) {
+                val vKeys = c.optJSONArray("videoKeys") ?: JSONArray()
+                val currentSet = HashSet<String>()
+                for (j in 0 until vKeys.length()) {
+                    currentSet.add(vKeys.getString(j))
+                }
+                for (j in 0 until mediaKeys.length()) {
+                    val k = mediaKeys.getString(j)
+                    if (k.isNotBlank() && currentSet.add(k)) {
+                        vKeys.put(k)
+                        changed = true
+                    }
+                }
+                c.put("videoKeys", vKeys)
+                break
+            }
+        }
+        if (changed) {
+            saveCollectionsArray(context, cols)
+        }
+        val ret = JSObject().apply {
+            this.put("success", true)
+        }
+        call.resolve(ret)
+    }
+
+    @PluginMethod
+    fun removeFromCollection(call: PluginCall) {
+        val collectionId = call.getString("collectionId")
+        val mediaKeys = call.getArray("mediaKeys")
+        if (collectionId.isNullOrBlank() || mediaKeys == null) {
+            call.reject("Missing required parameters: collectionId or mediaKeys")
+            return
+        }
+        val keysToRemove = HashSet<String>()
+        for (i in 0 until mediaKeys.length()) {
+            keysToRemove.add(mediaKeys.getString(i))
+        }
+
+        val cols = getCollectionsArray(context)
+        var changed = false
+        for (i in 0 until cols.length()) {
+            val c = cols.getJSONObject(i)
+            if (c.optString("id") == collectionId) {
+                val vKeys = c.optJSONArray("videoKeys") ?: JSONArray()
+                val newKeys = JSONArray()
+                for (j in 0 until vKeys.length()) {
+                    val k = vKeys.getString(j)
+                    if (keysToRemove.contains(k)) {
+                        changed = true
+                    } else {
+                        newKeys.put(k)
+                    }
+                }
+                c.put("videoKeys", newKeys)
+                break
+            }
+        }
+        if (changed) {
+            saveCollectionsArray(context, cols)
+        }
+        val ret = JSObject().apply {
+            this.put("success", true)
+        }
+        call.resolve(ret)
+    }
+
+    // ==================== STATS PLUGIN METHODS ====================
+    @PluginMethod
+    fun getDownloadStats(call: PluginCall) {
+        val stats = getStatsJson(context)
+        val ret = JSObject().apply {
+            this.put("totalDownloads", stats.optLong("totalDownloads", 0L))
+            this.put("totalBytes", stats.optLong("totalBytes", 0L))
+            this.put("videoCount", stats.optLong("videoCount", 0L))
+            this.put("photoCount", stats.optLong("photoCount", 0L))
+            this.put("failedCount", stats.optLong("failedCount", 0L))
+            this.put("successRate", stats.optDouble("successRate", 100.0))
+            this.put("busiestDay", stats.optString("busiestDay", "None"))
+            this.put("averageBytes", stats.optLong("averageBytes", 0L))
+
+            val platsObj = stats.optJSONObject("platformCounts") ?: JSONObject()
+            val platRet = JSObject()
+            val pKeys = platsObj.keys()
+            while (pKeys.hasNext()) {
+                val pk = pKeys.next()
+                platRet.put(pk, platsObj.optLong(pk, 0L))
+            }
+            this.put("platformCounts", platRet)
+
+            val dailyArr = stats.optJSONArray("dailyStats") ?: JSONArray()
+            val dailyRet = JSArray()
+            for (i in 0 until dailyArr.length()) {
+                val d = dailyArr.getJSONObject(i)
+                val dObj = JSObject().apply {
+                    this.put("date", d.optString("date"))
+                    this.put("downloads", d.optLong("downloads", 0L))
+                    this.put("bytes", d.optLong("bytes", 0L))
+                }
+                dailyRet.put(dObj)
+            }
+            this.put("dailyStats", dailyRet)
+        }
+        call.resolve(ret)
+    }
+
+    @PluginMethod
+    fun resetDownloadStats(call: PluginCall) {
+        resetStats(context)
+        val ret = JSObject().apply {
+            this.put("reset", true)
+        }
+        call.resolve(ret)
     }
 }
 

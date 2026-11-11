@@ -86,7 +86,9 @@ class VideoPlayerActivity : Activity() {
     data class PlaylistItem(
         val uri: String,
         val title: String,
-        val platform: String? = null
+        val platform: String? = null,
+        val fileName: String? = null,
+        val size: Long = 0L
     )
 
     private val playlist = ArrayList<PlaylistItem>()
@@ -102,6 +104,7 @@ class VideoPlayerActivity : Activity() {
 
     private lateinit var titleTextView: TextView
     private lateinit var playlistCounterTextView: TextView
+    private lateinit var favoriteStarButton: TextView
     private lateinit var prevVideoBtn: TextView
     private lateinit var nextVideoBtn: TextView
     private lateinit var playPauseButton: TextView
@@ -977,7 +980,79 @@ class VideoPlayerActivity : Activity() {
         }
         topBarLayout.addView(playlistCounterTextView)
 
+        // Favorite Star Button
+        favoriteStarButton = TextView(this).apply {
+            this.text = "★"
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            this.gravity = Gravity.CENTER
+            this.minHeight = dp(44)
+            this.minWidth = dp(44)
+            this.setPadding(dp(8), dp(4), dp(8), dp(4))
+            val starLp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                this.leftMargin = dp(8)
+            }
+            this.layoutParams = starLp
+            this.setOnClickListener {
+                toggleCurrentFavorite()
+            }
+        }
+        updateFavoriteStarUI()
+        topBarLayout.addView(favoriteStarButton)
+
         hudOverlay.addView(topBarLayout)
+    }
+
+    private fun getCurrentMediaKey(): String {
+        val current = playlist.getOrNull(currentIndex) ?: return ""
+        var name = current.fileName ?: ""
+        var sz = current.size
+        if (name.isBlank() || sz <= 0L) {
+            try {
+                val uri = Uri.parse(current.uri)
+                contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.SIZE), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val nIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
+                        val sIdx = cursor.getColumnIndex(MediaStore.MediaColumns.SIZE)
+                        if (nIdx >= 0 && name.isBlank()) name = cursor.getString(nIdx) ?: ""
+                        if (sIdx >= 0 && sz <= 0L) sz = cursor.getLong(sIdx)
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        if (name.isBlank()) name = current.title
+        return "${name}_$sz"
+    }
+
+    private fun updateFavoriteStarUI() {
+        if (!::favoriteStarButton.isInitialized) return
+        val key = getCurrentMediaKey()
+        val isFav = if (key.isNotBlank()) VideoDownloaderPlugin.isFavorite(this, key) else false
+        favoriteStarButton.apply {
+            this.text = if (isFav) "★" else "☆"
+            this.setTextColor(if (isFav) Color.parseColor("#F59E0B") else Color.parseColor("#94A3B8"))
+            this.background = GradientDrawable().apply {
+                this.shape = GradientDrawable.RECTANGLE
+                this.cornerRadius = dp(4).toFloat()
+                if (isFav) {
+                    this.setColor(Color.parseColor("#33F59E0B"))
+                    this.setStroke(dp(1), Color.parseColor("#F59E0B"))
+                } else {
+                    this.setColor(Color.parseColor("#1A1E293B"))
+                    this.setStroke(dp(1), Color.parseColor("#33475569"))
+                }
+            }
+        }
+    }
+
+    private fun toggleCurrentFavorite() {
+        val key = getCurrentMediaKey()
+        if (key.isBlank()) return
+        val newState = VideoDownloaderPlugin.toggleFavorite(this, key)
+        updateFavoriteStarUI()
+        flashTitleBanner(if (newState) "★ ADDED TO FAVORITES" else "☆ REMOVED FROM FAVORITES")
     }
 
     private fun buildBottomBar() {
@@ -1471,6 +1546,7 @@ class VideoPlayerActivity : Activity() {
 
             titleTextView.text = currentVideoTitle
             playlistCounterTextView.text = "${currentIndex + 1}/${playlist.size}"
+            updateFavoriteStarUI()
 
             flashTitleBanner("${currentIndex + 1} / ${playlist.size} - $currentVideoTitle")
 

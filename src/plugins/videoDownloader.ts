@@ -1,5 +1,5 @@
 import { registerPlugin, PluginListenerHandle } from '@capacitor/core';
-import { DownloadHistoryItem, VideoLibraryItem, PhotoLibraryItem } from '../types';
+import { DownloadHistoryItem, VideoLibraryItem, PhotoLibraryItem, FailedDownloadItem, CollectionItem, DownloadStatsData } from '../types';
 
 export interface VideoDownloaderPlugin {
   hasOverlayPermission(): Promise<{ granted: boolean }>;
@@ -64,6 +64,19 @@ export interface VideoDownloaderPlugin {
   }): Promise<{ fileName: string }>;
   getNativeHistory(): Promise<{ history: DownloadHistoryItem[] }>;
   clearNativeHistory(): Promise<{ cleared: boolean }>;
+  getFailedLinks(): Promise<{ failedLinks: FailedDownloadItem[] }>;
+  removeFailedLink(options: { id: string }): Promise<{ removed: boolean }>;
+  clearFailedLinks(): Promise<{ cleared: boolean }>;
+  retryFailedLink(options: { id: string }): Promise<{ started: boolean }>;
+  getFavoritesAndCollections(): Promise<{ favorites: string[]; collections: CollectionItem[] }>;
+  toggleFavorite(options: { mediaKey: string }): Promise<{ mediaKey: string; isFavorite: boolean }>;
+  createCollection(options: { name: string }): Promise<{ collection: CollectionItem }>;
+  renameCollection(options: { id: string; name: string }): Promise<{ renamed: boolean }>;
+  deleteCollection(options: { id: string }): Promise<{ deleted: boolean }>;
+  addToCollection(options: { collectionId: string; mediaKeys: string[] }): Promise<{ success: boolean }>;
+  removeFromCollection(options: { collectionId: string; mediaKeys: string[] }): Promise<{ success: boolean }>;
+  getDownloadStats(): Promise<DownloadStatsData>;
+  resetDownloadStats(): Promise<{ reset: boolean }>;
   addListener(
     eventName: 'onUrlReceived',
     listenerFunc: (data: { url: string }) => void
@@ -83,6 +96,18 @@ export interface VideoDownloaderPlugin {
   addListener(
     eventName: 'openSettingsTab',
     listenerFunc: (data: { tab: string }) => void
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'onFailedLinksChanged',
+    listenerFunc: () => void
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'onFavoritesChanged',
+    listenerFunc: (data: { mediaKey: string; isFavorite: boolean }) => void
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'onCollectionsChanged',
+    listenerFunc: () => void
   ): Promise<PluginListenerHandle>;
 }
 
@@ -200,6 +225,149 @@ const VideoDownloaderWeb: VideoDownloaderPlugin = {
   },
   async clearNativeHistory() {
     return { cleared: true };
+  },
+  async getFailedLinks() {
+    try {
+      const raw = localStorage.getItem('omnidrop_failed_links');
+      return { failedLinks: raw ? JSON.parse(raw) : [] };
+    } catch {
+      return { failedLinks: [] };
+    }
+  },
+  async removeFailedLink(options: { id: string }) {
+    try {
+      const raw = localStorage.getItem('omnidrop_failed_links');
+      const list: FailedDownloadItem[] = raw ? JSON.parse(raw) : [];
+      const filtered = list.filter((item) => item.id !== options.id);
+      localStorage.setItem('omnidrop_failed_links', JSON.stringify(filtered));
+      return { removed: true };
+    } catch {
+      return { removed: false };
+    }
+  },
+  async clearFailedLinks() {
+    try {
+      localStorage.removeItem('omnidrop_failed_links');
+    } catch {}
+    return { cleared: true };
+  },
+  async retryFailedLink() {
+    return { started: true };
+  },
+  async getFavoritesAndCollections() {
+    try {
+      const favsRaw = localStorage.getItem('omnidrop_favorites');
+      const colsRaw = localStorage.getItem('omnidrop_collections');
+      return {
+        favorites: favsRaw ? JSON.parse(favsRaw) : [],
+        collections: colsRaw ? JSON.parse(colsRaw) : [],
+      };
+    } catch {
+      return { favorites: [], collections: [] };
+    }
+  },
+  async toggleFavorite(options: { mediaKey: string }) {
+    try {
+      const favsRaw = localStorage.getItem('omnidrop_favorites');
+      const favs: string[] = favsRaw ? JSON.parse(favsRaw) : [];
+      const exists = favs.includes(options.mediaKey);
+      const updated = exists ? favs.filter((k) => k !== options.mediaKey) : [...favs, options.mediaKey];
+      localStorage.setItem('omnidrop_favorites', JSON.stringify(updated));
+      return { mediaKey: options.mediaKey, isFavorite: !exists };
+    } catch {
+      return { mediaKey: options.mediaKey, isFavorite: false };
+    }
+  },
+  async createCollection(options: { name: string }) {
+    const newCol: CollectionItem = {
+      id: 'col_' + Date.now(),
+      name: options.name,
+      videoKeys: [],
+      createdAt: Date.now(),
+    };
+    try {
+      const colsRaw = localStorage.getItem('omnidrop_collections');
+      const cols: CollectionItem[] = colsRaw ? JSON.parse(colsRaw) : [];
+      cols.push(newCol);
+      localStorage.setItem('omnidrop_collections', JSON.stringify(cols));
+    } catch {}
+    return { collection: newCol };
+  },
+  async renameCollection(options: { id: string; name: string }) {
+    try {
+      const colsRaw = localStorage.getItem('omnidrop_collections');
+      const cols: CollectionItem[] = colsRaw ? JSON.parse(colsRaw) : [];
+      const item = cols.find((c) => c.id === options.id);
+      if (item) {
+        item.name = options.name;
+        localStorage.setItem('omnidrop_collections', JSON.stringify(cols));
+        return { renamed: true };
+      }
+    } catch {}
+    return { renamed: false };
+  },
+  async deleteCollection(options: { id: string }) {
+    try {
+      const colsRaw = localStorage.getItem('omnidrop_collections');
+      const cols: CollectionItem[] = colsRaw ? JSON.parse(colsRaw) : [];
+      const filtered = cols.filter((c) => c.id !== options.id);
+      localStorage.setItem('omnidrop_collections', JSON.stringify(filtered));
+      return { deleted: true };
+    } catch {
+      return { deleted: false };
+    }
+  },
+  async addToCollection(options: { collectionId: string; mediaKeys: string[] }) {
+    try {
+      const colsRaw = localStorage.getItem('omnidrop_collections');
+      const cols: CollectionItem[] = colsRaw ? JSON.parse(colsRaw) : [];
+      const col = cols.find((c) => c.id === options.collectionId);
+      if (col) {
+        const set = new Set([...col.videoKeys, ...options.mediaKeys]);
+        col.videoKeys = Array.from(set);
+        localStorage.setItem('omnidrop_collections', JSON.stringify(cols));
+        return { success: true };
+      }
+    } catch {}
+    return { success: false };
+  },
+  async removeFromCollection(options: { collectionId: string; mediaKeys: string[] }) {
+    try {
+      const colsRaw = localStorage.getItem('omnidrop_collections');
+      const cols: CollectionItem[] = colsRaw ? JSON.parse(colsRaw) : [];
+      const col = cols.find((c) => c.id === options.collectionId);
+      if (col) {
+        const removeSet = new Set(options.mediaKeys);
+        col.videoKeys = col.videoKeys.filter((k) => !removeSet.has(k));
+        localStorage.setItem('omnidrop_collections', JSON.stringify(cols));
+        return { success: true };
+      }
+    } catch {}
+    return { success: false };
+  },
+  async getDownloadStats() {
+    try {
+      const raw = localStorage.getItem('omnidrop_stats');
+      if (raw) return JSON.parse(raw);
+    } catch {}
+    return {
+      totalDownloads: 0,
+      totalBytes: 0,
+      videoCount: 0,
+      photoCount: 0,
+      failedCount: 0,
+      successRate: 100,
+      platformCounts: {},
+      dailyStats: [],
+      busiestDay: 'None',
+      averageBytes: 0,
+    };
+  },
+  async resetDownloadStats() {
+    try {
+      localStorage.removeItem('omnidrop_stats');
+    } catch {}
+    return { reset: true };
   },
   async addListener() {
     return {

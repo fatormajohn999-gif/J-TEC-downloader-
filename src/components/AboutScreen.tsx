@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import {
   BookOpen,
   ShieldCheck,
@@ -20,10 +20,19 @@ import {
   Bot,
   Copy,
   Trash2,
+  BarChart3,
+  RotateCcw,
+  TrendingUp,
+  Calendar,
+  HardDrive,
+  Film,
+  Camera,
+  AlertTriangle,
 } from 'lucide-react';
 import { VideoDownloader } from '../plugins/videoDownloader';
+import { DownloadStatsData } from '../types';
 
-type SubScreen = 'guide' | 'privacy' | 'developer' | 'info' | null;
+type SubScreen = 'guide' | 'privacy' | 'developer' | 'info' | 'stats' | null;
 
 export const AboutScreen: React.FC = () => {
   const [activeSubScreen, setActiveSubScreen] = useState<SubScreen>(null);
@@ -33,8 +42,12 @@ export const AboutScreen: React.FC = () => {
     versionName: '1.0.0',
     versionCode: 1,
   });
+  const [stats, setStats] = useState<DownloadStatsData | null>(null);
+  const [isLoadingStats, setIsLoadingStats] = useState(false);
+  const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
 
-  React.useEffect(() => {
+  useEffect(() => {
     VideoDownloader.getAppVersion()
       .then((ver) => {
         if (ver && ver.versionCode) {
@@ -44,15 +57,141 @@ export const AboutScreen: React.FC = () => {
       .catch(() => {});
   }, []);
 
-  React.useEffect(() => {
+  const loadStats = useCallback(async () => {
+    setIsLoadingStats(true);
+    try {
+      const res = await VideoDownloader.getDownloadStats();
+      if (res && res.totalDownloads > 0) {
+        setStats(res);
+      } else {
+        // Fallback baseline from existing media libraries
+        const [vRes, pRes] = await Promise.all([
+          VideoDownloader.getVideoLibrary().catch(() => ({ videos: [] })),
+          VideoDownloader.getPhotoLibrary().catch(() => ({ photos: [] })),
+        ]);
+        const videos = vRes?.videos || [];
+        const photos = pRes?.photos || [];
+        const total = videos.length + photos.length;
+        const totalBytes =
+          videos.reduce((acc: number, v: any) => acc + (v.size || 0), 0) +
+          photos.reduce((acc: number, p: any) => acc + (p.size || 0), 0);
+
+        const split: Record<string, number> = {};
+        for (const v of videos) {
+          const p = v.platform || 'Other';
+          split[p] = (split[p] || 0) + 1;
+        }
+        for (const p of photos) {
+          const plat = p.platform || 'TikTok';
+          split[plat] = (split[plat] || 0) + 1;
+        }
+
+        const historyMap = new Map<string, { count: number; bytes: number }>();
+        const today = new Date();
+        for (let i = 13; i >= 0; i--) {
+          const d = new Date(today);
+          d.setDate(today.getDate() - i);
+          const ds = d.toISOString().split('T')[0];
+          historyMap.set(ds, { count: 0, bytes: 0 });
+        }
+
+        for (const v of videos) {
+          if (v.dateAdded) {
+            const ds = new Date(v.dateAdded).toISOString().split('T')[0];
+            if (historyMap.has(ds)) {
+              const cur = historyMap.get(ds)!;
+              cur.count += 1;
+              cur.bytes += v.size || 0;
+            }
+          }
+        }
+        for (const p of photos) {
+          if (p.dateAdded) {
+            const ds = new Date(p.dateAdded).toISOString().split('T')[0];
+            if (historyMap.has(ds)) {
+              const cur = historyMap.get(ds)!;
+              cur.count += 1;
+              cur.bytes += p.size || 0;
+            }
+          }
+        }
+
+        const dailyStats: Array<{ date: string; downloads: number; bytes: number }> = [];
+        let busiestDayObj = { date: '', count: 0 };
+        for (const [date, val] of historyMap.entries()) {
+          dailyStats.push({ date, downloads: val.count, bytes: val.bytes });
+          if (val.count > busiestDayObj.count) {
+            busiestDayObj = { date, count: val.count };
+          }
+        }
+
+        const busiestDayStr = busiestDayObj.date
+          ? `${busiestDayObj.date} (${busiestDayObj.count} dls)`
+          : 'None';
+
+        setStats({
+          totalDownloads: total,
+          totalBytes,
+          videoCount: videos.length,
+          photoCount: photos.length,
+          failedCount: 0,
+          platformCounts: split,
+          dailyStats,
+          busiestDay: busiestDayStr,
+          averageBytes: total > 0 ? Math.round(totalBytes / total) : 0,
+          successRate: total > 0 ? 100 : 0,
+        });
+      }
+    } catch (e) {
+      console.warn('Failed to load stats', e);
+    } finally {
+      setIsLoadingStats(false);
+    }
+  }, []);
+
+  useEffect(() => {
     if (activeSubScreen === 'info') {
       VideoDownloader.getLastCrash()
         .then((res) => {
           setCrashLog(res?.crash || '');
         })
         .catch(() => setCrashLog(''));
+    } else if (activeSubScreen === 'stats') {
+      loadStats();
     }
-  }, [activeSubScreen]);
+  }, [activeSubScreen, loadStats]);
+
+  const handleResetStats = async () => {
+    setIsResetting(true);
+    try {
+      await VideoDownloader.resetDownloadStats();
+      setStats({
+        totalDownloads: 0,
+        totalBytes: 0,
+        videoCount: 0,
+        photoCount: 0,
+        failedCount: 0,
+        platformCounts: {},
+        dailyStats: [],
+        busiestDay: 'None',
+        averageBytes: 0,
+        successRate: 0,
+      });
+      setResetConfirmOpen(false);
+    } catch (err) {
+      console.warn('Failed to reset stats', err);
+    } finally {
+      setIsResetting(false);
+    }
+  };
+
+  const formatStatsBytes = (bytes: number) => {
+    if (!bytes || bytes === 0) return '0 B';
+    const mb = bytes / (1024 * 1024);
+    if (mb < 1) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (mb >= 1024) return `${(mb / 1024).toFixed(2)} GB`;
+    return `${mb.toFixed(1)} MB`;
+  };
 
   const handleCopyCrash = async () => {
     if (!crashLog) return;
@@ -106,6 +245,15 @@ export const AboutScreen: React.FC = () => {
       icon: Info,
       color: 'text-purple-400',
       badge: `v1.0.${appVersion.versionCode}`,
+    },
+    {
+      id: 'stats' as SubScreen,
+      code: 'METRICS // 05',
+      title: 'Download Statistics',
+      subtitle: 'Volume, bandwidth saved, platform breakdown, 14-day history & efficiency',
+      icon: BarChart3,
+      color: 'text-cyan-400',
+      badge: 'STATS',
     },
   ];
 
@@ -594,7 +742,296 @@ export const AboutScreen: React.FC = () => {
     );
   }
 
-  // MAIN ABOUT MENU (4 BIG TILES)
+  // SUB-SCREEN 5: DOWNLOAD STATISTICS
+  if (activeSubScreen === 'stats') {
+    const totalPlatformCount = stats
+      ? Object.values(stats.platformCounts || {}).reduce((a: number, b: number) => a + b, 0)
+      : 0;
+
+    const maxDailyDownloads = stats
+      ? Math.max(...(stats.dailyStats || []).map((d) => d.downloads), 1)
+      : 1;
+
+    const platformColors: Record<string, { bg: string; text: string; glow: string }> = {
+      TikTok: { bg: 'bg-cyan-400', text: 'text-cyan-400', glow: 'shadow-[0_0_8px_rgba(0,240,255,0.6)]' },
+      YouTube: { bg: 'bg-rose-500', text: 'text-rose-400', glow: 'shadow-[0_0_8px_rgba(244,63,94,0.6)]' },
+      Instagram: { bg: 'bg-fuchsia-500', text: 'text-fuchsia-400', glow: 'shadow-[0_0_8px_rgba(217,70,239,0.6)]' },
+      Facebook: { bg: 'bg-blue-500', text: 'text-blue-400', glow: 'shadow-[0_0_8px_rgba(59,130,246,0.6)]' },
+      Other: { bg: 'bg-slate-400', text: 'text-slate-400', glow: 'shadow-[0_0_8px_rgba(148,163,184,0.4)]' },
+    };
+
+    return (
+      <div className="space-y-4 pb-28 animate-fade-in font-mono text-xs">
+        {/* Sub-screen header */}
+        <div className="flex items-center gap-3 pb-2 border-b border-cyan-500/20">
+          <button
+            onClick={() => setActiveSubScreen(null)}
+            className="machine-btn px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-mono text-cyan-300"
+          >
+            <ArrowLeft className="w-3.5 h-3.5" />
+            <span>BACK // MENU</span>
+          </button>
+          <div className="text-right flex-1">
+            <span className="font-mono text-[11px] text-cyan-400 font-bold uppercase tracking-widest">
+              METRICS // DOWNLOAD STATS
+            </span>
+          </div>
+        </div>
+
+        {isLoadingStats && !stats ? (
+          <div className="machine-surface p-8 text-center rounded-xl space-y-3">
+            <div className="w-8 h-8 mx-auto rounded-full border-2 border-cyan-400 border-t-transparent animate-spin" />
+            <p className="text-slate-400 font-mono text-xs">COMPUTING NATIVE TELEMETRY...</p>
+          </div>
+        ) : !stats ? (
+          <div className="machine-surface p-6 text-center rounded-xl text-slate-400">
+            NO STATS RECORDED YET
+          </div>
+        ) : (
+          <>
+            {/* Primary KPI Grid (4 Cards) */}
+            <div className="grid grid-cols-2 gap-2.5">
+              {/* Total Downloads */}
+              <div className="machine-surface p-3 rounded-xl space-y-1">
+                <div className="flex items-center justify-between text-slate-400 text-[10px] uppercase">
+                  <span>TOTAL DOWNLOADS</span>
+                  <HardDrive className="w-3.5 h-3.5 text-cyan-400" />
+                </div>
+                <div className="text-xl font-bold text-white tracking-wider">
+                  {stats.totalDownloads}
+                </div>
+                <div className="text-[10px] text-slate-500">Finished media jobs</div>
+              </div>
+
+              {/* Total Bandwidth Saved */}
+              <div className="machine-surface p-3 rounded-xl space-y-1">
+                <div className="flex items-center justify-between text-slate-400 text-[10px] uppercase">
+                  <span>DATA VOLUME</span>
+                  <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
+                </div>
+                <div className="text-xl font-bold text-cyan-300 tracking-wider">
+                  {formatStatsBytes(stats.totalBytes)}
+                </div>
+                <div className="text-[10px] text-slate-500">Saved to storage</div>
+              </div>
+
+              {/* Videos vs Photos */}
+              <div className="machine-surface p-3 rounded-xl space-y-1">
+                <div className="flex items-center justify-between text-slate-400 text-[10px] uppercase">
+                  <span>MEDIA SPLIT</span>
+                  <div className="flex items-center gap-1">
+                    <Film className="w-3 h-3 text-cyan-400" />
+                    <Camera className="w-3 h-3 text-fuchsia-400" />
+                  </div>
+                </div>
+                <div className="text-base font-bold text-white tracking-wider flex items-center gap-2">
+                  <span>{stats.videoCount} <span className="text-[10px] text-slate-400 font-normal">VID</span></span>
+                  <span className="text-slate-600">/</span>
+                  <span>{stats.photoCount} <span className="text-[10px] text-slate-400 font-normal">PIC</span></span>
+                </div>
+                <div className="text-[10px] text-slate-500">Clips vs photo sets</div>
+              </div>
+
+              {/* Success Rate */}
+              <div className="machine-surface p-3 rounded-xl space-y-1">
+                <div className="flex items-center justify-between text-slate-400 text-[10px] uppercase">
+                  <span>SUCCESS EFFICIENCY</span>
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                </div>
+                <div className="text-xl font-bold text-emerald-400 tracking-wider">
+                  {stats.successRate.toFixed(1)}%
+                </div>
+                <div className="text-[10px] text-slate-500">
+                  {stats.failedCount > 0 ? `${stats.failedCount} recorded failures` : 'Flawless execution'}
+                </div>
+              </div>
+            </div>
+
+            {/* Secondary Insights (Average Size & Busiest Day) */}
+            <div className="grid grid-cols-2 gap-2.5">
+              <div className="machine-surface p-3 rounded-xl space-y-1">
+                <div className="text-slate-400 text-[10px] uppercase flex items-center gap-1.5">
+                  <BarChart3 className="w-3 h-3 text-purple-400" />
+                  <span>AVG FILE SIZE</span>
+                </div>
+                <div className="text-sm font-bold text-white">
+                  {formatStatsBytes(stats.averageBytes)}
+                </div>
+              </div>
+
+              <div className="machine-surface p-3 rounded-xl space-y-1">
+                <div className="text-slate-400 text-[10px] uppercase flex items-center gap-1.5">
+                  <Calendar className="w-3 h-3 text-amber-400" />
+                  <span>BUSIEST RECORD</span>
+                </div>
+                <div className="text-sm font-bold text-white truncate" title={stats.busiestDay}>
+                  {stats.busiestDay || 'N/A'}
+                </div>
+              </div>
+            </div>
+
+            {/* Platform Distribution: Glowing Segmented Bar */}
+            <div className="machine-surface rounded-xl p-4 space-y-3">
+              <div className="flex items-center justify-between pb-1 border-b border-slate-800">
+                <div className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full led-cyan" />
+                  <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
+                    PLATFORM DISTRIBUTION
+                  </h3>
+                </div>
+                <span className="text-[10px] text-slate-400">
+                  {totalPlatformCount} total tracks
+                </span>
+              </div>
+
+              {/* Glowing Segmented Bar */}
+              <div className="h-3 w-full bg-slate-950 rounded-full overflow-hidden flex border border-slate-800 p-0.5">
+                {totalPlatformCount === 0 ? (
+                  <div className="w-full h-full bg-slate-800 rounded-full" />
+                ) : (
+                  Object.entries(stats.platformCounts || {}).map(([plat, count]) => {
+                    const numCount = Number(count) || 0;
+                    if (numCount <= 0) return null;
+                    const pct = (numCount / totalPlatformCount) * 100;
+                    const style = platformColors[plat] || platformColors.Other;
+                    return (
+                      <div
+                        key={plat}
+                        style={{ width: `${pct}%` }}
+                        className={`h-full ${style.bg} ${style.glow} first:rounded-l-full last:rounded-r-full transition-all`}
+                        title={`${plat}: ${numCount} (${pct.toFixed(1)}%)`}
+                      />
+                    );
+                  })
+                )}
+              </div>
+
+              {/* Platform Legend Grid */}
+              <div className="grid grid-cols-2 gap-2 pt-1">
+                {['TikTok', 'YouTube', 'Instagram', 'Facebook', 'Other'].map((plat) => {
+                  const count = Number(stats.platformCounts?.[plat]) || 0;
+                  const pct = totalPlatformCount > 0 ? (count / totalPlatformCount) * 100 : 0;
+                  const style = platformColors[plat] || platformColors.Other;
+                  return (
+                    <div
+                      key={plat}
+                      className="p-2 rounded-lg bg-slate-950/80 border border-slate-800/80 flex items-center justify-between"
+                    >
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        <span className={`w-2 h-2 rounded-full ${style.bg} shrink-0`} />
+                        <span className="font-bold text-slate-200 truncate">{plat}</span>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <span className={`font-bold ${style.text}`}>{count}</span>
+                        <span className="text-[9px] text-slate-500 ml-1">({pct.toFixed(0)}%)</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* 14-Day Activity Bar Chart */}
+            <div className="machine-surface rounded-xl p-4 space-y-3">
+              <div className="flex items-center justify-between pb-1 border-b border-slate-800">
+                <div className="flex items-center gap-2">
+                  <BarChart3 className="w-3.5 h-3.5 text-cyan-400" />
+                  <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
+                    14-DAY ACTIVITY TIMELINE
+                  </h3>
+                </div>
+                <span className="text-[10px] text-slate-400">Peak: {maxDailyDownloads} items</span>
+              </div>
+
+              <div className="pt-2">
+                <div className="h-28 flex items-end justify-between gap-1 border-b border-slate-800/80 pb-1">
+                  {stats.dailyStats.map((d, idx) => {
+                    const heightPct = maxDailyDownloads > 0 ? (d.downloads / maxDailyDownloads) * 100 : 0;
+                    const isPeak = d.downloads === maxDailyDownloads && d.downloads > 0;
+                    return (
+                      <div
+                        key={idx}
+                        className="flex-1 flex flex-col items-center h-full justify-end group relative"
+                      >
+                        {/* Tooltip on tap/hover */}
+                        <div className="opacity-0 group-hover:opacity-100 pointer-events-none absolute bottom-full mb-1 z-30 px-1.5 py-0.5 rounded bg-black border border-cyan-500 text-[9px] text-cyan-300 whitespace-nowrap transition-opacity">
+                          {d.date.slice(5)}: {d.downloads} ({formatStatsBytes(d.bytes)})
+                        </div>
+
+                        {/* Bar */}
+                        <div
+                          style={{ height: `${Math.max(heightPct, d.downloads > 0 ? 8 : 2)}%` }}
+                          className={`w-full rounded-t transition-all ${
+                            d.downloads === 0
+                              ? 'bg-slate-800/40'
+                              : isPeak
+                              ? 'bg-cyan-400 shadow-[0_0_10px_rgba(0,240,255,0.7)]'
+                              : 'bg-cyan-600/80 group-hover:bg-cyan-400'
+                          }`}
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Day Labels */}
+                <div className="flex justify-between pt-1 text-[8px] text-slate-500 font-mono">
+                  <span>{stats.dailyStats[0]?.date.slice(5) || '14d ago'}</span>
+                  <span>7d ago</span>
+                  <span>Today</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Reset Stats Key */}
+            <div className="pt-2 flex justify-end">
+              <button
+                onClick={() => setResetConfirmOpen(true)}
+                className="machine-btn px-3 py-1.5 rounded-lg font-mono text-xs text-rose-400 hover:text-rose-300 border-rose-500/30 flex items-center gap-1.5 transition-colors"
+              >
+                <RotateCcw className="w-3.5 h-3.5 text-rose-400" />
+                <span>RESET STATS</span>
+              </button>
+            </div>
+          </>
+        )}
+
+        {/* Reset Confirmation Modal */}
+        {resetConfirmOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm animate-in fade-in duration-200">
+            <div className="machine-surface w-full max-w-sm rounded-xl p-5 space-y-4 shadow-2xl border border-rose-500/40">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-rose-400" />
+                <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
+                  CONFIRM STATS PURGE
+                </h3>
+              </div>
+              <p className="font-mono text-xs text-slate-300 leading-relaxed bg-slate-950/60 p-3 rounded-lg border border-slate-800">
+                Are you sure you want to purge all download statistics? This will reset total bandwidth saved, platform breakdown counters, and 14-day history to zero. Your video and photo files will NOT be deleted.
+              </p>
+              <div className="flex justify-end gap-2 pt-1 font-mono text-xs">
+                <button
+                  onClick={() => setResetConfirmOpen(false)}
+                  className="machine-btn px-3 py-1.5 rounded-lg text-slate-400"
+                >
+                  CANCEL
+                </button>
+                <button
+                  onClick={handleResetStats}
+                  disabled={isResetting}
+                  className="machine-btn-danger px-4 py-1.5 rounded-lg font-bold text-white uppercase"
+                >
+                  {isResetting ? 'PURGING...' : 'PURGE STATS'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // MAIN ABOUT MENU (5 BIG TILES)
   return (
     <div className="space-y-4 pb-28">
       {/* Monospace Section Header */}
@@ -611,7 +1048,7 @@ export const AboutScreen: React.FC = () => {
         </div>
       </div>
 
-      {/* 4 Big Machine Tiles */}
+      {/* 5 Big Machine Tiles */}
       <div className="grid grid-cols-1 gap-3">
         {menuItems.map((item) => {
           const Icon = item.icon;

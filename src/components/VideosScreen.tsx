@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   Play,
   Share2,
@@ -16,8 +16,14 @@ import {
   Check,
   X,
   MoreVertical,
+  Star,
+  FolderPlus,
+  Folder,
+  Plus,
+  CheckSquare,
+  Square,
 } from 'lucide-react';
-import { VideoLibraryItem, PlatformType } from '../types';
+import { VideoLibraryItem, PlatformType, CollectionItem } from '../types';
 import { VideoDownloader } from '../plugins/videoDownloader';
 import { Capacitor } from '@capacitor/core';
 
@@ -35,6 +41,60 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
+
+  // Favorites & Collections
+  const [favorites, setFavorites] = useState<string[]>([]);
+  const [collections, setCollections] = useState<CollectionItem[]>([]);
+  const [collectionMenuId, setCollectionMenuId] = useState<string | null>(null);
+
+  // Modals for collections
+  const [createCollectionModalOpen, setCreateCollectionModalOpen] = useState(false);
+  const [newCollectionName, setNewCollectionName] = useState('');
+  const [renameCollectionTarget, setRenameCollectionTarget] = useState<CollectionItem | null>(null);
+  const [addToCollectionModalOpen, setAddToCollectionModalOpen] = useState(false);
+  const [targetVideosForCollection, setTargetVideosForCollection] = useState<VideoLibraryItem[]>([]);
+
+  // Multi-select state
+  const [selectedUris, setSelectedUris] = useState<Set<string>>(new Set());
+  const [isMultiSelectMode, setIsMultiSelectMode] = useState(false);
+  const pressTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const getVideoKey = useCallback((v: VideoLibraryItem) => {
+    const name = v.fileName || v.title || 'video';
+    return `${name}_${v.size || 0}`;
+  }, []);
+
+  const loadFavoritesAndCollections = useCallback(async () => {
+    try {
+      const res = await VideoDownloader.getFavoritesAndCollections();
+      if (res) {
+        if (Array.isArray(res.favorites)) setFavorites(res.favorites);
+        if (Array.isArray(res.collections)) setCollections(res.collections);
+      }
+    } catch (e) {
+      console.warn('Failed to load favorites and collections', e);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadFavoritesAndCollections();
+    let h1: any = null;
+    let h2: any = null;
+    (async () => {
+      try {
+        h1 = await VideoDownloader.addListener('onFavoritesChanged', () => {
+          loadFavoritesAndCollections();
+        });
+        h2 = await VideoDownloader.addListener('onCollectionsChanged', () => {
+          loadFavoritesAndCollections();
+        });
+      } catch {}
+    })();
+    return () => {
+      if (h1 && h1.remove) h1.remove();
+      if (h2 && h2.remove) h2.remove();
+    };
+  }, [loadFavoritesAndCollections]);
 
   // Duplicates modal state
   const [duplicateModalOpen, setDuplicateModalOpen] = useState(false);
@@ -155,6 +215,8 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
         uri: v.uri,
         title: v.title,
         platform: v.platform,
+        fileName: v.fileName,
+        size: v.size,
       }));
       await VideoDownloader.playVideo({
         uri: video.uri,
@@ -352,16 +414,186 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
         v.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
         (v.platform && v.platform.toLowerCase().includes(searchQuery.toLowerCase()));
 
-      const matchPlatform =
-        selectedPlatform === 'all' ||
-        (v.platform && v.platform.toLowerCase() === selectedPlatform.toLowerCase()) ||
-        (selectedPlatform === 'other' &&
-          (!v.platform ||
-            !['tiktok', 'youtube', 'instagram', 'facebook'].includes(v.platform.toLowerCase())));
+      if (!matchSearch) return false;
 
-      return matchSearch && matchPlatform;
+      if (selectedPlatform === 'all') return true;
+      if (selectedPlatform === 'favorites') {
+        return favorites.includes(getVideoKey(v));
+      }
+      if (selectedPlatform.startsWith('col_')) {
+        const col = collections.find((c) => c.id === selectedPlatform);
+        return col ? col.videoKeys.includes(getVideoKey(v)) : true;
+      }
+      const p = (v.platform || 'other').toLowerCase();
+      if (selectedPlatform === 'other') {
+        return !['tiktok', 'youtube', 'instagram', 'facebook'].includes(p);
+      }
+      return p === selectedPlatform.toLowerCase();
     });
-  }, [videos, searchQuery, selectedPlatform]);
+  }, [videos, searchQuery, selectedPlatform, favorites, collections, getVideoKey]);
+
+  // Favorites & Collections Actions
+  const handleToggleFavorite = async (video: VideoLibraryItem, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    const key = getVideoKey(video);
+    try {
+      const res = await VideoDownloader.toggleFavorite({ mediaKey: key });
+      setFavorites((prev) =>
+        res.isFavorite ? [...prev.filter((k) => k !== key), key] : prev.filter((k) => k !== key)
+      );
+    } catch (err) {
+      console.warn('Failed to toggle favorite', err);
+    }
+  };
+
+  const handleCreateCollection = async () => {
+    const trimmed = newCollectionName.trim();
+    if (!trimmed) return;
+    try {
+      const res = await VideoDownloader.createCollection({ name: trimmed });
+      if (res && res.collection) {
+        setCollections((prev) => [...prev, res.collection]);
+        setSelectedPlatform(res.collection.id);
+      }
+    } catch (err) {
+      console.warn('Failed to create collection', err);
+    } finally {
+      setNewCollectionName('');
+      setCreateCollectionModalOpen(false);
+    }
+  };
+
+  const handleSaveRenameCollection = async () => {
+    if (!renameCollectionTarget) return;
+    const trimmed = newCollectionName.trim();
+    if (!trimmed) return;
+    try {
+      await VideoDownloader.renameCollection({ id: renameCollectionTarget.id, name: trimmed });
+      setCollections((prev) =>
+        prev.map((c) => (c.id === renameCollectionTarget.id ? { ...c, name: trimmed } : c))
+      );
+    } catch (err) {
+      console.warn('Failed to rename collection', err);
+    } finally {
+      setRenameCollectionTarget(null);
+      setNewCollectionName('');
+    }
+  };
+
+  const handleDeleteCollection = async (id: string) => {
+    try {
+      await VideoDownloader.deleteCollection({ id });
+      setCollections((prev) => prev.filter((c) => c.id !== id));
+      if (selectedPlatform === id) setSelectedPlatform('all');
+    } catch (err) {
+      console.warn('Failed to delete collection', err);
+    } finally {
+      setCollectionMenuId(null);
+    }
+  };
+
+  const handleAddVideosToCollection = async (collectionId: string) => {
+    const keys = targetVideosForCollection.map(getVideoKey);
+    if (keys.length === 0) return;
+    try {
+      await VideoDownloader.addToCollection({ collectionId, mediaKeys: keys });
+      setCollections((prev) =>
+        prev.map((c) => {
+          if (c.id === collectionId) {
+            const set = new Set([...c.videoKeys, ...keys]);
+            return { ...c, videoKeys: Array.from(set) };
+          }
+          return c;
+        })
+      );
+    } catch (err) {
+      console.warn('Failed to add to collection', err);
+    } finally {
+      setAddToCollectionModalOpen(false);
+      setTargetVideosForCollection([]);
+      setSelectedUris(new Set());
+      setIsMultiSelectMode(false);
+    }
+  };
+
+  // Multi-select handlers
+  const handleToggleSelectUri = (uri: string) => {
+    setSelectedUris((prev) => {
+      const next = new Set(prev);
+      if (next.has(uri)) {
+        next.delete(uri);
+        if (next.size === 0) setIsMultiSelectMode(false);
+      } else {
+        next.add(uri);
+        setIsMultiSelectMode(true);
+      }
+      return next;
+    });
+  };
+
+  const handleCardPressStart = (uri: string) => {
+    pressTimerRef.current = setTimeout(() => {
+      handleToggleSelectUri(uri);
+    }, 500);
+  };
+
+  const handleCardPressEnd = () => {
+    if (pressTimerRef.current) {
+      clearTimeout(pressTimerRef.current);
+      pressTimerRef.current = null;
+    }
+  };
+
+  const handleSelectAll = () => {
+    const all = new Set(filteredVideos.map((v) => v.uri));
+    setSelectedUris(all);
+    setIsMultiSelectMode(true);
+  };
+
+  const handleClearSelection = () => {
+    setSelectedUris(new Set());
+    setIsMultiSelectMode(false);
+  };
+
+  const handleDeleteSelected = async () => {
+    const urisToDelete = Array.from(selectedUris);
+    if (urisToDelete.length === 0) return;
+    setIsDeleting(true);
+    setPermissionNotice(`Android will ask your permission to delete ${urisToDelete.length} files`);
+    try {
+      const res = await VideoDownloader.deleteVideo({ uris: urisToDelete });
+      setPermissionNotice(null);
+      if (res && res.cancelled) {
+        setRoboticNotice({
+          title: 'DELETE CANCELLED',
+          message: 'Permission was cancelled by user.',
+          isError: true,
+        });
+      }
+      setSelectedUris(new Set());
+      setIsMultiSelectMode(false);
+      await loadLibrary();
+    } catch (e: any) {
+      setPermissionNotice(null);
+      setRoboticNotice({
+        title: 'DELETE ERROR',
+        message: e?.message || 'Failed to delete selected videos',
+        isError: true,
+      });
+    } finally {
+      setIsDeleting(false);
+      setPermissionNotice(null);
+    }
+  };
+
+  const handleFavoriteSelected = async () => {
+    const selectedVideos = videos.filter((v) => selectedUris.has(v.uri));
+    for (const v of selectedVideos) {
+      await handleToggleFavorite(v);
+    }
+    setSelectedUris(new Set());
+    setIsMultiSelectMode(false);
+  };
 
   const totalSizeBytes = useMemo(() => {
     return videos.reduce((acc, v) => acc + (v.size || 0), 0);
@@ -475,6 +707,24 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
         </div>
 
         <div className="flex items-center gap-2">
+          {/* Select Mode Toggle */}
+          <button
+            onClick={() => {
+              if (isMultiSelectMode) {
+                handleClearSelection();
+              } else {
+                setIsMultiSelectMode(true);
+              }
+            }}
+            className={`machine-btn px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-mono transition-all ${
+              isMultiSelectMode ? 'bg-cyan-950 border-cyan-400 text-cyan-300' : 'text-slate-400'
+            }`}
+            title="Multi-select mode"
+          >
+            <CheckSquare className="w-3.5 h-3.5 text-cyan-400" />
+            <span>{isMultiSelectMode ? 'DONE' : 'SELECT'}</span>
+          </button>
+
           {/* Find Duplicates Button */}
           <button
             onClick={handleFindDuplicates}
@@ -516,24 +766,123 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
         )}
       </div>
 
-      {/* Platform Filter Buttons */}
-      <div className="flex items-center gap-1 overflow-x-auto pb-1 no-scrollbar text-xs">
-        {platforms.map((p) => {
-          const isActive = selectedPlatform === p.id;
+      {/* Platform & Collections Filter Buttons */}
+      <div className="flex items-center gap-1.5 overflow-x-auto pb-1 no-scrollbar text-xs">
+        {/* ALL */}
+        <button
+          onClick={() => setSelectedPlatform('all')}
+          className={`px-2.5 py-1 rounded-md font-mono text-[11px] whitespace-nowrap transition-all ${
+            selectedPlatform === 'all'
+              ? 'machine-btn-primary text-slate-950 shadow-[0_0_8px_rgba(0,240,255,0.4)]'
+              : 'machine-btn text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          ALL ({videos.length})
+        </button>
+
+        {/* ★ FAVORITES */}
+        <button
+          onClick={() => setSelectedPlatform('favorites')}
+          className={`px-2.5 py-1 rounded-md font-mono text-[11px] whitespace-nowrap transition-all flex items-center gap-1.5 ${
+            selectedPlatform === 'favorites'
+              ? 'bg-amber-400 text-slate-950 font-bold shadow-[0_0_10px_rgba(245,158,11,0.5)] border border-amber-300'
+              : 'machine-btn text-amber-400 hover:text-amber-300 border-amber-500/30'
+          }`}
+        >
+          <Star className="w-3 h-3 fill-current" />
+          <span>★ FAVORITES ({favorites.length})</span>
+        </button>
+
+        {/* Platforms */}
+        {platforms
+          .filter((p) => p.id !== 'all')
+          .map((p) => {
+            const isActive = selectedPlatform === p.id;
+            return (
+              <button
+                key={p.id}
+                onClick={() => setSelectedPlatform(p.id)}
+                className={`px-2.5 py-1 rounded-md font-mono text-[11px] whitespace-nowrap transition-all ${
+                  isActive
+                    ? 'machine-btn-primary text-slate-950 shadow-[0_0_8px_rgba(0,240,255,0.4)]'
+                    : 'machine-btn text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {p.label}
+              </button>
+            );
+          })}
+
+        {/* User Collections */}
+        {collections.map((c) => {
+          const isActive = selectedPlatform === c.id;
           return (
-            <button
-              key={p.id}
-              onClick={() => setSelectedPlatform(p.id)}
-              className={`px-2.5 py-1 rounded-md font-mono text-[11px] whitespace-nowrap transition-all ${
-                isActive
-                  ? 'machine-btn-primary text-slate-950 shadow-[0_0_8px_rgba(0,240,255,0.4)]'
-                  : 'machine-btn text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              {p.label}
-            </button>
+            <div key={c.id} className="relative shrink-0 flex items-center">
+              <button
+                onClick={() => setSelectedPlatform(c.id)}
+                className={`px-2.5 py-1 rounded-l-md font-mono text-[11px] whitespace-nowrap transition-all flex items-center gap-1.5 ${
+                  isActive
+                    ? 'bg-purple-500 text-slate-950 font-bold shadow-[0_0_8px_rgba(168,85,247,0.4)]'
+                    : 'machine-btn text-purple-300 hover:text-purple-200 border-purple-500/30'
+                }`}
+              >
+                <Folder className="w-3 h-3" />
+                <span>{c.name.toUpperCase()} ({c.videoKeys.length})</span>
+              </button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setCollectionMenuId(collectionMenuId === c.id ? null : c.id);
+                }}
+                className={`px-1.5 py-1 rounded-r-md border-l border-slate-800 font-mono text-[10px] ${
+                  isActive ? 'bg-purple-600 text-slate-950' : 'machine-btn text-slate-400 hover:text-slate-200'
+                }`}
+                title="Collection options"
+              >
+                •••
+              </button>
+
+              {/* Collection Context Dropdown */}
+              {collectionMenuId === c.id && (
+                <div
+                  onClick={(e) => e.stopPropagation()}
+                  className="absolute left-0 top-full mt-1 w-32 rounded-lg bg-slate-950 border border-purple-500/40 shadow-2xl p-1 z-30 font-mono text-xs space-y-0.5 animate-fade-in"
+                >
+                  <button
+                    onClick={() => {
+                      setCollectionMenuId(null);
+                      setRenameCollectionTarget(c);
+                      setNewCollectionName(c.name);
+                    }}
+                    className="w-full px-2 py-1.5 rounded flex items-center gap-1.5 text-slate-300 hover:bg-slate-800 hover:text-cyan-300 text-left text-[11px]"
+                  >
+                    <Edit3 className="w-3 h-3 text-cyan-400" />
+                    <span>Rename</span>
+                  </button>
+                  <button
+                    onClick={() => handleDeleteCollection(c.id)}
+                    className="w-full px-2 py-1.5 rounded flex items-center gap-1.5 text-red-400 hover:bg-slate-800 hover:text-red-300 text-left text-[11px]"
+                  >
+                    <Trash2 className="w-3 h-3 text-red-400" />
+                    <span>Delete</span>
+                  </button>
+                </div>
+              )}
+            </div>
           );
         })}
+
+        {/* + COLLECTION KEY */}
+        <button
+          onClick={() => {
+            setNewCollectionName('');
+            setCreateCollectionModalOpen(true);
+          }}
+          className="px-2.5 py-1 rounded-md font-mono text-[11px] whitespace-nowrap transition-all machine-btn text-cyan-400 hover:text-cyan-300 border-cyan-500/40 flex items-center gap-1 shrink-0"
+        >
+          <FolderPlus className="w-3 h-3 text-cyan-400" />
+          <span>+ COLLECTION</span>
+        </button>
       </div>
 
       {/* Loading Skeleton */}
@@ -575,161 +924,233 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
 
       {/* Video Cards List */}
       <div className="space-y-3">
-        {filteredVideos.map((video) => (
-          <div
-            key={video.id || video.uri}
-            className="machine-surface group relative p-3 rounded-xl flex flex-col gap-2.5 transition-all duration-150"
-          >
-            <div className="flex gap-3 items-center">
-              {/* Thumbnail with Play Key */}
-              <button
-                onClick={() => handlePlay(video)}
-                className="relative w-22 h-15 rounded-lg overflow-hidden bg-slate-950 shrink-0 border border-slate-800 group-hover:border-cyan-400/60 transition-colors text-left"
-              >
-                {video.thumbnail ? (
-                  <img
-                    src={video.thumbnail}
-                    alt={video.title}
-                    className="w-full h-full object-cover"
-                    loading="lazy"
-                  />
-                ) : (
-                  <div className="w-full h-full flex items-center justify-center text-slate-700">
-                    <Film className="w-6 h-6" />
-                  </div>
+        {filteredVideos.map((video) => {
+          const mediaKey = getVideoKey(video);
+          const isFav = favorites.includes(mediaKey);
+          const isSelected = selectedUris.has(video.uri);
+
+          return (
+            <div
+              key={video.id || video.uri}
+              onTouchStart={() => handleCardPressStart(video.uri)}
+              onTouchEnd={handleCardPressEnd}
+              onMouseDown={() => handleCardPressStart(video.uri)}
+              onMouseUp={handleCardPressEnd}
+              onClick={() => {
+                if (isMultiSelectMode) {
+                  handleToggleSelectUri(video.uri);
+                }
+              }}
+              className={`machine-surface group relative p-3 rounded-xl flex flex-col gap-2.5 transition-all duration-150 ${
+                isSelected ? 'border-cyan-400/80 bg-cyan-950/20 shadow-[0_0_12px_rgba(0,240,255,0.15)]' : ''
+              }`}
+            >
+              <div className="flex gap-3 items-center">
+                {/* Multi-select Checkbox */}
+                {isMultiSelectMode && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleToggleSelectUri(video.uri);
+                    }}
+                    className="p-1 text-cyan-400 shrink-0"
+                  >
+                    {isSelected ? (
+                      <CheckSquare className="w-5 h-5 text-cyan-400" />
+                    ) : (
+                      <Square className="w-5 h-5 text-slate-600 hover:text-slate-400" />
+                    )}
+                  </button>
                 )}
 
-                {/* Dark Vignette & Play */}
-                <div className="absolute inset-0 bg-black/40 flex items-center justify-center group-hover:bg-black/20 transition-all">
-                  <div className="w-7 h-7 rounded-full bg-cyan-400 text-slate-950 flex items-center justify-center shadow-[0_0_8px_rgba(0,240,255,0.7)]">
-                    <Play className="w-3.5 h-3.5 fill-slate-950 translate-x-0.5" />
+                {/* Thumbnail with Play Key */}
+                <button
+                  onClick={(e) => {
+                    if (isMultiSelectMode) {
+                      e.stopPropagation();
+                      handleToggleSelectUri(video.uri);
+                    } else {
+                      handlePlay(video);
+                    }
+                  }}
+                  className="relative w-22 h-15 rounded-lg overflow-hidden bg-slate-950 shrink-0 border border-slate-800 group-hover:border-cyan-400/60 transition-colors text-left"
+                >
+                  {video.thumbnail ? (
+                    <img
+                      src={video.thumbnail}
+                      alt={video.title}
+                      className="w-full h-full object-cover"
+                      loading="lazy"
+                    />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center text-slate-700">
+                      <Film className="w-6 h-6" />
+                    </div>
+                  )}
+
+                  {/* Dark Vignette & Play */}
+                  <div className="absolute inset-0 bg-black/40 flex items-center justify-center group-hover:bg-black/20 transition-all">
+                    <div className="w-7 h-7 rounded-full bg-cyan-400 text-slate-950 flex items-center justify-center shadow-[0_0_8px_rgba(0,240,255,0.7)]">
+                      <Play className="w-3.5 h-3.5 fill-slate-950 translate-x-0.5" />
+                    </div>
+                  </div>
+
+                  {video.durationMs > 0 && (
+                    <span className="absolute bottom-1 right-1 px-1 py-0.2 rounded bg-black/80 font-mono text-[9px] text-white">
+                      {formatDuration(video.durationMs)}
+                    </span>
+                  )}
+                </button>
+
+                {/* Title & Info */}
+                <div className="flex-1 min-w-0 pr-1">
+                  <h4
+                    onClick={() => {
+                      if (isMultiSelectMode) {
+                        handleToggleSelectUri(video.uri);
+                      } else {
+                        handlePlay(video);
+                      }
+                    }}
+                    className="font-mono text-xs font-bold text-white truncate cursor-pointer hover:text-cyan-300 transition"
+                    title={video.title}
+                  >
+                    {video.title}
+                  </h4>
+
+                  <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+                    <span
+                      className={`uppercase px-1.5 py-0.2 rounded border text-[10px] font-mono tracking-wider font-bold ${getPlatformBadgeStyle(
+                        video.platform
+                      )}`}
+                    >
+                      {video.platform || 'Other'}
+                    </span>
+
+                    <span className="font-mono text-[11px] text-slate-400">
+                      {formatSize(video.size)}
+                    </span>
+
+                    {video.dateAdded > 0 && (
+                      <span className="flex items-center gap-1 font-mono text-[10px] text-slate-500">
+                        <Clock className="w-3 h-3" />
+                        {formatDate(video.dateAdded)}
+                      </span>
+                    )}
                   </div>
                 </div>
+              </div>
 
-                {video.durationMs > 0 && (
-                  <span className="absolute bottom-1 right-1 px-1 py-0.2 rounded bg-black/80 font-mono text-[9px] text-white">
-                    {formatDuration(video.durationMs)}
-                  </span>
-                )}
-              </button>
-
-              {/* Title & Info */}
-              <div className="flex-1 min-w-0 pr-1">
-                <h4
-                  onClick={() => handlePlay(video)}
-                  className="font-mono text-xs font-bold text-white truncate cursor-pointer hover:text-cyan-300 transition"
-                  title={video.title}
-                >
-                  {video.title}
-                </h4>
-
-                <div className="flex items-center gap-2 mt-1.5 flex-wrap">
-                  <span
-                    className={`uppercase px-1.5 py-0.2 rounded border text-[10px] font-mono tracking-wider font-bold ${getPlatformBadgeStyle(
-                      video.platform
-                    )}`}
+              {/* Bottom Row: Play Button, Favorite Star & 3-Dot Menu */}
+              <div className="flex items-center justify-between pt-2 border-t border-slate-800/80">
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => handlePlay(video)}
+                    className="machine-btn px-3 py-1 rounded-md text-xs font-mono font-bold text-cyan-300 flex items-center gap-1.5"
                   >
-                    {video.platform || 'Other'}
-                  </span>
+                    <Play className="w-3 h-3 fill-cyan-400" />
+                    <span>PLAY</span>
+                  </button>
 
-                  <span className="font-mono text-[11px] text-slate-400">
-                    {formatSize(video.size)}
-                  </span>
+                  <button
+                    onClick={(e) => handleToggleFavorite(video, e)}
+                    className={`machine-btn p-1.5 rounded-md transition-all ${
+                      isFav
+                        ? 'text-amber-400 border-amber-500/50 shadow-[0_0_8px_rgba(251,191,36,0.3)] bg-amber-950/20'
+                        : 'text-slate-400 hover:text-amber-300'
+                    }`}
+                    title={isFav ? 'Remove from Favorites' : 'Add to Favorites'}
+                  >
+                    <Star className={`w-3.5 h-3.5 ${isFav ? 'fill-amber-400' : ''}`} />
+                  </button>
+                </div>
 
-                  {video.dateAdded > 0 && (
-                    <span className="flex items-center gap-1 font-mono text-[10px] text-slate-500">
-                      <Clock className="w-3 h-3" />
-                      {formatDate(video.dateAdded)}
-                    </span>
+                <div className="relative">
+                  {/* 3-Dot Trigger */}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setActiveMenuId(activeMenuId === video.uri ? null : video.uri);
+                    }}
+                    className="machine-btn p-1.5 rounded-md text-slate-400 hover:text-cyan-300"
+                    title="Card options"
+                  >
+                    <MoreVertical className="w-3.5 h-3.5" />
+                  </button>
+
+                  {/* 3-Dot Dropdown Menu (Rename, Add to Collection, Share, Delete) */}
+                  {activeMenuId === video.uri && (
+                    <div
+                      onClick={(e) => e.stopPropagation()}
+                      className="absolute right-0 bottom-full mb-1 w-44 rounded-lg bg-slate-950 border border-cyan-500/40 shadow-2xl p-1 z-30 font-mono text-xs space-y-0.5 animate-fade-in"
+                    >
+                      <button
+                        onClick={() => handleOpenRename(video)}
+                        className="w-full px-2.5 py-1.5 rounded flex items-center gap-2 text-slate-300 hover:bg-slate-800 hover:text-cyan-300 text-left"
+                      >
+                        <Edit3 className="w-3.5 h-3.5 text-cyan-400" />
+                        <span>Rename</span>
+                      </button>
+                      <button
+                        onClick={() => {
+                          setActiveMenuId(null);
+                          setTargetVideosForCollection([video]);
+                          setAddToCollectionModalOpen(true);
+                        }}
+                        className="w-full px-2.5 py-1.5 rounded flex items-center gap-2 text-slate-300 hover:bg-slate-800 hover:text-cyan-300 text-left"
+                      >
+                        <Folder className="w-3.5 h-3.5 text-purple-400" />
+                        <span>Add to Collection</span>
+                      </button>
+                      <button
+                        onClick={() => {
+                          setActiveMenuId(null);
+                          handleShare(video);
+                        }}
+                        className="w-full px-2.5 py-1.5 rounded flex items-center gap-2 text-slate-300 hover:bg-slate-800 hover:text-cyan-300 text-left"
+                      >
+                        <Share2 className="w-3.5 h-3.5 text-cyan-400" />
+                        <span>Share</span>
+                      </button>
+                      <button
+                        onClick={() => {
+                          setActiveMenuId(null);
+                          setDeleteConfirmId(video.uri);
+                        }}
+                        className="w-full px-2.5 py-1.5 rounded flex items-center gap-2 text-rose-400 hover:bg-rose-950/50 text-left"
+                      >
+                        <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                        <span>Delete</span>
+                      </button>
+                    </div>
                   )}
                 </div>
               </div>
-            </div>
 
-            {/* Bottom Row: Play Button & 3-Dot Menu */}
-            <div className="flex items-center justify-between pt-2 border-t border-slate-800/80">
-              <button
-                onClick={() => handlePlay(video)}
-                className="machine-btn px-3 py-1 rounded-md text-xs font-mono font-bold text-cyan-300 flex items-center gap-1.5"
-              >
-                <Play className="w-3 h-3 fill-cyan-400" />
-                <span>PLAY</span>
-              </button>
-
-              <div className="relative">
-                {/* 3-Dot Trigger */}
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setActiveMenuId(activeMenuId === video.uri ? null : video.uri);
-                  }}
-                  className="machine-btn p-1.5 rounded-md text-slate-400 hover:text-cyan-300"
-                  title="Card options"
-                >
-                  <MoreVertical className="w-3.5 h-3.5" />
-                </button>
-
-                {/* 3-Dot Dropdown Menu (Rename, Share, Delete) */}
-                {activeMenuId === video.uri && (
-                  <div
-                    onClick={(e) => e.stopPropagation()}
-                    className="absolute right-0 bottom-full mb-1 w-36 rounded-lg bg-slate-950 border border-cyan-500/40 shadow-2xl p-1 z-30 font-mono text-xs space-y-0.5 animate-fade-in"
-                  >
+              {/* In-place Delete Confirmation */}
+              {deleteConfirmId === video.uri && (
+                <div className="p-2 rounded-lg bg-rose-950/60 border border-rose-500/50 flex items-center justify-between font-mono text-xs animate-fade-in">
+                  <span className="text-rose-200">Confirm file deletion?</span>
+                  <div className="flex items-center gap-1.5">
                     <button
-                      onClick={() => handleOpenRename(video)}
-                      className="w-full px-2.5 py-1.5 rounded flex items-center gap-2 text-slate-300 hover:bg-slate-800 hover:text-cyan-300 text-left"
+                      onClick={() => handleDelete(video)}
+                      disabled={isDeleting}
+                      className="px-2.5 py-1 rounded bg-rose-600 hover:bg-rose-500 text-white font-bold disabled:opacity-50"
                     >
-                      <Edit3 className="w-3.5 h-3.5 text-cyan-400" />
-                      <span>Rename</span>
+                      DELETE
                     </button>
                     <button
-                      onClick={() => {
-                        setActiveMenuId(null);
-                        handleShare(video);
-                      }}
-                      className="w-full px-2.5 py-1.5 rounded flex items-center gap-2 text-slate-300 hover:bg-slate-800 hover:text-cyan-300 text-left"
+                      onClick={() => setDeleteConfirmId(null)}
+                      className="px-2 py-1 rounded bg-slate-800 text-slate-300"
                     >
-                      <Share2 className="w-3.5 h-3.5 text-cyan-400" />
-                      <span>Share</span>
-                    </button>
-                    <button
-                      onClick={() => {
-                        setActiveMenuId(null);
-                        setDeleteConfirmId(video.uri);
-                      }}
-                      className="w-full px-2.5 py-1.5 rounded flex items-center gap-2 text-rose-400 hover:bg-rose-950/50 text-left"
-                    >
-                      <Trash2 className="w-3.5 h-3.5 text-rose-400" />
-                      <span>Delete</span>
+                      CANCEL
                     </button>
                   </div>
-                )}
-              </div>
-            </div>
-
-            {/* In-place Delete Confirmation */}
-            {deleteConfirmId === video.uri && (
-              <div className="p-2 rounded-lg bg-rose-950/60 border border-rose-500/50 flex items-center justify-between font-mono text-xs animate-fade-in">
-                <span className="text-rose-200">Confirm file deletion?</span>
-                <div className="flex items-center gap-1.5">
-                  <button
-                    onClick={() => handleDelete(video)}
-                    disabled={isDeleting}
-                    className="px-2.5 py-1 rounded bg-rose-600 hover:bg-rose-500 text-white font-bold disabled:opacity-50"
-                  >
-                    DELETE
-                  </button>
-                  <button
-                    onClick={() => setDeleteConfirmId(null)}
-                    className="px-2 py-1 rounded bg-slate-800 text-slate-300"
-                  >
-                    CANCEL
-                  </button>
                 </div>
-              </div>
-            )}
-          </div>
-        ))}
+              )}
+            </div>
+          );
+        })}
       </div>
 
       {/* Find Duplicates Modal */}
@@ -892,6 +1313,253 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
                 className="machine-btn-primary px-4 py-1.5 rounded-lg font-mono text-xs uppercase"
               >
                 {isRenaming ? 'SAVING...' : 'SAVE CHANGES'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Floating Multi-Select Action Bar */}
+      {(isMultiSelectMode || selectedUris.size > 0) && (
+        <div className="fixed bottom-20 left-4 right-4 z-40 p-2.5 rounded-xl bg-slate-950/95 border border-cyan-500/50 shadow-[0_0_25px_rgba(0,240,255,0.25)] flex items-center justify-between gap-2 font-mono text-xs animate-in slide-in-from-bottom duration-200">
+          <div className="flex items-center gap-2 pl-1">
+            <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+            <span className="font-bold text-white uppercase tracking-wider">
+              {selectedUris.size} SELECTED
+            </span>
+          </div>
+
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <button
+              onClick={handleSelectAll}
+              className="machine-btn px-2 py-1 rounded text-[11px] text-slate-300 hover:text-white"
+            >
+              ALL
+            </button>
+            <button
+              onClick={handleFavoriteSelected}
+              className="machine-btn px-2 py-1 rounded text-[11px] text-amber-400 hover:text-amber-300 flex items-center gap-1"
+              title="Toggle Favorite"
+            >
+              <Star className="w-3 h-3 fill-amber-400" />
+              <span>STAR</span>
+            </button>
+            <button
+              onClick={() => {
+                const targetVids = videos.filter((v) => selectedUris.has(v.uri));
+                setTargetVideosForCollection(targetVids);
+                setAddToCollectionModalOpen(true);
+              }}
+              className="machine-btn px-2 py-1 rounded text-[11px] text-purple-400 hover:text-purple-300 flex items-center gap-1"
+              title="Add to Collection"
+            >
+              <Folder className="w-3 h-3 text-purple-400" />
+              <span>COLLECT</span>
+            </button>
+            <button
+              onClick={handleDeleteSelected}
+              className="machine-btn-danger px-2 py-1 rounded text-[11px] font-bold text-rose-300 hover:text-white flex items-center gap-1"
+              title="Delete Selected"
+            >
+              <Trash2 className="w-3 h-3" />
+              <span>DEL</span>
+            </button>
+            <button
+              onClick={handleClearSelection}
+              className="machine-btn px-2 py-1 rounded text-[11px] text-slate-400 hover:text-white"
+              title="Cancel Selection"
+            >
+              <X className="w-3 h-3" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Create Collection Modal */}
+      {createCollectionModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="machine-surface w-full max-w-sm rounded-xl p-4 space-y-3.5 shadow-2xl border border-cyan-500/40">
+            <div className="flex items-center justify-between pb-2 border-b border-cyan-500/20">
+              <div className="flex items-center gap-2">
+                <FolderPlus className="w-4 h-4 text-cyan-400" />
+                <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
+                  NEW COLLECTION
+                </h3>
+              </div>
+              <button
+                onClick={() => setCreateCollectionModalOpen(false)}
+                className="text-slate-400 hover:text-white"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-2">
+              <label className="block text-[10px] font-mono text-slate-400 uppercase">
+                COLLECTION NAME
+              </label>
+              <input
+                type="text"
+                autoFocus
+                placeholder="e.g. Anime edits, Car clips, Dance"
+                value={newCollectionName}
+                onChange={(e) => setNewCollectionName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleCreateCollection();
+                }}
+                className="w-full rounded-lg bg-slate-950 border border-slate-800 focus:border-cyan-400 px-3 py-2 font-mono text-xs text-white outline-none"
+              />
+            </div>
+
+            <div className="pt-2 flex items-center justify-end gap-2">
+              <button
+                onClick={() => setCreateCollectionModalOpen(false)}
+                className="machine-btn px-3 py-1.5 rounded-lg font-mono text-xs text-slate-400"
+              >
+                CANCEL
+              </button>
+              <button
+                onClick={handleCreateCollection}
+                disabled={!newCollectionName.trim()}
+                className="machine-btn-primary px-4 py-1.5 rounded-lg font-mono text-xs font-bold uppercase disabled:opacity-50"
+              >
+                CREATE
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Rename Collection Modal */}
+      {renameCollectionTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="machine-surface w-full max-w-sm rounded-xl p-4 space-y-3.5 shadow-2xl border border-purple-500/40">
+            <div className="flex items-center justify-between pb-2 border-b border-purple-500/20">
+              <div className="flex items-center gap-2">
+                <Edit3 className="w-4 h-4 text-purple-400" />
+                <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
+                  RENAME COLLECTION
+                </h3>
+              </div>
+              <button
+                onClick={() => setRenameCollectionTarget(null)}
+                className="text-slate-400 hover:text-white"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-2">
+              <label className="block text-[10px] font-mono text-slate-400 uppercase">
+                NEW NAME
+              </label>
+              <input
+                type="text"
+                autoFocus
+                value={newCollectionName}
+                onChange={(e) => setNewCollectionName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleSaveRenameCollection();
+                }}
+                className="w-full rounded-lg bg-slate-950 border border-slate-800 focus:border-purple-400 px-3 py-2 font-mono text-xs text-white outline-none"
+              />
+            </div>
+
+            <div className="pt-2 flex items-center justify-end gap-2">
+              <button
+                onClick={() => setRenameCollectionTarget(null)}
+                className="machine-btn px-3 py-1.5 rounded-lg font-mono text-xs text-slate-400"
+              >
+                CANCEL
+              </button>
+              <button
+                onClick={handleSaveRenameCollection}
+                disabled={!newCollectionName.trim()}
+                className="machine-btn-primary px-4 py-1.5 rounded-lg font-mono text-xs font-bold uppercase disabled:opacity-50"
+              >
+                SAVE
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Add To Collection Modal */}
+      {addToCollectionModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="machine-surface w-full max-w-sm max-h-[80vh] flex flex-col rounded-xl p-4 space-y-3 shadow-2xl border border-purple-500/40">
+            <div className="flex items-center justify-between pb-2 border-b border-purple-500/20">
+              <div className="flex items-center gap-2">
+                <Folder className="w-4 h-4 text-purple-400" />
+                <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
+                  ADD TO COLLECTION
+                </h3>
+              </div>
+              <button
+                onClick={() => {
+                  setAddToCollectionModalOpen(false);
+                  setTargetVideosForCollection([]);
+                }}
+                className="text-slate-400 hover:text-white"
+              >
+                ✕
+              </button>
+            </div>
+
+            <p className="font-mono text-[11px] text-slate-400">
+              Select collection for {targetVideosForCollection.length} clip{targetVideosForCollection.length > 1 ? 's' : ''}:
+            </p>
+
+            <div className="space-y-1.5 overflow-y-auto max-h-56 pr-1">
+              {collections.length === 0 ? (
+                <div className="p-3 text-center rounded-lg bg-slate-950 border border-slate-800 font-mono text-xs text-slate-500">
+                  No collections yet. Create your first one below.
+                </div>
+              ) : (
+                collections.map((col) => {
+                  const targetKeys = targetVideosForCollection.map(getVideoKey);
+                  const allAlreadyIn = targetKeys.every((k) => col.videoKeys.includes(k));
+
+                  return (
+                    <button
+                      key={col.id}
+                      onClick={() => handleAddVideosToCollection(col.id)}
+                      className="w-full p-2.5 rounded-lg bg-slate-950 border border-slate-800 hover:border-purple-500/60 flex items-center justify-between transition-colors text-left"
+                    >
+                      <div className="flex items-center gap-2 font-mono text-xs text-slate-200">
+                        <Folder className="w-3.5 h-3.5 text-purple-400 shrink-0" />
+                        <span className="font-bold truncate">{col.name}</span>
+                      </div>
+                      <span className="font-mono text-[10px] text-slate-400 shrink-0">
+                        {allAlreadyIn ? 'ALREADY ADDED' : `${col.videoKeys.length} items`}
+                      </span>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+
+            <div className="pt-2 border-t border-slate-800 flex items-center justify-between gap-2">
+              <button
+                onClick={() => {
+                  setAddToCollectionModalOpen(false);
+                  setNewCollectionName('');
+                  setCreateCollectionModalOpen(true);
+                }}
+                className="machine-btn px-2.5 py-1.5 rounded-lg font-mono text-xs text-cyan-400 hover:text-cyan-300 flex items-center gap-1"
+              >
+                <Plus className="w-3 h-3" />
+                <span>NEW</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  setAddToCollectionModalOpen(false);
+                  setTargetVideosForCollection([]);
+                }}
+                className="machine-btn px-3 py-1.5 rounded-lg font-mono text-xs text-slate-400"
+              >
+                CANCEL
               </button>
             </div>
           </div>

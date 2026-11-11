@@ -2056,6 +2056,8 @@ class FloatingBubbleService : Service() {
                     }
                     VideoDownloaderPlugin.saveHistoryEntry(this@FloatingBubbleService, historyEntry)
                     VideoDownloaderPlugin.instance?.emitNativeDownloadFinished(historyEntry)
+                    VideoDownloaderPlugin.removeFailedLinkByUrl(this@FloatingBubbleService, normalizedUrl)
+                    VideoDownloaderPlugin.recordDownloadStat(this@FloatingBubbleService, "TikTok", "photo", (totalPhotos.toLong() * 800L * 1024L))
 
                     NotificationHelper.showDownloadFinishedNotification(
                         this@FloatingBubbleService,
@@ -2230,6 +2232,8 @@ class FloatingBubbleService : Service() {
                 }
                 VideoDownloaderPlugin.saveHistoryEntry(this, historyEntry)
                 VideoDownloaderPlugin.instance?.emitNativeDownloadFinished(historyEntry)
+                VideoDownloaderPlugin.removeFailedLinkByUrl(this, normalizedUrl)
+                VideoDownloaderPlugin.recordDownloadStat(this, cleanPlatform, if (isAudio) "audio" else "video", bytesCopied)
 
                 NotificationHelper.showDownloadFinishedNotification(
                     this,
@@ -2294,6 +2298,9 @@ class FloatingBubbleService : Service() {
                     val rawMsg = e.message ?: "Failed"
                     val shortReason = parseShortServerError(rawMsg)
                     lastFailedUrl = normalizedUrl
+                    val failPlat = VideoDownloaderPlugin.detectPlatformName(normalizedUrl)
+                    VideoDownloaderPlugin.recordFailedLink(this@FloatingBubbleService, normalizedUrl, failPlat, title, shortReason)
+                    VideoDownloaderPlugin.recordFailedStat(this@FloatingBubbleService)
                     mainHandler.post {
                         progressStatusText?.text = "Failed: $shortReason"
                         progressSpeedText?.text = "ERR"

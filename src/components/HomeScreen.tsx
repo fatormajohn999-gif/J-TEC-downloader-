@@ -14,9 +14,11 @@ import {
   Music,
   ExternalLink,
   Images,
+  Copy,
+  X,
 } from 'lucide-react';
 import { Capacitor } from '@capacitor/core';
-import { VideoInfo, AppSettings, PlatformType, DownloadHistoryItem } from '../types';
+import { VideoInfo, AppSettings, PlatformType, DownloadHistoryItem, FailedDownloadItem } from '../types';
 import { isSupportedUrl, fetchVideoInfo, downloadVideoFile, wakeUpServerUntilReady, normalizeUrl } from '../services/api';
 import { VideoDownloader } from '../plugins/videoDownloader';
 
@@ -79,6 +81,37 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     title: string;
     fileName: string;
   } | null>(null);
+
+  // Failed downloads modal state
+  const [failedLinks, setFailedLinks] = useState<FailedDownloadItem[]>([]);
+  const [failedModalOpen, setFailedModalOpen] = useState<boolean>(false);
+  const [copiedFailedId, setCopiedFailedId] = useState<string | null>(null);
+
+  const loadFailedLinks = React.useCallback(async () => {
+    try {
+      const res = await VideoDownloader.getFailedLinks();
+      if (res && Array.isArray(res.failedLinks)) {
+        setFailedLinks(res.failedLinks);
+      }
+    } catch (e) {
+      console.warn('Failed to load failed links:', e);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadFailedLinks();
+    let handle: any = null;
+    (async () => {
+      try {
+        handle = await VideoDownloader.addListener('onFailedLinksChanged', () => {
+          loadFailedLinks();
+        });
+      } catch {}
+    })();
+    return () => {
+      if (handle && handle.remove) handle.remove();
+    };
+  }, [loadFailedLinks]);
 
   // Sync if pendingUrl was passed from Share Target or Clipboard detector
   useEffect(() => {
@@ -288,6 +321,66 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     );
   };
 
+  const handleRetryFailedItem = async (item: FailedDownloadItem) => {
+    setFailedModalOpen(false);
+    setInputUrl(item.url);
+    if (isNative) {
+      try {
+        await VideoDownloader.retryFailedLink({ id: item.id });
+      } catch {
+        inspectUrl(item.url);
+      }
+    } else {
+      inspectUrl(item.url);
+    }
+  };
+
+  const handleCopyFailed = async (item: FailedDownloadItem) => {
+    try {
+      await navigator.clipboard.writeText(item.url);
+      setCopiedFailedId(item.id);
+      setTimeout(() => setCopiedFailedId(null), 2000);
+    } catch {}
+  };
+
+  const handleDeleteFailed = async (id: string) => {
+    try {
+      await VideoDownloader.removeFailedLink({ id });
+      loadFailedLinks();
+    } catch {}
+  };
+
+  const handleClearAllFailed = async () => {
+    try {
+      await VideoDownloader.clearFailedLinks();
+      setFailedLinks([]);
+      setFailedModalOpen(false);
+    } catch {}
+  };
+
+  const handleRetryAllFailed = async () => {
+    if (failedLinks.length === 0) return;
+    setFailedModalOpen(false);
+    for (const item of failedLinks) {
+      try {
+        await VideoDownloader.retryFailedLink({ id: item.id });
+      } catch {}
+    }
+    setTimeout(loadFailedLinks, 1000);
+  };
+
+  const formatFailedTime = (timestamp: number) => {
+    if (!timestamp) return '';
+    const diff = Date.now() - timestamp;
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    const days = Math.floor(hrs / 24);
+    return `${days}d ago`;
+  };
+
   return (
     <div className="space-y-4 pb-28">
       {/* Backend Required Warning if unconfigured */}
@@ -356,7 +449,19 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
               PASTE LINK // INGESTION UNIT
             </h3>
           </div>
-          <span className="font-mono text-[10px] text-slate-400 uppercase">TIKTOK • YT • IG • FB</span>
+          <div className="flex items-center gap-2">
+            {failedLinks.length > 0 && (
+              <button
+                onClick={() => setFailedModalOpen(true)}
+                className="px-2 py-0.5 rounded-full font-mono text-[10px] font-bold bg-red-950 text-red-400 border border-red-500/80 shadow-[0_0_8px_rgba(239,68,68,0.4)] hover:bg-red-900 transition-all flex items-center gap-1.5 animate-pulse"
+                title="View failed downloads"
+              >
+                <AlertCircle className="w-3 h-3 text-red-400" />
+                <span>FAILED {failedLinks.length}</span>
+              </button>
+            )}
+            <span className="font-mono text-[10px] text-slate-400 uppercase">TIKTOK • YT • IG • FB</span>
+          </div>
         </div>
 
         {/* Input & Paste Key */}
@@ -630,6 +735,128 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           </span>
         </div>
       </div>
+
+      {/* FAILED DOWNLOADS MODAL */}
+      {failedModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-fade-in">
+          <div className="w-full max-w-lg max-h-[85vh] bg-slate-950 border border-red-500/40 rounded-t-2xl sm:rounded-2xl flex flex-col overflow-hidden shadow-[0_0_30px_rgba(239,68,68,0.25)]">
+            {/* Modal Header */}
+            <div className="p-4 border-b border-red-500/20 flex items-center justify-between bg-gradient-to-r from-red-950/40 to-slate-950">
+              <div className="flex items-center gap-2">
+                <span className="w-2.5 h-2.5 rounded-full bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.9)]" />
+                <div>
+                  <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-white">
+                    FAILED DOWNLOADS // RECOVERY
+                  </h3>
+                  <p className="text-[10px] font-mono text-red-400">
+                    {failedLinks.length} failed link{failedLinks.length === 1 ? '' : 's'} recorded
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setFailedModalOpen(false)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Modal Bulk Actions */}
+            <div className="p-3 border-b border-slate-800/80 bg-slate-900/60 flex items-center justify-between gap-2">
+              <button
+                onClick={handleRetryAllFailed}
+                className="machine-btn-primary flex-1 py-1.5 rounded-lg text-xs font-mono font-bold flex items-center justify-center gap-1.5"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>RETRY ALL ({failedLinks.length})</span>
+              </button>
+              <button
+                onClick={handleClearAllFailed}
+                className="machine-btn px-3 py-1.5 rounded-lg text-xs font-mono text-red-400 hover:text-red-300 flex items-center gap-1.5"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>CLEAR ALL</span>
+              </button>
+            </div>
+
+            {/* Failed Items List */}
+            <div className="p-3 overflow-y-auto space-y-2.5 flex-1 max-h-[55vh]">
+              {failedLinks.length === 0 ? (
+                <div className="p-8 text-center text-xs font-mono text-slate-500">
+                  NO FAILED LINKS
+                </div>
+              ) : (
+                failedLinks.map((item) => (
+                  <div
+                    key={item.id}
+                    className="p-3 rounded-xl bg-slate-900/80 border border-slate-800 hover:border-red-500/40 space-y-2 transition"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-1.5 mb-1">
+                          <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-slate-800 text-slate-300 border border-slate-700 uppercase">
+                            {item.platform || 'OTHER'}
+                          </span>
+                          <span className="text-[10px] font-mono text-slate-500">
+                            {item.attempts > 1 ? `${item.attempts} attempts • ` : ''}{formatFailedTime(item.failedAt)}
+                          </span>
+                        </div>
+                        <h4 className="font-mono text-xs font-bold text-white truncate" title={item.title}>
+                          {item.title && item.title !== 'video' ? item.title : item.url}
+                        </h4>
+                        <div className="font-mono text-[10px] text-slate-400 truncate mt-0.5">
+                          {item.url}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Reason in plain words */}
+                    <div className="px-2.5 py-1.5 rounded bg-red-950/40 border border-red-500/30 text-red-300 text-[11px] font-mono flex items-center gap-1.5">
+                      <AlertCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+                      <span className="truncate">{item.reason || 'Download failed'}</span>
+                    </div>
+
+                    {/* Action Keys: RETRY, COPY LINK and DELETE */}
+                    <div className="flex items-center gap-2 pt-1">
+                      <button
+                        onClick={() => handleRetryFailedItem(item)}
+                        className="machine-btn-primary flex-1 py-1 rounded-md text-xs font-mono font-bold flex items-center justify-center gap-1.5"
+                      >
+                        <RotateCcw className="w-3 h-3" />
+                        <span>RETRY</span>
+                      </button>
+                      <button
+                        onClick={() => handleCopyFailed(item)}
+                        className="machine-btn px-2.5 py-1 rounded-md text-xs font-mono text-slate-300 hover:text-white flex items-center gap-1"
+                        title="Copy link"
+                      >
+                        {copiedFailedId === item.id ? (
+                          <>
+                            <Check className="w-3 h-3 text-cyan-400" />
+                            <span className="text-cyan-400">COPIED</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3 h-3" />
+                            <span>COPY LINK</span>
+                          </>
+                        )}
+                      </button>
+                      <button
+                        onClick={() => handleDeleteFailed(item.id)}
+                        className="machine-btn p-1.5 rounded-md text-slate-400 hover:text-red-400"
+                        title="Delete entry"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

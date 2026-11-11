@@ -90,3 +90,49 @@ export interface UpdateProgressEvent {
   totalBytes: number;
   formattedMb: string;
 }
+
+export interface FailedDownloadItem {
+  id: string;
+  url: string;
+  platform: PlatformType;
+  title: string;
+  reason: string;
+  failedAt: number;
+  attempts: number;
+}
+
+export interface CollectionItem {
+  id: string;
+  name: string;
+  videoKeys: string[];
+  createdAt: number;
+}
+
+export interface FavoritesAndCollectionsData {
+  favorites: string[];
+  collections: CollectionItem[];
+}
+
+export interface DownloadStatRecord {
+  date: string; // YYYY-MM-DD
+  platform: string;
+  type: 'video' | 'photo' | 'audio';
+  bytes: number;
+}
+
+export interface DownloadStatsData {
+  totalDownloads: number;
+  totalBytes: number;
+  videoCount: number;
+  photoCount: number;
+  failedCount: number;
+  successRate: number;
+  platformCounts: Record<string, number>;
+  dailyStats: Array<{
+    date: string;
+    downloads: number;
+    bytes: number;
+  }>;
+  busiestDay: string;
+  averageBytes: number;
+}
