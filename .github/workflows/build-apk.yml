@@ -124,6 +124,7 @@ jobs:
               '    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />\n'
               '    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />\n'
               '    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />\n'
+              '    <uses-permission android:name="android.permission.VIBRATE" />\n'
               '    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />\n'
           )
           comps = (
@@ -131,8 +132,19 @@ jobs:
               '            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="floating_quick_download_bubble" />\n'
               '        </service>\n'
               '        <activity android:name="com.omnidrop.app.plugin.ClipboardBridgeActivity" android:theme="@android:style/Theme.Translucent.NoTitleBar" android:excludeFromRecents="true" android:launchMode="singleTask" android:exported="false" />\n'
+              '        <service android:name="com.omnidrop.app.plugin.QuickTileService" android:exported="true" android:label="OmniDrop Tab" android:icon="@android:drawable/stat_sys_download" android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">\n'
+              '            <intent-filter>\n'
+              '                <action android:name="android.service.quicksettings.action.QS_TILE" />\n'
+              '            </intent-filter>\n'
+              '        </service>\n'
+              '        <receiver android:name="com.omnidrop.app.plugin.OmniDropWidgetProvider" android:exported="true">\n'
+              '            <intent-filter>\n'
+              '                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />\n'
+              '            </intent-filter>\n'
+              '            <meta-data android:name="android.appwidget.provider" android:resource="@xml/omnidrop_widget_info" />\n'
+              '        </receiver>\n'
               '        <activity android:name="com.omnidrop.app.plugin.PhotoViewerActivity" android:exported="false" android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize" />\n'
-              '        <activity android:name="com.omnidrop.app.plugin.VideoPlayerActivity" android:exported="false" android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize" />\n'
+              '        <activity android:name="com.omnidrop.app.plugin.VideoPlayerActivity" android:exported="false" android:supportsPictureInPicture="true" android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize" />\n'
               '        <activity android:name="com.omnidrop.app.plugin.ShareActivity" android:exported="true" android:theme="@android:style/Theme.Translucent.NoTitleBar">\n'
               '            <intent-filter>\n'
               '                <action android:name="android.intent.action.SEND" />\n'
@@ -168,6 +180,60 @@ jobs:
           s = re.sub(r"versionCode\s+\d+", "versionCode " + run_no, s, count=1)
           s = re.sub(r'versionName\s+"[^"]*"', 'versionName "1.0.' + run_no + '"', s, count=1)
           open(p, "w").write(s)
+          # ---- Home-screen widget resources ----
+          res = "android/app/src/main/res"
+          for d in ("layout", "xml", "drawable"):
+              os.makedirs(res + "/" + d, exist_ok=True)
+          open(res + "/drawable/omnidrop_widget_bg.xml", "w").write("""<?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="#F20B0E14" />
+              <corners android:radius="18dp" />
+              <stroke android:width="1dp" android:color="#6600F0FF" />
+          </shape>
+          """)
+          open(res + "/layout/omnidrop_widget.xml", "w").write("""<?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/widget_root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="@drawable/omnidrop_widget_bg"
+              android:gravity="center"
+              android:orientation="vertical"
+              android:padding="8dp">
+              <ImageView
+                  android:id="@+id/widget_icon"
+                  android:layout_width="28dp"
+                  android:layout_height="28dp"
+                  android:src="@android:drawable/stat_sys_download" />
+              <TextView
+                  android:id="@+id/widget_title"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="4dp"
+                  android:text="PASTE &amp; DOWNLOAD"
+                  android:textColor="#00F0FF"
+                  android:textSize="11sp"
+                  android:textStyle="bold" />
+              <TextView
+                  android:id="@+id/widget_status"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="OmniDrop"
+                  android:textColor="#8899AA"
+                  android:textSize="9sp" />
+          </LinearLayout>
+          """)
+          open(res + "/xml/omnidrop_widget_info.xml", "w").write("""<?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:initialLayout="@layout/omnidrop_widget"
+              android:minWidth="110dp"
+              android:minHeight="70dp"
+              android:targetCellWidth="2"
+              android:targetCellHeight="1"
+              android:resizeMode="horizontal|vertical"
+              android:updatePeriodMillis="0"
+              android:widgetCategory="home_screen" />
+          """)
           print("Patched manifest and gradle, version 1.0." + run_no)
           PY
 
