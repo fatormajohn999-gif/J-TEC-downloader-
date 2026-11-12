@@ -8,12 +8,15 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.ClipDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.Icon
 import android.graphics.drawable.LayerDrawable
@@ -24,6 +27,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.MediaStore
+import android.text.TextUtils
 import android.util.Base64
 import android.util.Rational
 import android.util.TypedValue
@@ -32,6 +37,8 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.view.animation.AlphaAnimation
 import android.widget.FrameLayout
@@ -40,7 +47,13 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.SeekBar
 import android.widget.TextView
+import android.widget.Toast
 import android.widget.VideoView
+import java.io.File
+import java.io.PrintWriter
+import java.io.StringWriter
+import java.util.Date
+import java.util.HashSet
 import java.util.Locale
 import org.json.JSONArray
 import org.json.JSONObject

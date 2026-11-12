@@ -2130,6 +2130,7 @@ class FloatingBubbleService : Service() {
             var conn: HttpURLConnection? = null
             var input: InputStream? = null
             var output: OutputStream? = null
+            var title = "Video"
 
             try {
                 // Step 1: /health wake-up polling
@@ -2160,6 +2161,9 @@ class FloatingBubbleService : Service() {
                 if (isDownloadCancelled) throw InterruptedException("Cancelled")
 
                 if (!isReady) {
+                    val failPlat = VideoDownloaderPlugin.detectPlatformName(normalizedUrl)
+                    VideoDownloaderPlugin.recordFailedLink(this@FloatingBubbleService, normalizedUrl, failPlat, if (title.isNotBlank()) title else "Video", "Backend unreachable")
+                    VideoDownloaderPlugin.recordFailedStat(this@FloatingBubbleService)
                     mainHandler.post {
                         progressStatusText?.text = "Backend unreachable."
                         progressSpeedText?.text = "ERR"
@@ -2181,7 +2185,7 @@ class FloatingBubbleService : Service() {
                     progressStatusText?.text = "Extracting video metadata..."
                 }
 
-                var title = ""
+                title = "Video"
                 var thumbnail = ""
                 var uploader = "Creator"
                 var platform = ""

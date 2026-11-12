@@ -1752,7 +1752,7 @@ class VideoDownloaderPlugin : Plugin() {
                         errorText
                     }
 
-                    call.reject("Download failed: $cleanMsg")
+                    callToResolve?.reject("Download failed: $cleanMsg")
                     return@Thread
                 }
 
