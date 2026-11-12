@@ -72,6 +72,11 @@ export interface AppSettings {
   floatingHideInsideApp?: boolean;
   autoCheckUpdates?: boolean;
   skippedUpdateVersion?: number;
+  watchdogEnabled?: boolean;
+  watchdogPaused?: boolean;
+  watchdogInterval?: number;
+  watchdogActiveFrom?: string;
+  watchdogActiveTo?: string;
 }
 
 export interface AppUpdateInfo {

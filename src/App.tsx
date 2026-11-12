@@ -37,6 +37,11 @@ const DEFAULT_SETTINGS: AppSettings = {
   floatingVibrate: true,
   floatingHideInsideApp: true,
   autoCheckUpdates: true,
+  watchdogEnabled: false,
+  watchdogPaused: false,
+  watchdogInterval: 10,
+  watchdogActiveFrom: '07:00',
+  watchdogActiveTo: '23:00',
 };
 
 export default function App() {

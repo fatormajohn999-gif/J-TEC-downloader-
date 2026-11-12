@@ -58,3 +58,16 @@ inside the <manifest> and <application> tags.
         <data android:mimeType="text/plain" />
     </intent-filter>
 </activity>
+
+<!-- Quick Settings Tile for Edge Tab Toggle -->
+<service
+    android:name="com.omnidrop.app.plugin.QuickTileService"
+    android:icon="@android:drawable/stat_sys_download"
+    android:label="OmniDrop Tab"
+    android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+    android:exported="true">
+    <intent-filter>
+        <action android:name="android.service.quicksettings.action.QS_TILE" />
+    </intent-filter>
+</service>
+

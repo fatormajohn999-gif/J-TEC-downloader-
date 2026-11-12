@@ -22,6 +22,7 @@ import {
   Plus,
   CheckSquare,
   Square,
+  Music,
 } from 'lucide-react';
 import { VideoLibraryItem, PlatformType, CollectionItem } from '../types';
 import { VideoDownloader } from '../plugins/videoDownloader';
@@ -95,6 +96,79 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
       if (h2 && h2.remove) h2.remove();
     };
   }, [loadFavoritesAndCollections]);
+
+  // Audio extraction modal state
+  const [audioExtractModal, setAudioExtractModal] = useState<{
+    isOpen: boolean;
+    video: VideoLibraryItem | null;
+    isExtracting: boolean;
+    progress: number;
+    resultUri: string | null;
+    resultFileName: string | null;
+    error: string | null;
+  }>({
+    isOpen: false,
+    video: null,
+    isExtracting: false,
+    progress: 0,
+    resultUri: null,
+    resultFileName: null,
+    error: null,
+  });
+
+  useEffect(() => {
+    let handle: any = null;
+    (async () => {
+      try {
+        handle = await VideoDownloader.addListener('audioExtractProgress', (data: { percent: number; title: string }) => {
+          setAudioExtractModal((prev) => (prev.isOpen ? { ...prev, progress: data.percent } : prev));
+        });
+      } catch {}
+    })();
+    return () => {
+      if (handle && handle.remove) handle.remove();
+    };
+  }, []);
+
+  const handleStartAudioExtraction = async (video: VideoLibraryItem) => {
+    setActiveMenuId(null);
+    setAudioExtractModal({
+      isOpen: true,
+      video,
+      isExtracting: true,
+      progress: 0,
+      resultUri: null,
+      resultFileName: null,
+      error: null,
+    });
+    try {
+      const res = await VideoDownloader.extractAudio({
+        uri: video.uri,
+        title: video.title,
+      });
+      if (res && res.success && res.uri) {
+        setAudioExtractModal((prev) => ({
+          ...prev,
+          isExtracting: false,
+          progress: 100,
+          resultUri: res.uri || null,
+          resultFileName: res.fileName || `${video.title}.m4a`,
+        }));
+      } else {
+        setAudioExtractModal((prev) => ({
+          ...prev,
+          isExtracting: false,
+          error: res?.error || 'Extraction failed: unsupported audio track',
+        }));
+      }
+    } catch (err: any) {
+      setAudioExtractModal((prev) => ({
+        ...prev,
+        isExtracting: false,
+        error: err?.message || 'Unsupported audio codec or extraction error',
+      }));
+    }
+  };
 
   // Duplicates modal state
   const [duplicateModalOpen, setDuplicateModalOpen] = useState(false);
@@ -1103,6 +1177,13 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
                         <span>Add to Collection</span>
                       </button>
                       <button
+                        onClick={() => handleStartAudioExtraction(video)}
+                        className="w-full px-2.5 py-1.5 rounded flex items-center gap-2 text-slate-300 hover:bg-slate-800 hover:text-cyan-300 text-left"
+                      >
+                        <Music className="w-3.5 h-3.5 text-cyan-400" />
+                        <span>Extract audio</span>
+                      </button>
+                      <button
                         onClick={() => {
                           setActiveMenuId(null);
                           handleShare(video);
@@ -1561,6 +1642,131 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
               >
                 CANCEL
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Audio Extraction Modal with Progress Bar and Open/Share */}
+      {audioExtractModal.isOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="machine-surface w-full max-w-sm rounded-xl p-5 space-y-4 shadow-2xl border border-cyan-500/40">
+            <div className="flex items-center justify-between pb-2 border-b border-cyan-500/20">
+              <div className="flex items-center gap-2">
+                <Music className="w-4 h-4 text-cyan-400" />
+                <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
+                  EXTRACT AUDIO // .M4A
+                </h3>
+              </div>
+              {!audioExtractModal.isExtracting && (
+                <button
+                  onClick={() => setAudioExtractModal((prev) => ({ ...prev, isOpen: false }))}
+                  className="text-slate-400 hover:text-white"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              )}
+            </div>
+
+            <div className="space-y-1">
+              <p className="font-mono text-xs text-white truncate font-bold" title={audioExtractModal.video?.title}>
+                {audioExtractModal.video?.title}
+              </p>
+              <p className="font-mono text-[10px] text-slate-400">
+                Direct demux to MPEG-4 Audio (.m4a) without lossy re-encoding
+              </p>
+            </div>
+
+            {/* Progress Bar Container */}
+            <div className="space-y-2">
+              <div className="h-2 w-full bg-slate-950 rounded-full overflow-hidden border border-slate-800">
+                <div
+                  style={{ width: `${audioExtractModal.progress}%` }}
+                  className={`h-full transition-all duration-150 ${
+                    audioExtractModal.error
+                      ? 'bg-rose-500'
+                      : audioExtractModal.progress === 100
+                      ? 'bg-emerald-400 shadow-[0_0_8px_rgba(16,185,129,0.7)]'
+                      : 'bg-cyan-400 shadow-[0_0_8px_rgba(0,240,255,0.7)]'
+                  }`}
+                />
+              </div>
+
+              <div className="flex justify-between font-mono text-[10px]">
+                <span className={audioExtractModal.error ? 'text-rose-400' : audioExtractModal.progress === 100 ? 'text-emerald-400' : 'text-cyan-300'}>
+                  {audioExtractModal.error
+                    ? 'Extraction failed'
+                    : audioExtractModal.progress === 100
+                    ? 'Saved to Music/OmniDrop'
+                    : `Demuxing audio track (${audioExtractModal.progress}%)...`}
+                </span>
+                <span className="text-slate-500 font-bold">{audioExtractModal.progress}%</span>
+              </div>
+            </div>
+
+            {/* Error Message if any */}
+            {audioExtractModal.error && (
+              <div className="p-3 rounded-lg bg-rose-950/60 border border-rose-500/40 font-mono text-[11px] text-rose-300 leading-relaxed">
+                {audioExtractModal.error}
+              </div>
+            )}
+
+            {/* Success details if finished */}
+            {!audioExtractModal.isExtracting && audioExtractModal.resultUri && !audioExtractModal.error && (
+              <div className="p-3 rounded-lg bg-emerald-950/40 border border-emerald-500/30 space-y-1 font-mono text-xs">
+                <div className="text-emerald-300 font-bold flex items-center gap-1.5">
+                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Audio Saved Successfully</span>
+                </div>
+                <div className="text-slate-400 text-[11px] truncate">
+                  {audioExtractModal.resultFileName}
+                </div>
+              </div>
+            )}
+
+            {/* Action buttons */}
+            <div className="pt-2 flex items-center justify-end gap-2 font-mono text-xs">
+              {!audioExtractModal.isExtracting && audioExtractModal.resultUri && !audioExtractModal.error ? (
+                <>
+                  <button
+                    onClick={() => {
+                      if (audioExtractModal.resultUri) {
+                        VideoDownloader.openAudio({ uri: audioExtractModal.resultUri });
+                      }
+                    }}
+                    className="machine-btn-primary px-3.5 py-1.5 rounded-lg flex items-center gap-1.5 text-slate-950 font-bold uppercase"
+                  >
+                    <span>OPEN AUDIO</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (audioExtractModal.resultUri) {
+                        VideoDownloader.shareAudio({
+                          uri: audioExtractModal.resultUri,
+                          title: audioExtractModal.resultFileName || undefined,
+                        });
+                      }
+                    }}
+                    className="machine-btn px-3.5 py-1.5 rounded-lg text-cyan-300 hover:text-white flex items-center gap-1.5"
+                  >
+                    <Share2 className="w-3.5 h-3.5" />
+                    <span>SHARE</span>
+                  </button>
+                  <button
+                    onClick={() => setAudioExtractModal((prev) => ({ ...prev, isOpen: false }))}
+                    className="machine-btn px-3 py-1.5 rounded-lg text-slate-400"
+                  >
+                    CLOSE
+                  </button>
+                </>
+              ) : !audioExtractModal.isExtracting ? (
+                <button
+                  onClick={() => setAudioExtractModal((prev) => ({ ...prev, isOpen: false }))}
+                  className="machine-btn px-4 py-1.5 rounded-lg text-slate-300"
+                >
+                  DISMISS
+                </button>
+              ) : null}
             </div>
           </div>
         </div>

@@ -1,18 +1,28 @@
 package com.omnidrop.app.plugin
 
 import android.app.Activity
+import android.app.StatusBarManager
+import android.content.ComponentName
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.drawable.Icon
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import java.util.concurrent.Executor
+import java.util.function.Consumer
 import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Base64
 import android.util.Size
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMuxer
+import android.os.ParcelFileDescriptor
 import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
 import com.getcapacitor.Plugin
@@ -20,8 +30,10 @@ import com.getcapacitor.PluginCall
 import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.nio.ByteBuffer
 import java.net.HttpURLConnection
 import java.net.URL
 import java.text.SimpleDateFormat
@@ -656,6 +668,157 @@ class VideoDownloaderPlugin : Plugin() {
                 }
             } catch (_: Exception) {}
         }
+
+        fun extractAudioDirect(
+            context: Context,
+            srcUri: Uri,
+            title: String?,
+            onProgress: ((Int) -> Unit)? = null,
+            onSuccess: ((outputUri: Uri, fileName: String) -> Unit)? = null,
+            onError: ((String) -> Unit)? = null
+        ) {
+            Thread {
+                var pfd: ParcelFileDescriptor? = null
+                var outPfd: ParcelFileDescriptor? = null
+                var extractor: MediaExtractor? = null
+                var muxer: MediaMuxer? = null
+                var outUri: Uri? = null
+
+                try {
+                    pfd = context.contentResolver.openFileDescriptor(srcUri, "r")
+                        ?: throw IOException("Cannot open video source file")
+
+                    extractor = MediaExtractor()
+                    extractor.setDataSource(pfd.fileDescriptor)
+
+                    var audioTrackIndex = -1
+                    var audioFormat: MediaFormat? = null
+                    for (i in 0 until extractor.trackCount) {
+                        val format = extractor.getTrackFormat(i)
+                        val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
+                        if (mime.startsWith("audio/")) {
+                            audioTrackIndex = i
+                            audioFormat = format
+                            break
+                        }
+                    }
+
+                    if (audioTrackIndex < 0 || audioFormat == null) {
+                        throw IllegalStateException("No audio track found in this video")
+                    }
+
+                    val mime = audioFormat.getString(MediaFormat.KEY_MIME) ?: ""
+
+                    var cleanTitle = (title ?: "OmniDrop_Audio").trim()
+                    if (cleanTitle.isBlank()) cleanTitle = "OmniDrop_Audio"
+                    cleanTitle = cleanTitle.replace("[\\\\/:*?\"<>|]".toRegex(), "_")
+                    if (cleanTitle.endsWith(".mp4", ignoreCase = true)) {
+                        cleanTitle = cleanTitle.substring(0, cleanTitle.length - 4)
+                    }
+                    if (cleanTitle.endsWith(".m4a", ignoreCase = true)) {
+                        cleanTitle = cleanTitle.substring(0, cleanTitle.length - 4)
+                    }
+                    val finalFileName = "$cleanTitle.m4a"
+
+                    val values = ContentValues().apply {
+                        this.put(MediaStore.Audio.Media.DISPLAY_NAME, finalFileName)
+                        this.put(MediaStore.Audio.Media.TITLE, cleanTitle)
+                        this.put(MediaStore.Audio.Media.MIME_TYPE, "audio/mp4")
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            this.put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/OmniDrop")
+                            this.put(MediaStore.Audio.Media.IS_PENDING, 1)
+                        }
+                    }
+
+                    outUri = context.contentResolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)
+                        ?: throw IOException("Could not create audio destination in Music/OmniDrop")
+
+                    outPfd = context.contentResolver.openFileDescriptor(outUri, "w")
+                        ?: throw IOException("Cannot write to audio destination in Music/OmniDrop")
+
+                    muxer = try {
+                        MediaMuxer(outPfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                    } catch (e: Exception) {
+                        throw IllegalArgumentException("Unsupported audio container for output: ${e.message}")
+                    }
+
+                    val muxerTrack = try {
+                        muxer.addTrack(audioFormat)
+                    } catch (e: Exception) {
+                        throw IllegalArgumentException("Unsupported audio codec ($mime) for M4A container")
+                    }
+
+                    muxer.start()
+                    extractor.selectTrack(audioTrackIndex)
+
+                    val durationUs = try {
+                        audioFormat.getLong(MediaFormat.KEY_DURATION)
+                    } catch (_: Throwable) { 0L }
+
+                    val maxBufferSize = try {
+                        audioFormat.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)
+                    } catch (_: Throwable) {
+                        64 * 1024
+                    }.coerceAtLeast(64 * 1024)
+
+                    val buffer = ByteBuffer.allocate(maxBufferSize)
+                    val bufferInfo = MediaCodec.BufferInfo()
+                    var lastProgressEmit = 0L
+
+                    while (true) {
+                        bufferInfo.offset = 0
+                        bufferInfo.size = extractor.readSampleData(buffer, 0)
+                        if (bufferInfo.size < 0) {
+                            bufferInfo.size = 0
+                            break
+                        }
+                        bufferInfo.presentationTimeUs = extractor.sampleTime
+                        bufferInfo.flags = extractor.sampleFlags
+                        muxer.writeSampleData(muxerTrack, buffer, bufferInfo)
+
+                        val now = System.currentTimeMillis()
+                        if (durationUs > 0L && now - lastProgressEmit > 120L) {
+                            lastProgressEmit = now
+                            val pct = ((bufferInfo.presentationTimeUs.toDouble() / durationUs.toDouble()) * 100.0).toInt().coerceIn(0, 99)
+                            onProgress?.invoke(pct)
+                        }
+                        extractor.advance()
+                    }
+
+                    muxer.stop()
+                    muxer.release()
+                    muxer = null
+
+                    outPfd.close()
+                    outPfd = null
+
+                    extractor.release()
+                    extractor = null
+
+                    pfd.close()
+                    pfd = null
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        val updateVals = ContentValues().apply {
+                            this.put(MediaStore.Audio.Media.IS_PENDING, 0)
+                        }
+                        context.contentResolver.update(outUri, updateVals, null, null)
+                    }
+
+                    onProgress?.invoke(100)
+                    onSuccess?.invoke(outUri, finalFileName)
+                } catch (t: Throwable) {
+                    try { muxer?.release() } catch (_: Throwable) {}
+                    try { outPfd?.close() } catch (_: Throwable) {}
+                    try { extractor?.release() } catch (_: Throwable) {}
+                    try { pfd?.close() } catch (_: Throwable) {}
+                    if (outUri != null) {
+                        try { context.contentResolver.delete(outUri, null, null) } catch (_: Throwable) {}
+                    }
+                    onError?.invoke(t.message ?: "Audio extraction failed")
+                }
+            }.start()
+        }
     }
 
     override fun load() {
@@ -1111,6 +1274,12 @@ class VideoDownloaderPlugin : Plugin() {
         val floatingHideInsideApp = call.getBoolean("floatingHideInsideApp", true) ?: true
         val autoCheckUpdates = call.getBoolean("autoCheckUpdates", true) ?: true
 
+        val watchdogEnabled = call.getBoolean("watchdogEnabled", false) ?: false
+        val watchdogPaused = call.getBoolean("watchdogPaused", false) ?: false
+        val watchdogInterval = call.getInt("watchdogInterval", 10) ?: 10
+        val watchdogActiveFrom = call.getString("watchdogActiveFrom") ?: "07:00"
+        val watchdogActiveTo = call.getString("watchdogActiveTo") ?: "23:00"
+
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().apply {
             this.putString("backend_url", backendUrl)
@@ -1126,6 +1295,12 @@ class VideoDownloaderPlugin : Plugin() {
             this.putBoolean("floating_vibrate", floatingVibrate)
             this.putBoolean("floating_hide_inside_app", floatingHideInsideApp)
             this.putBoolean("auto_check_updates", autoCheckUpdates)
+
+            this.putBoolean("watchdog_enabled", watchdogEnabled)
+            this.putBoolean("watchdog_paused", watchdogPaused)
+            this.putInt("watchdog_interval_minutes", watchdogInterval)
+            this.putString("watchdog_active_from", watchdogActiveFrom)
+            this.putString("watchdog_active_to", watchdogActiveTo)
             this.apply()
         }
 
@@ -1139,6 +1314,8 @@ class VideoDownloaderPlugin : Plugin() {
             floatingHideInsideApp,
             autoCheckUpdates
         )
+
+        FloatingBubbleService.syncService(context)
 
         val result = JSObject().apply {
             this.put("saved", true)
@@ -1195,13 +1372,12 @@ class VideoDownloaderPlugin : Plugin() {
         }
 
         try {
-            FloatingBubbleService.ensureNotificationChannel(ctx)
-            val serviceIntent = Intent(ctx, FloatingBubbleService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                ctx.startForegroundService(serviceIntent)
-            } else {
-                ctx.startService(serviceIntent)
+            val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            prefs.edit().apply {
+                this.putBoolean("floating_bubble_enabled", true)
+                this.apply()
             }
+            FloatingBubbleService.syncService(ctx)
 
             val res = JSObject().apply {
                 this.put("status", "running")
@@ -1215,7 +1391,8 @@ class VideoDownloaderPlugin : Plugin() {
 
     @PluginMethod
     fun isBubbleRunning(call: PluginCall) {
-        val isRunning = FloatingBubbleService.instance != null
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val isRunning = (FloatingBubbleService.instance != null) && prefs.getBoolean("floating_bubble_enabled", false)
         val res = JSObject().apply {
             this.put("running", isRunning)
         }
@@ -1234,13 +1411,152 @@ class VideoDownloaderPlugin : Plugin() {
     @PluginMethod
     fun stopBubble(call: PluginCall) {
         val ctx = context
-        val serviceIntent = Intent(ctx, FloatingBubbleService::class.java)
-        ctx.stopService(serviceIntent)
+        val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().apply {
+            this.putBoolean("floating_bubble_enabled", false)
+            this.apply()
+        }
+        FloatingBubbleService.syncService(ctx)
 
         val res = JSObject().apply {
             this.put("status", "stopped")
         }
         call.resolve(res)
+    }
+
+    @PluginMethod
+    fun requestAddQuickTile(call: PluginCall) {
+        val ctx = context ?: activity ?: run {
+            val res = JSObject().apply {
+                this.put("supported", false)
+                this.put("result", "manual")
+            }
+            call.resolve(res)
+            return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            try {
+                val statusBarManager = ctx.getSystemService(StatusBarManager::class.java)
+                if (statusBarManager == null) {
+                    val res = JSObject().apply {
+                        this.put("supported", false)
+                        this.put("result", "manual")
+                    }
+                    call.resolve(res)
+                    return
+                }
+
+                val comp = ComponentName(ctx, QuickTileService::class.java)
+                val icon = Icon.createWithResource(ctx, android.R.drawable.stat_sys_download)
+                val executor = Executor { command -> command.run() }
+                val callback = Consumer<Int> { resultCode ->
+                    val ret = JSObject().apply {
+                        this.put("supported", true)
+                        when (resultCode) {
+                            StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_ADDED -> {
+                                this.put("result", "added")
+                            }
+                            StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_ALREADY_ADDED -> {
+                                this.put("result", "already_added")
+                            }
+                            StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_NOT_ADDED -> {
+                                this.put("result", "declined")
+                            }
+                            else -> {
+                                this.put("result", "declined")
+                            }
+                        }
+                    }
+                    call.resolve(ret)
+                }
+
+                statusBarManager.requestAddTileService(
+                    comp,
+                    "OmniDrop Tab",
+                    icon,
+                    executor,
+                    callback
+                )
+            } catch (t: Throwable) {
+                val res = JSObject().apply {
+                    this.put("supported", false)
+                    this.put("result", "manual")
+                    this.put("error", t.message ?: "Unknown error")
+                }
+                call.resolve(res)
+            }
+        } else {
+            val res = JSObject().apply {
+                this.put("supported", false)
+                this.put("result", "manual")
+            }
+            call.resolve(res)
+        }
+    }
+
+    @PluginMethod
+    fun getWatchdogStatus(call: PluginCall) {
+        val ctx = context ?: activity ?: run {
+            call.reject("Context unavailable")
+            return
+        }
+        val p = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val isServiceRunning = FloatingBubbleService.instance != null
+        val watchdogEnabled = p.getBoolean("watchdog_enabled", false)
+        val isPaused = p.getBoolean("watchdog_paused", false)
+        val lastPingTime = p.getLong("watchdog_last_ping_time", 0L)
+        val lastPingMs = p.getInt("watchdog_last_ping_ms", -1)
+        val lastPingStatus = p.getString("watchdog_last_ping_status", "IDLE") ?: "IDLE"
+        val nextPingTime = p.getLong("watchdog_next_ping_time", 0L)
+        val pingsToday = p.getInt("watchdog_pings_today", 0)
+        val interval = p.getInt("watchdog_interval_minutes", 10)
+        val activeFrom = p.getString("watchdog_active_from", "07:00") ?: "07:00"
+        val activeTo = p.getString("watchdog_active_to", "23:00") ?: "23:00"
+
+        val currentMonthKey = SimpleDateFormat("yyyy-MM", Locale.US).format(Date())
+        val savedMonth = p.getString("watchdog_active_month_key", "")
+        val totalMinutes = if (savedMonth == currentMonthKey) {
+            p.getInt("watchdog_active_minutes_month", 0)
+        } else {
+            0
+        }
+        val estimatedHours = Math.round((totalMinutes / 60.0) * 10.0) / 10.0
+
+        val ret = JSObject().apply {
+            this.put("isRunning", isServiceRunning && watchdogEnabled)
+            this.put("isPaused", isPaused)
+            this.put("lastPingTime", lastPingTime)
+            this.put("lastPingMs", lastPingMs)
+            this.put("lastPingStatus", lastPingStatus)
+            this.put("nextPingTime", nextPingTime)
+            this.put("pingsToday", pingsToday)
+            this.put("estimatedHoursThisMonth", estimatedHours)
+            this.put("watchdogEnabled", watchdogEnabled)
+            this.put("watchdogInterval", interval)
+            this.put("watchdogActiveFrom", activeFrom)
+            this.put("watchdogActiveTo", activeTo)
+        }
+        call.resolve(ret)
+    }
+
+    @PluginMethod
+    fun setWatchdogPaused(call: PluginCall) {
+        val paused = call.getBoolean("paused", false) ?: false
+        val ctx = context ?: activity ?: run {
+            call.reject("Context unavailable")
+            return
+        }
+        val p = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        p.edit().apply {
+            this.putBoolean("watchdog_paused", paused)
+            this.apply()
+        }
+        FloatingBubbleService.instance?.syncViewsAndWatchdog()
+        val ret = JSObject().apply {
+            this.put("paused", paused)
+        }
+        call.resolve(ret)
     }
 
     @PluginMethod
@@ -2821,6 +3137,95 @@ class VideoDownloaderPlugin : Plugin() {
             this.put("reset", true)
         }
         call.resolve(ret)
+    }
+
+    // ==================== AUDIO EXTRACTOR PLUGIN METHODS ====================
+    @PluginMethod
+    fun extractAudio(call: PluginCall) {
+        val uriStr = call.getString("uri")
+        val title = call.getString("title") ?: "OmniDrop_Audio"
+        if (uriStr.isNullOrBlank()) {
+            call.reject("Missing required parameter: uri")
+            return
+        }
+        val srcUri = Uri.parse(uriStr)
+        extractAudioDirect(
+            context,
+            srcUri,
+            title,
+            onProgress = { pct ->
+                val data = JSObject().apply {
+                    this.put("percent", pct)
+                    this.put("title", title)
+                }
+                notifyListeners("audioExtractProgress", data)
+            },
+            onSuccess = { outUri, fileName ->
+                val ret = JSObject().apply {
+                    this.put("success", true)
+                    this.put("uri", outUri.toString())
+                    this.put("fileName", fileName)
+                    this.put("mimeType", "audio/mp4")
+                    this.put("relativePath", "Music/OmniDrop")
+                }
+                call.resolve(ret)
+            },
+            onError = { err ->
+                call.reject(err)
+            }
+        )
+    }
+
+    @PluginMethod
+    fun openAudio(call: PluginCall) {
+        val uriStr = call.getString("uri")
+        if (uriStr.isNullOrBlank()) {
+            call.reject("Missing required parameter: uri")
+            return
+        }
+        try {
+            val uri = Uri.parse(uriStr)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                this.setDataAndType(uri, "audio/*")
+                this.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+            val ret = JSObject().apply {
+                this.put("success", true)
+            }
+            call.resolve(ret)
+        } catch (e: Exception) {
+            call.reject("No audio player found to open file: ${e.message ?: "Unknown error"}")
+        }
+    }
+
+    @PluginMethod
+    fun shareAudio(call: PluginCall) {
+        val uriStr = call.getString("uri")
+        val title = call.getString("title") ?: "OmniDrop Audio"
+        if (uriStr.isNullOrBlank()) {
+            call.reject("Missing required parameter: uri")
+            return
+        }
+        try {
+            val uri = Uri.parse(uriStr)
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                this.type = "audio/*"
+                this.putExtra(Intent.EXTRA_STREAM, uri)
+                this.putExtra(Intent.EXTRA_SUBJECT, title)
+                this.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = Intent.createChooser(shareIntent, "Share audio").apply {
+                this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(chooser)
+            val ret = JSObject().apply {
+                this.put("shared", true)
+            }
+            call.resolve(ret)
+        } catch (e: Exception) {
+            call.reject("Failed to share audio: ${e.message ?: "Unknown error"}")
+        }
     }
 }
 

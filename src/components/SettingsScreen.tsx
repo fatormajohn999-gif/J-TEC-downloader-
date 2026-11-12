@@ -18,6 +18,7 @@ import {
   AlertTriangle,
   X,
   Sparkles,
+  Activity,
 } from 'lucide-react';
 import { AppSettings, AppUpdateInfo, UpdateProgressEvent } from '../types';
 import { checkServerHealth } from '../services/api';
@@ -65,6 +66,34 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   const [hasOverlayPerm, setHasOverlayPerm] = useState<boolean>(false);
   const [tabServiceStatus, setTabServiceStatus] = useState<'RUNNING' | 'STOPPED' | 'NO PERMISSION'>('STOPPED');
   const [isTestingTab, setIsTestingTab] = useState<boolean>(false);
+  const [isAddingTile, setIsAddingTile] = useState<boolean>(false);
+
+  // Watchdog Keep-Alive state
+  const [watchdogEnabled, setWatchdogEnabled] = useState<boolean>(settings.watchdogEnabled ?? false);
+  const [watchdogPaused, setWatchdogPaused] = useState<boolean>(settings.watchdogPaused ?? false);
+  const [watchdogInterval, setWatchdogInterval] = useState<number>(settings.watchdogInterval || 10);
+  const [watchdogActiveFrom, setWatchdogActiveFrom] = useState<string>(settings.watchdogActiveFrom || '07:00');
+  const [watchdogActiveTo, setWatchdogActiveTo] = useState<string>(settings.watchdogActiveTo || '23:00');
+  const [watchdogStatus, setWatchdogStatus] = useState<{
+    isRunning: boolean;
+    isPaused: boolean;
+    lastPingTime: number;
+    lastPingMs: number;
+    lastPingStatus: string;
+    nextPingTime: number;
+    pingsToday: number;
+    estimatedHoursThisMonth: number;
+  }>({
+    isRunning: false,
+    isPaused: false,
+    lastPingTime: 0,
+    lastPingMs: -1,
+    lastPingStatus: 'IDLE',
+    nextPingTime: 0,
+    pingsToday: 0,
+    estimatedHoursThisMonth: 0,
+  });
+  const [isTogglingWatchdogPause, setIsTogglingWatchdogPause] = useState<boolean>(false);
 
   // Update firmware state
   const [installedVersion, setInstalledVersion] = useState<{ versionName: string; versionCode: number }>({
@@ -146,10 +175,34 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     } catch {}
   };
 
-  // Load app version and perform initial update check
+  const refreshWatchdogStatus = async () => {
+    try {
+      const res = await VideoDownloader.getWatchdogStatus();
+      if (res) {
+        setWatchdogStatus({
+          isRunning: res.isRunning,
+          isPaused: res.isPaused,
+          lastPingTime: res.lastPingTime,
+          lastPingMs: res.lastPingMs,
+          lastPingStatus: res.lastPingStatus,
+          nextPingTime: res.nextPingTime,
+          pingsToday: res.pingsToday,
+          estimatedHoursThisMonth: res.estimatedHoursThisMonth,
+        });
+        if (typeof res.watchdogEnabled === 'boolean') setWatchdogEnabled(res.watchdogEnabled);
+        if (typeof res.isPaused === 'boolean') setWatchdogPaused(res.isPaused);
+        if (res.watchdogInterval) setWatchdogInterval(res.watchdogInterval);
+        if (res.watchdogActiveFrom) setWatchdogActiveFrom(res.watchdogActiveFrom);
+        if (res.watchdogActiveTo) setWatchdogActiveTo(res.watchdogActiveTo);
+      }
+    } catch {}
+  };
+
+  // Load app version and perform initial update check, and sync with native tile and watchdog on resume
   useEffect(() => {
     checkOverlayPermission();
     loadStorageStats();
+    refreshWatchdogStatus();
 
     VideoDownloader.getAppVersion()
       .then((ver) => {
@@ -161,6 +214,28 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
 
     // Initial check (cached/throttled to 1 hour unless forced)
     performUpdateCheck(false);
+
+    const handleResume = () => {
+      refreshTabServiceStatus();
+      loadStorageStats();
+      refreshWatchdogStatus();
+    };
+
+    window.addEventListener('focus', handleResume);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        handleResume();
+      }
+    });
+
+    const watchdogIntervalId = setInterval(() => {
+      refreshWatchdogStatus();
+    }, 4000);
+
+    return () => {
+      window.removeEventListener('focus', handleResume);
+      clearInterval(watchdogIntervalId);
+    };
   }, []);
 
   const performUpdateCheck = async (force: boolean) => {
@@ -256,7 +331,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     }
   };
 
-  const handleSave = () => {
+  const persistSettings = (overrides?: Partial<AppSettings>) => {
     const updated: AppSettings = {
       ...settings,
       backendUrl: backendUrl.trim(),
@@ -273,28 +348,137 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       floatingVibrate,
       floatingHideInsideApp,
       autoCheckUpdates,
+      watchdogEnabled,
+      watchdogPaused,
+      watchdogInterval,
+      watchdogActiveFrom,
+      watchdogActiveTo,
+      ...overrides,
     };
     onUpdateSettings(updated);
 
     VideoDownloader.saveNativeSettings({
-      backendUrl: backendUrl.trim(),
-      apiKey: apiKey.trim(),
-      defaultQuality,
+      backendUrl: (overrides?.backendUrl ?? backendUrl).trim(),
+      apiKey: (overrides?.apiKey ?? apiKey).trim(),
+      defaultQuality: overrides?.defaultQuality ?? defaultQuality,
       autoDownload: true,
-      autoDownloadOnPaste,
-      autoPlayNext,
-      repeatMode,
-      floatingSide,
-      floatingShowMs,
-      floatingAutoClear,
-      floatingVibrate,
-      floatingHideInsideApp,
-      autoCheckUpdates,
+      autoDownloadOnPaste: overrides?.autoDownloadOnPaste ?? autoDownloadOnPaste,
+      autoPlayNext: overrides?.autoPlayNext ?? autoPlayNext,
+      repeatMode: overrides?.repeatMode ?? repeatMode,
+      floatingSide: overrides?.floatingSide ?? floatingSide,
+      floatingShowMs: overrides?.floatingShowMs ?? floatingShowMs,
+      floatingAutoClear: overrides?.floatingAutoClear ?? floatingAutoClear,
+      floatingVibrate: overrides?.floatingVibrate ?? floatingVibrate,
+      floatingHideInsideApp: overrides?.floatingHideInsideApp ?? floatingHideInsideApp,
+      autoCheckUpdates: overrides?.autoCheckUpdates ?? autoCheckUpdates,
+      watchdogEnabled: overrides?.watchdogEnabled ?? watchdogEnabled,
+      watchdogPaused: overrides?.watchdogPaused ?? watchdogPaused,
+      watchdogInterval: overrides?.watchdogInterval ?? watchdogInterval,
+      watchdogActiveFrom: overrides?.watchdogActiveFrom ?? watchdogActiveFrom,
+      watchdogActiveTo: overrides?.watchdogActiveTo ?? watchdogActiveTo,
     }).catch(() => {});
+  };
 
+  const handleSave = () => {
+    persistSettings();
     setIsSaved(true);
     setTimeout(() => setIsSaved(false), 2200);
     onRefreshHealth();
+  };
+
+  const handleToggleWatchdog = () => {
+    const next = !watchdogEnabled;
+    setWatchdogEnabled(next);
+    persistSettings({ watchdogEnabled: next });
+    setTimeout(refreshWatchdogStatus, 300);
+  };
+
+  const handleChangeWatchdogInterval = (mins: number) => {
+    setWatchdogInterval(mins);
+    persistSettings({ watchdogInterval: mins });
+    setTimeout(refreshWatchdogStatus, 300);
+  };
+
+  const handleChangeActiveHours = (from: string, to: string) => {
+    setWatchdogActiveFrom(from);
+    setWatchdogActiveTo(to);
+    persistSettings({ watchdogActiveFrom: from, watchdogActiveTo: to });
+    setTimeout(refreshWatchdogStatus, 300);
+  };
+
+  const handleToggleWatchdogPause = async () => {
+    if (!watchdogEnabled || isTogglingWatchdogPause) return;
+    setIsTogglingWatchdogPause(true);
+    const nextPaused = !watchdogPaused;
+    try {
+      setWatchdogPaused(nextPaused);
+      await VideoDownloader.setWatchdogPaused({ paused: nextPaused });
+      persistSettings({ watchdogPaused: nextPaused });
+      await refreshWatchdogStatus();
+    } catch {} finally {
+      setIsTogglingWatchdogPause(false);
+    }
+  };
+
+  const handleAddToQuickSettings = async () => {
+    setIsAddingTile(true);
+    try {
+      const res = await VideoDownloader.requestAddQuickTile();
+      if (res && res.supported) {
+        if (res.result === 'added') {
+          setModalState({
+            isOpen: true,
+            title: 'QUICK SETTINGS TILE ADDED',
+            message: '"OmniDrop Tab" tile has been added to your Android Quick Settings panel. You can now toggle the edge tab directly from your status bar.',
+            actionLabel: 'OK',
+            onAction: () => setModalState((prev) => ({ ...prev, isOpen: false })),
+          });
+        } else if (res.result === 'already_added') {
+          setModalState({
+            isOpen: true,
+            title: 'TILE ALREADY PRESENT',
+            message: '"OmniDrop Tab" is already added to your Quick Settings panel.',
+            actionLabel: 'OK',
+            onAction: () => setModalState((prev) => ({ ...prev, isOpen: false })),
+          });
+        } else {
+          setModalState({
+            isOpen: true,
+            title: 'REQUEST DECLINED',
+            message: 'The quick settings tile addition request was dismissed or cancelled.',
+            actionLabel: 'DISMISS',
+            onAction: () => setModalState((prev) => ({ ...prev, isOpen: false })),
+          });
+        }
+      } else {
+        setModalState({
+          isOpen: true,
+          title: 'ADD TO QUICK SETTINGS',
+          message: 'To add the OmniDrop Tab tile manually on your device:\n\n1. Pull down your notification bar twice to expand full Quick Settings.\n2. Tap the edit button (the pencil ✎ icon or the three-dot ⋮ menu).\n3. Find "OmniDrop Tab" in the available tile list.\n4. Drag "OmniDrop Tab" up into your active quick tile grid.',
+          actionLabel: 'GOT IT',
+          onAction: () => setModalState((prev) => ({ ...prev, isOpen: false })),
+        });
+      }
+    } catch (e: any) {
+      setModalState({
+        isOpen: true,
+        title: 'MANUAL SETUP',
+        message: 'Pull down Quick Settings, tap the edit (pencil or ⋮) button, and drag "OmniDrop Tab" into the active grid.',
+        actionLabel: 'OK',
+        onAction: () => setModalState((prev) => ({ ...prev, isOpen: false })),
+      });
+    } finally {
+      setIsAddingTile(false);
+    }
+  };
+
+  const formatNextPingCountdown = (targetTime: number) => {
+    if (!targetTime || targetTime <= 0) return 'Scheduled soon';
+    const diffSec = Math.round((targetTime - Date.now()) / 1000);
+    if (diffSec <= 0) return 'Pinging now...';
+    const m = Math.floor(diffSec / 60);
+    const s = diffSec % 60;
+    return `in ${m}m ${s < 10 ? '0' : ''}${s}s (${new Date(targetTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})`;
   };
 
   const handleTestConnection = async () => {
@@ -943,10 +1127,193 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               )}
             </div>
           </div>
+
+          {/* Quick Settings Tile Action */}
+          <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-between">
+            <div className="min-w-0 pr-2">
+              <div className="font-mono text-xs text-white uppercase font-bold flex items-center gap-2">
+                <Sliders className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                <span>QUICK SETTINGS TILE</span>
+              </div>
+              <div className="text-[11px] text-slate-400 mt-0.5">
+                Toggle the OmniDrop edge tab directly from Android notification bar
+              </div>
+            </div>
+
+            <button
+              onClick={handleAddToQuickSettings}
+              disabled={isAddingTile}
+              className="machine-btn px-3 py-1.5 rounded-lg text-xs font-mono font-bold text-cyan-300 border-cyan-500/40 hover:border-cyan-400 shrink-0"
+            >
+              {isAddingTile ? 'ADDING...' : 'ADD TO QUICK SETTINGS'}
+            </button>
+          </div>
         </div>
       </div>
 
-      {/* 4. STORAGE // CACHE CONTROL */}
+      {/* 4. SERVER KEEP-ALIVE // WATCHDOG */}
+      <div className="machine-surface rounded-xl p-4 space-y-4">
+        <div className="flex items-center justify-between pb-2 border-b border-cyan-500/20">
+          <div className="flex items-center gap-2">
+            <Activity className="w-4 h-4 text-cyan-400" />
+            <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
+              SERVER KEEP-ALIVE // WATCHDOG
+            </h3>
+          </div>
+          <span
+            className={`font-mono text-[10px] font-bold px-2 py-0.5 rounded border ${
+              watchdogEnabled
+                ? watchdogPaused
+                  ? 'border-amber-500/40 text-amber-300 bg-amber-500/10'
+                  : 'border-emerald-500/40 text-emerald-300 bg-emerald-500/10'
+                : 'border-slate-800 text-slate-500 bg-slate-900'
+            }`}
+          >
+            {watchdogEnabled ? (watchdogPaused ? 'PAUSED' : 'ACTIVE') : 'OFF'}
+          </span>
+        </div>
+
+        {/* Master Watchdog Toggle */}
+        {renderMechanicalToggle(
+          'SERVER KEEP-ALIVE WATCHDOG',
+          'Periodically ping {backendUrl}/health in background to prevent Render sleep',
+          watchdogEnabled,
+          handleToggleWatchdog
+        )}
+
+        {/* Interval Selector */}
+        <div className="space-y-2 pt-1">
+          <div className="flex items-center justify-between text-xs font-mono">
+            <span className="text-slate-300 font-bold uppercase">PING INTERVAL</span>
+            <span className="text-[11px] text-slate-400">Render sleeps after ~15m</span>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            {[5, 10, 14].map((mins) => (
+              <button
+                key={mins}
+                type="button"
+                onClick={() => handleChangeWatchdogInterval(mins)}
+                disabled={!watchdogEnabled}
+                className={`py-2 px-3 rounded-lg font-mono text-xs font-bold transition-all border ${
+                  watchdogInterval === mins
+                    ? 'machine-btn-primary bg-cyan-500/20 border-cyan-400 text-cyan-300 shadow-[0_0_8px_rgba(0,240,255,0.4)]'
+                    : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white hover:border-slate-700'
+                } ${!watchdogEnabled ? 'opacity-40 cursor-not-allowed' : ''}`}
+              >
+                {mins} MINUTES
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Active Hours From / To */}
+        <div className="space-y-2 pt-1">
+          <div className="flex items-center justify-between text-xs font-mono">
+            <span className="text-slate-300 font-bold uppercase">ACTIVE HOURS</span>
+            <span className="text-[11px] text-slate-400">No pings outside window</span>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-1">
+              <label className="block text-[10px] font-mono text-slate-400 uppercase">START TIME (FROM)</label>
+              <input
+                type="time"
+                value={watchdogActiveFrom}
+                disabled={!watchdogEnabled}
+                onChange={(e) => handleChangeActiveHours(e.target.value, watchdogActiveTo)}
+                className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 font-mono text-xs text-white focus:outline-none focus:border-cyan-400 disabled:opacity-40"
+              />
+            </div>
+            <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-1">
+              <label className="block text-[10px] font-mono text-slate-400 uppercase">END TIME (TO)</label>
+              <input
+                type="time"
+                value={watchdogActiveTo}
+                disabled={!watchdogEnabled}
+                onChange={(e) => handleChangeActiveHours(watchdogActiveFrom, e.target.value)}
+                className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 font-mono text-xs text-white focus:outline-none focus:border-cyan-400 disabled:opacity-40"
+              />
+            </div>
+          </div>
+        </div>
+
+        {/* Big PAUSE / RESUME Key with LED */}
+        <div className="pt-2">
+          <button
+            type="button"
+            onClick={handleToggleWatchdogPause}
+            disabled={!watchdogEnabled || isTogglingWatchdogPause}
+            className={`w-full py-3 px-4 rounded-xl border flex items-center justify-center gap-3 font-mono font-bold text-xs tracking-wider transition-all duration-200 ${
+              !watchdogEnabled
+                ? 'bg-slate-950 border-slate-800 text-slate-600 opacity-50 cursor-not-allowed'
+                : watchdogPaused
+                ? 'bg-amber-950/40 border-amber-500/60 text-amber-300 hover:bg-amber-900/50 shadow-[0_0_12px_rgba(245,158,11,0.25)]'
+                : 'bg-emerald-950/40 border-emerald-500/60 text-emerald-300 hover:bg-emerald-900/50 shadow-[0_0_12px_rgba(16,185,129,0.25)]'
+            }`}
+          >
+            <span
+              className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                !watchdogEnabled
+                  ? 'bg-slate-700'
+                  : watchdogPaused
+                  ? 'led-amber'
+                  : 'led-emerald'
+              }`}
+            />
+            <span>
+              {isTogglingWatchdogPause
+                ? 'UPDATING...'
+                : !watchdogEnabled
+                ? 'WATCHDOG DISABLED'
+                : watchdogPaused
+                ? 'RESUME KEEP-ALIVE WATCHDOG'
+                : 'PAUSE KEEP-ALIVE WATCHDOG'}
+            </span>
+          </button>
+        </div>
+
+        {/* Status Block */}
+        <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 space-y-2.5 font-mono text-xs">
+          <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+            <span className="text-slate-400">LAST PING:</span>
+            <span className="font-bold text-white">
+              {watchdogStatus.lastPingTime > 0
+                ? `${new Date(watchdogStatus.lastPingTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })} • ${watchdogStatus.lastPingMs >= 0 ? watchdogStatus.lastPingMs + 'ms' : 'err'} (${watchdogStatus.lastPingStatus})`
+                : 'No pings recorded'}
+            </span>
+          </div>
+
+          <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+            <span className="text-slate-400">NEXT PING:</span>
+            <span className="font-bold text-cyan-300">
+              {!watchdogEnabled
+                ? 'WATCHDOG OFF'
+                : watchdogPaused
+                ? 'PAUSED'
+                : formatNextPingCountdown(watchdogStatus.nextPingTime)}
+            </span>
+          </div>
+
+          <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+            <span className="text-slate-400">PINGS TODAY:</span>
+            <span className="font-bold text-white">{watchdogStatus.pingsToday} pings</span>
+          </div>
+
+          <div className="flex items-center justify-between">
+            <span className="text-slate-400">ESTIMATED RENDER HOURS THIS MONTH:</span>
+            <span className="font-bold text-emerald-400">
+              {watchdogStatus.estimatedHoursThisMonth.toFixed(1)} hrs active
+            </span>
+          </div>
+        </div>
+
+        {/* UI Note Required by Specification */}
+        <div className="p-2.5 rounded-lg bg-cyan-950/20 border border-cyan-500/30 flex items-start gap-2 text-[11px] font-mono text-cyan-300">
+          <AlertCircle className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5" />
+          <span>Works while the phone is awake. For 24/7, use Cloud keep-alive.</span>
+        </div>
+      </div>
+
+      {/* 5. STORAGE // CACHE CONTROL */}
       <div className="machine-surface rounded-xl p-4 space-y-3">
         <div className="flex items-center gap-2 pb-2 border-b border-cyan-500/20">
           <HardDrive className="w-4 h-4 text-cyan-400" />

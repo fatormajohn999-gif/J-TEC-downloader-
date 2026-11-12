@@ -54,7 +54,10 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
 import java.util.ArrayDeque
+import java.util.Calendar
+import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -85,8 +88,53 @@ class FloatingBubbleService : Service() {
         const val NOTIFICATION_ID_UPDATE = 1002
         const val PREF_HISTORY_KEY = "native_download_history"
 
+        const val PREF_WATCHDOG_ENABLED = "watchdog_enabled"
+        const val PREF_WATCHDOG_PAUSED = "watchdog_paused"
+        const val PREF_WATCHDOG_INTERVAL = "watchdog_interval_minutes"
+        const val PREF_WATCHDOG_ACTIVE_FROM = "watchdog_active_from"
+        const val PREF_WATCHDOG_ACTIVE_TO = "watchdog_active_to"
+
+        const val PREF_WATCHDOG_LAST_PING_TIME = "watchdog_last_ping_time"
+        const val PREF_WATCHDOG_LAST_PING_MS = "watchdog_last_ping_ms"
+        const val PREF_WATCHDOG_LAST_PING_STATUS = "watchdog_last_ping_status"
+        const val PREF_WATCHDOG_NEXT_PING_TIME = "watchdog_next_ping_time"
+        const val PREF_WATCHDOG_PINGS_TODAY = "watchdog_pings_today"
+        const val PREF_WATCHDOG_LAST_DATE = "watchdog_last_date"
+        const val PREF_WATCHDOG_ACTIVE_MINUTES_MONTH = "watchdog_active_minutes_month"
+        const val PREF_WATCHDOG_ACTIVE_MONTH_KEY = "watchdog_active_month_key"
+
         @Volatile var isOmniDropInForeground: Boolean = false
         @Volatile private var forceShowUntil: Long = 0L
+
+        fun syncService(context: Context) {
+            val p = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val tabOn = p.getBoolean("floating_bubble_enabled", false)
+            val watchdogOn = p.getBoolean(PREF_WATCHDOG_ENABLED, false)
+            val shouldRun = tabOn || watchdogOn
+
+            val inst = instance
+            if (shouldRun) {
+                if (inst == null) {
+                    ensureNotificationChannel(context)
+                    val intent = Intent(context, FloatingBubbleService::class.java)
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            context.startForegroundService(intent)
+                        } else {
+                            context.startService(intent)
+                        }
+                    } catch (_: Exception) {}
+                } else {
+                    inst.syncViewsAndWatchdog()
+                }
+            } else {
+                if (inst != null) {
+                    val intent = Intent(context, FloatingBubbleService::class.java)
+                    context.stopService(intent)
+                }
+            }
+            QuickTileService.updateTile(context)
+        }
 
         fun setOmniDropForeground(inForeground: Boolean) {
             isOmniDropInForeground = inForeground
@@ -239,6 +287,28 @@ class FloatingBubbleService : Service() {
     // Auto-check updates state
     private var autoCheckUpdatesEnabled: Boolean = true
 
+    // Tab & Watchdog State
+    private var isTabEnabled: Boolean = false
+    private var isWatchdogEnabled: Boolean = false
+    private var isWatchdogPaused: Boolean = false
+    private var watchdogIntervalMinutes: Int = 10
+    private var watchdogActiveFrom: String = "07:00"
+    private var watchdogActiveTo: String = "23:00"
+
+    private var watchdogLastPingTime: Long = 0L
+    private var watchdogLastPingMs: Int = -1
+    private var watchdogLastPingStatus: String = "IDLE"
+    private var watchdogNextPingTime: Long = 0L
+    private var watchdogPingsToday: Int = 0
+    private var watchdogLastPingDateStr: String = ""
+
+    private val watchdogRunnable = object : Runnable {
+        override fun run() {
+            if (!isWatchdogEnabled) return
+            executeWatchdogPingCycle()
+        }
+    }
+
     // Threading
     private val mainHandler = Handler(Looper.getMainLooper())
     private val backgroundExecutor = Executors.newFixedThreadPool(3)
@@ -299,6 +369,7 @@ class FloatingBubbleService : Service() {
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
         loadSavedSettings()
+        QuickTileService.updateTile(this)
         ensureNotificationChannel(this)
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -316,12 +387,15 @@ class FloatingBubbleService : Service() {
         }
         registerReceiver(screenReceiver, filter)
 
-        initEdgeTab()
-        initPanelOverlay()
+        if (isTabEnabled) {
+            initEdgeTab()
+            initPanelOverlay()
+            resetIdleFade()
+        }
 
         mainHandler.post(dualPingRunnable)
         mainHandler.postDelayed(updateCheckRunnable, 5000L)
-        resetIdleFade()
+        rescheduleWatchdog()
     }
 
     private fun loadSavedSettings() {
@@ -336,6 +410,19 @@ class FloatingBubbleService : Service() {
             vibrateEnabled = p.getBoolean(PREF_FLOATING_VIBRATE, true)
             hideInsideAppEnabled = p.getBoolean(PREF_FLOATING_HIDE_INSIDE_APP, true)
             autoCheckUpdatesEnabled = p.getBoolean(PREF_AUTO_CHECK_UPDATES, true)
+
+            isTabEnabled = p.getBoolean("floating_bubble_enabled", false)
+            isWatchdogEnabled = p.getBoolean(PREF_WATCHDOG_ENABLED, false)
+            isWatchdogPaused = p.getBoolean(PREF_WATCHDOG_PAUSED, false)
+            watchdogIntervalMinutes = p.getInt(PREF_WATCHDOG_INTERVAL, 10).coerceIn(1, 60)
+            watchdogActiveFrom = p.getString(PREF_WATCHDOG_ACTIVE_FROM, "07:00") ?: "07:00"
+            watchdogActiveTo = p.getString(PREF_WATCHDOG_ACTIVE_TO, "23:00") ?: "23:00"
+            watchdogLastPingTime = p.getLong(PREF_WATCHDOG_LAST_PING_TIME, 0L)
+            watchdogLastPingMs = p.getInt(PREF_WATCHDOG_LAST_PING_MS, -1)
+            watchdogLastPingStatus = p.getString(PREF_WATCHDOG_LAST_PING_STATUS, "IDLE") ?: "IDLE"
+            watchdogNextPingTime = p.getLong(PREF_WATCHDOG_NEXT_PING_TIME, 0L)
+            watchdogPingsToday = p.getInt(PREF_WATCHDOG_PINGS_TODAY, 0)
+            watchdogLastPingDateStr = p.getString(PREF_WATCHDOG_LAST_DATE, "") ?: ""
         }
     }
 
@@ -413,6 +500,242 @@ class FloatingBubbleService : Service() {
         }
     }
 
+    fun syncViewsAndWatchdog() {
+        val p = prefs ?: getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        isTabEnabled = p.getBoolean("floating_bubble_enabled", false)
+        isWatchdogEnabled = p.getBoolean(PREF_WATCHDOG_ENABLED, false)
+        isWatchdogPaused = p.getBoolean(PREF_WATCHDOG_PAUSED, false)
+        watchdogIntervalMinutes = p.getInt(PREF_WATCHDOG_INTERVAL, 10).coerceIn(1, 60)
+        watchdogActiveFrom = p.getString(PREF_WATCHDOG_ACTIVE_FROM, "07:00") ?: "07:00"
+        watchdogActiveTo = p.getString(PREF_WATCHDOG_ACTIVE_TO, "23:00") ?: "23:00"
+
+        mainHandler.post {
+            if (isTabEnabled) {
+                if (tabRootView == null) {
+                    initEdgeTab()
+                    initPanelOverlay()
+                    resetIdleFade()
+                } else {
+                    updateForegroundVisibility()
+                }
+            } else {
+                removeTabViews()
+            }
+            rescheduleWatchdog()
+        }
+    }
+
+    fun updateWatchdogSettings(
+        enabled: Boolean,
+        paused: Boolean,
+        interval: Int,
+        activeFrom: String,
+        activeTo: String
+    ) {
+        isWatchdogEnabled = enabled
+        isWatchdogPaused = paused
+        watchdogIntervalMinutes = interval.coerceIn(1, 60)
+        watchdogActiveFrom = activeFrom
+        watchdogActiveTo = activeTo
+        prefs?.edit()?.apply {
+            this.putBoolean(PREF_WATCHDOG_ENABLED, isWatchdogEnabled)
+            this.putBoolean(PREF_WATCHDOG_PAUSED, isWatchdogPaused)
+            this.putInt(PREF_WATCHDOG_INTERVAL, watchdogIntervalMinutes)
+            this.putString(PREF_WATCHDOG_ACTIVE_FROM, watchdogActiveFrom)
+            this.putString(PREF_WATCHDOG_ACTIVE_TO, watchdogActiveTo)
+            this.apply()
+        }
+        mainHandler.post {
+            rescheduleWatchdog()
+        }
+    }
+
+    private fun removeTabViews() {
+        tabRootView?.let {
+            try { windowManager?.removeView(it) } catch (_: Exception) {}
+            tabRootView = null
+            tabInnerFrame = null
+        }
+        panelRootOverlay?.let {
+            try { windowManager?.removeView(it) } catch (_: Exception) {}
+            panelRootOverlay = null
+        }
+        isPanelOpen = false
+    }
+
+    private fun rescheduleWatchdog() {
+        mainHandler.removeCallbacks(watchdogRunnable)
+        if (!isWatchdogEnabled) return
+        val intervalMs = (watchdogIntervalMinutes.toLong() * 60 * 1000L).coerceAtLeast(60_000L)
+        val now = System.currentTimeMillis()
+        val delayMs = if (watchdogLastPingTime > 0L) {
+            val elapsed = now - watchdogLastPingTime
+            (intervalMs - elapsed).coerceIn(1000L, intervalMs)
+        } else {
+            1000L
+        }
+        watchdogNextPingTime = now + delayMs
+        prefs?.edit()?.apply {
+            this.putLong(PREF_WATCHDOG_NEXT_PING_TIME, watchdogNextPingTime)
+            this.apply()
+        }
+        mainHandler.postDelayed(watchdogRunnable, delayMs)
+    }
+
+    private fun parseMinutes(timeStr: String, defaultMinutes: Int): Int {
+        try {
+            val parts = timeStr.trim().split(":")
+            if (parts.size >= 2) {
+                val h = parts[0].toIntOrNull() ?: return defaultMinutes
+                val m = parts[1].toIntOrNull() ?: return defaultMinutes
+                return h * 60 + m
+            }
+        } catch (_: Throwable) {}
+        return defaultMinutes
+    }
+
+    private fun isWithinActiveHours(): Boolean {
+        val cal = Calendar.getInstance()
+        val nowMinutes = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
+        val fromMin = parseMinutes(watchdogActiveFrom, 7 * 60)
+        val toMin = parseMinutes(watchdogActiveTo, 23 * 60)
+
+        return if (fromMin <= toMin) {
+            nowMinutes in fromMin..toMin
+        } else {
+            nowMinutes >= fromMin || nowMinutes <= toMin
+        }
+    }
+
+    private fun accumulateActiveMinutes(minutes: Int) {
+        try {
+            val currentMonthKey = SimpleDateFormat("yyyy-MM", Locale.US).format(Date())
+            val p = prefs ?: return
+            val savedMonth = p.getString(PREF_WATCHDOG_ACTIVE_MONTH_KEY, "")
+            var totalMinutes = if (savedMonth == currentMonthKey) {
+                p.getInt(PREF_WATCHDOG_ACTIVE_MINUTES_MONTH, 0)
+            } else {
+                0
+            }
+            totalMinutes += minutes
+            p.edit().apply {
+                this.putString(PREF_WATCHDOG_ACTIVE_MONTH_KEY, currentMonthKey)
+                this.putInt(PREF_WATCHDOG_ACTIVE_MINUTES_MONTH, totalMinutes)
+                this.apply()
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun executeWatchdogPingCycle() {
+        if (!isWatchdogEnabled) return
+
+        val intervalMs = (watchdogIntervalMinutes.toLong() * 60 * 1000L).coerceAtLeast(60_000L)
+        val nextTime = System.currentTimeMillis() + intervalMs
+        watchdogNextPingTime = nextTime
+        prefs?.edit()?.apply {
+            this.putLong(PREF_WATCHDOG_NEXT_PING_TIME, nextTime)
+            this.apply()
+        }
+
+        if (isWatchdogPaused) {
+            watchdogLastPingStatus = "PAUSED"
+            prefs?.edit()?.apply {
+                this.putString(PREF_WATCHDOG_LAST_PING_STATUS, "PAUSED")
+                this.apply()
+            }
+            mainHandler.postDelayed(watchdogRunnable, intervalMs)
+            return
+        }
+
+        if (!isWithinActiveHours()) {
+            watchdogLastPingStatus = "OFF_HOURS"
+            prefs?.edit()?.apply {
+                this.putString(PREF_WATCHDOG_LAST_PING_STATUS, "OFF_HOURS")
+                this.apply()
+            }
+            mainHandler.postDelayed(watchdogRunnable, intervalMs)
+            return
+        }
+
+        accumulateActiveMinutes(watchdogIntervalMinutes)
+
+        backgroundExecutor.execute {
+            var elapsed = -1
+            var status = "ERROR"
+            val start = System.currentTimeMillis()
+
+            try {
+                if (backendUrl.isNotBlank()) {
+                    val endpoint = "${backendUrl.removeSuffix("/")}/health"
+                    val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                        this.connectTimeout = 8000
+                        this.readTimeout = 8000
+                        this.setRequestProperty("User-Agent", "OmniDrop-Watchdog/1.0")
+                        if (apiKey.isNotBlank()) {
+                            this.setRequestProperty("x-api-key", apiKey)
+                        }
+                    }
+                    val code = conn.responseCode
+                    elapsed = (System.currentTimeMillis() - start).toInt()
+                    conn.disconnect()
+
+                    if (code in 200..299) {
+                        status = "OK"
+                    } else {
+                        status = "HTTP $code"
+                    }
+                } else {
+                    status = "NO_URL"
+                }
+            } catch (t: Throwable) {
+                elapsed = (System.currentTimeMillis() - start).toInt()
+                status = t.message ?: "TIMEOUT"
+            }
+
+            val finalElapsed = elapsed
+            val finalStatus = status
+
+            mainHandler.post {
+                watchdogLastPingTime = System.currentTimeMillis()
+                watchdogLastPingMs = finalElapsed
+                watchdogLastPingStatus = finalStatus
+
+                val todayDateStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+                if (todayDateStr != watchdogLastPingDateStr) {
+                    watchdogLastPingDateStr = todayDateStr
+                    watchdogPingsToday = 1
+                } else {
+                    watchdogPingsToday++
+                }
+
+                prefs?.edit()?.apply {
+                    this.putLong(PREF_WATCHDOG_LAST_PING_TIME, watchdogLastPingTime)
+                    this.putInt(PREF_WATCHDOG_LAST_PING_MS, watchdogLastPingMs)
+                    this.putString(PREF_WATCHDOG_LAST_PING_STATUS, watchdogLastPingStatus)
+                    this.putInt(PREF_WATCHDOG_PINGS_TODAY, watchdogPingsToday)
+                    this.putString(PREF_WATCHDOG_LAST_DATE, watchdogLastPingDateStr)
+                    this.apply()
+                }
+
+                // Update tab's SERVER LED
+                if (finalStatus == "OK") {
+                    serverPingMs = finalElapsed
+                    serverState = "ONLINE"
+                } else if (finalStatus == "NO_URL") {
+                    serverPingMs = -1
+                    serverState = "OFF"
+                } else {
+                    serverPingMs = finalElapsed
+                    serverState = "SLEEP"
+                }
+                tabInnerFrame?.updateStatus(serverState, serverPingMs)
+                updateInstrumentUI()
+
+                mainHandler.postDelayed(watchdogRunnable, intervalMs)
+            }
+        }
+    }
+
     private fun createNotificationChannel() {
         ensureNotificationChannel(this)
     }
@@ -426,9 +749,12 @@ class FloatingBubbleService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
         )
 
+        val title = if (isTabEnabled) "OmniDrop Machine Tab Active" else "OmniDrop Server Watchdog Active"
+        val desc = if (isTabEnabled) "Swipe or tap metal latch to open download space" else "Keep-alive active (every ${watchdogIntervalMinutes}m)"
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("OmniDrop Machine Tab Active")
-            .setContentText("Swipe or tap metal latch to open download space")
+            .setContentTitle(title)
+            .setContentText(desc)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setOngoing(true)
             .setContentIntent(pendingIntent)
@@ -2625,11 +2951,17 @@ class FloatingBubbleService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         instance = null
+        prefs?.edit()?.apply {
+            this.putBoolean("floating_bubble_enabled", false)
+            this.apply()
+        }
+        QuickTileService.updateTile(this)
         try { unregisterReceiver(screenReceiver) } catch (_: Exception) {}
         mainHandler.removeCallbacks(dualPingRunnable)
         mainHandler.removeCallbacks(trafficRunnable)
         mainHandler.removeCallbacks(idleFadeRunnable)
         mainHandler.removeCallbacks(updateCheckRunnable)
+        mainHandler.removeCallbacks(watchdogRunnable)
         autoClearRunnable?.let { mainHandler.removeCallbacks(it) }
 
         tabRootView?.let { try { windowManager?.removeView(it) } catch (_: Exception) {} }

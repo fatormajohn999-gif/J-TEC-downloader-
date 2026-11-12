@@ -1,7 +1,13 @@
 package com.omnidrop.app.plugin
 
 import android.app.Activity
+import android.app.PendingIntent
+import android.app.PictureInPictureParams
+import android.app.RemoteAction
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.res.ColorStateList
 import android.content.res.Configuration
@@ -9,6 +15,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.Icon
 import android.graphics.drawable.LayerDrawable
 import android.media.AudioManager
 import android.media.MediaPlayer
@@ -18,6 +25,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
+import android.util.Rational
 import android.util.TypedValue
 import android.view.GestureDetector
 import android.view.Gravity
@@ -29,6 +37,7 @@ import android.view.animation.AlphaAnimation
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.VideoView
@@ -54,6 +63,8 @@ import org.json.JSONObject
 class VideoPlayerActivity : Activity() {
 
     companion object {
+        private const val ACTION_PIP_PLAY_PAUSE = "com.omnidrop.app.ACTION_PIP_PLAY_PAUSE"
+        private const val PIP_CONTROL_REQUEST_CODE = 202
         private const val PREFS_PLAYBACK = "omnidrop_playback_positions"
         private const val PREFS_PLAYER_UI = "omnidrop_player_prefs"
         private const val KEY_SWIPE_HINT_SHOWN = "swipe_hint_shown"
@@ -93,6 +104,16 @@ class VideoPlayerActivity : Activity() {
 
     private val playlist = ArrayList<PlaylistItem>()
     private var currentIndex = 0
+
+    private var isPipReceiverRegistered = false
+    private val pipActionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == ACTION_PIP_PLAY_PAUSE) {
+                togglePlayback()
+                updatePipActions()
+            }
+        }
+    }
 
     private lateinit var rootContainer: FrameLayout
     private lateinit var videoContentContainer: FrameLayout
@@ -236,6 +257,16 @@ class VideoPlayerActivity : Activity() {
 
             buildPlayerUI()
             setupGestures()
+
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    registerReceiver(pipActionReceiver, IntentFilter(ACTION_PIP_PLAY_PAUSE), Context.RECEIVER_NOT_EXPORTED)
+                } else {
+                    registerReceiver(pipActionReceiver, IntentFilter(ACTION_PIP_PLAY_PAUSE))
+                }
+                isPipReceiverRegistered = true
+            } catch (_: Throwable) {}
+
             loadVideoAtCurrentIndex(animate = false, slideLeft = true)
             checkAndShowSwipeHint()
         } catch (t: Throwable) {
@@ -1002,6 +1033,30 @@ class VideoPlayerActivity : Activity() {
         updateFavoriteStarUI()
         topBarLayout.addView(favoriteStarButton)
 
+        // Audio Extractor Button ("M4A")
+        val audioExtractBtn = TextView(this).apply {
+            this.text = "M4A"
+            this.setTextColor(Color.parseColor("#00F0FF"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            this.typeface = Typeface.MONOSPACE
+            this.gravity = Gravity.CENTER
+            this.minHeight = dp(44)
+            this.setPadding(dp(8), dp(4), dp(8), dp(4))
+            this.background = createMechanicalButtonBackground(false)
+            val btnLp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                this.leftMargin = dp(6)
+            }
+            this.layoutParams = btnLp
+            this.setOnClickListener {
+                resetAutoHideTimer()
+                triggerAudioExtraction()
+            }
+        }
+        topBarLayout.addView(audioExtractBtn)
+
         hudOverlay.addView(topBarLayout)
     }
 
@@ -1453,7 +1508,7 @@ class VideoPlayerActivity : Activity() {
             this.setPadding(dp(2), dp(2), dp(2), dp(2))
             this.background = createMechanicalButtonBackground(false)
             val lp = LinearLayout.LayoutParams(0, dp(44), 1f).apply {
-                this.rightMargin = 0
+                this.rightMargin = dp(4)
             }
             this.layoutParams = lp
             this.setOnClickListener {
@@ -1462,6 +1517,27 @@ class VideoPlayerActivity : Activity() {
             }
         }
         optionsRow.addView(rotateButton)
+
+        // PIP Button
+        val pipButton = TextView(this).apply {
+            this.text = "PIP"
+            this.setTextColor(Color.parseColor("#00F0FF"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            this.typeface = Typeface.MONOSPACE
+            this.gravity = Gravity.CENTER
+            this.setSingleLine(true)
+            this.setPadding(dp(2), dp(2), dp(2), dp(2))
+            this.background = createMechanicalButtonBackground(false)
+            val lp = LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+                this.rightMargin = 0
+            }
+            this.layoutParams = lp
+            this.setOnClickListener {
+                resetAutoHideTimer()
+                enterPipMode()
+            }
+        }
+        optionsRow.addView(pipButton)
 
         bottomBarLayout.addView(optionsRow)
         hudOverlay.addView(bottomBarLayout)
@@ -1884,6 +1960,7 @@ class VideoPlayerActivity : Activity() {
             flashCenterIcon("❚❚")
             scheduleControlsAutoHide()
         }
+        updatePipActions()
     }
 
     private fun cyclePlaybackSpeed() {
@@ -2035,14 +2112,326 @@ class VideoPlayerActivity : Activity() {
         }
     }
 
+    // ==================== PICTURE-IN-PICTURE (PIP) ====================
+    private fun getClampedAspectRatio(): Rational {
+        val w = if (videoW > 0) videoW else 16
+        val h = if (videoH > 0) videoH else 9
+        val ratio = w.toDouble() / h.toDouble()
+        // Android PiP aspect ratio clamp range: 1:2.39 to 2.39:1
+        return when {
+            ratio < 0.41841 -> Rational(100, 239)
+            ratio > 2.39000 -> Rational(239, 100)
+            else -> Rational(w, h)
+        }
+    }
+
+    private fun buildPipParams(): PictureInPictureParams? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return null
+        val isPlaying = try { playerReady && videoView.isPlaying } catch (_: Throwable) { false }
+        val iconRes = if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+        val title = if (isPlaying) "Pause" else "Play"
+        val icon = Icon.createWithResource(this, iconRes)
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        val intent = Intent(ACTION_PIP_PLAY_PAUSE).setPackage(packageName)
+        val pi = PendingIntent.getBroadcast(this, PIP_CONTROL_REQUEST_CODE, intent, flags)
+        val action = RemoteAction(icon, title, title, pi)
+
+        return PictureInPictureParams.Builder()
+            .setAspectRatio(getClampedAspectRatio())
+            .setActions(listOf(action))
+            .build()
+    }
+
+    private fun updatePipActions() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (isInPictureInPictureMode) {
+                buildPipParams()?.let { params ->
+                    try {
+                        setPictureInPictureParams(params)
+                    } catch (_: Throwable) {}
+                }
+            }
+        }
+    }
+
+    private fun enterPipMode() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                val params = buildPipParams()
+                if (params != null) {
+                    enterPictureInPictureMode(params)
+                } else {
+                    enterPictureInPictureMode()
+                }
+            } catch (t: Throwable) {
+                flashTitleBanner("PiP not supported on this device")
+            }
+        } else {
+            flashTitleBanner("PiP requires Android 8.0+")
+        }
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val isPlaying = try { playerReady && videoView.isPlaying } catch (_: Throwable) { false }
+            if (isPlaying && !isInPictureInPictureMode) {
+                enterPipMode()
+            }
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        if (isInPictureInPictureMode) {
+            hudOverlay.visibility = View.GONE
+            FloatingBubbleService.setOmniDropForeground(false)
+        } else {
+            hudOverlay.visibility = View.VISIBLE
+            FloatingBubbleService.setOmniDropForeground(true)
+            resetAutoHideTimer()
+        }
+    }
+
+    // ==================== AUDIO EXTRACTION HUD ====================
+    private var audioExtractDialogOverlay: FrameLayout? = null
+
+    private fun triggerAudioExtraction() {
+        val currentItem = playlist.getOrNull(currentIndex) ?: return
+        val videoUriStr = currentItem.uri
+        if (videoUriStr.isBlank()) return
+        val srcUri = Uri.parse(videoUriStr)
+
+        try {
+            if (playerReady && videoView.isPlaying) {
+                videoView.pause()
+                playPauseButton.text = "▶"
+            }
+        } catch (_: Throwable) {}
+
+        audioExtractDialogOverlay?.let { try { rootContainer.removeView(it) } catch (_: Throwable) {} }
+
+        val overlay = FrameLayout(this).apply {
+            this.setBackgroundColor(Color.parseColor("#D0000000"))
+            this.isClickable = true
+            this.isFocusable = true
+            val lp = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+            this.layoutParams = lp
+        }
+        audioExtractDialogOverlay = overlay
+
+        val card = LinearLayout(this).apply {
+            this.orientation = LinearLayout.VERTICAL
+            this.setPadding(dp(20), dp(18), dp(20), dp(18))
+            this.background = GradientDrawable().apply {
+                this.shape = GradientDrawable.RECTANGLE
+                this.cornerRadius = dp(12).toFloat()
+                this.setColor(Color.parseColor("#0F172A"))
+                this.setStroke(dp(1), Color.parseColor("#3300F0FF"))
+            }
+            val cardLp = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                this.gravity = Gravity.CENTER
+                this.leftMargin = dp(24)
+                this.rightMargin = dp(24)
+            }
+            this.layoutParams = cardLp
+        }
+
+        val titleTv = TextView(this).apply {
+            this.text = "EXTRACT AUDIO // .M4A"
+            this.setTextColor(Color.WHITE)
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            this.typeface = Typeface.MONOSPACE
+            this.setTypeface(this.typeface, Typeface.BOLD)
+        }
+        card.addView(titleTv)
+
+        val subTitleTv = TextView(this).apply {
+            this.text = currentItem.title
+            this.setTextColor(Color.parseColor("#94A3B8"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            this.typeface = Typeface.MONOSPACE
+            this.setSingleLine(true)
+            this.ellipsize = android.text.TextUtils.TruncateAt.END
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                this.topMargin = dp(4)
+                this.bottomMargin = dp(14)
+            }
+            this.layoutParams = lp
+        }
+        card.addView(subTitleTv)
+
+        val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            this.isIndeterminate = false
+            this.max = 100
+            this.progress = 0
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(6)
+            ).apply {
+                this.bottomMargin = dp(8)
+            }
+            this.layoutParams = lp
+            this.progressDrawable = GradientDrawable().apply {
+                this.shape = GradientDrawable.RECTANGLE
+                this.cornerRadius = dp(3).toFloat()
+                this.setColor(Color.parseColor("#00F0FF"))
+            }
+        }
+        card.addView(progressBar)
+
+        val statusTv = TextView(this).apply {
+            this.text = "Extracting audio track (0%)..."
+            this.setTextColor(Color.parseColor("#38BDF8"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            this.typeface = Typeface.MONOSPACE
+        }
+        card.addView(statusTv)
+
+        val buttonRow = LinearLayout(this).apply {
+            this.orientation = LinearLayout.HORIZONTAL
+            this.gravity = Gravity.END
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                this.topMargin = dp(16)
+            }
+            this.layoutParams = lp
+            this.visibility = View.GONE
+        }
+
+        val openBtn = TextView(this).apply {
+            this.text = "OPEN"
+            this.setTextColor(Color.parseColor("#00F0FF"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            this.typeface = Typeface.MONOSPACE
+            this.setPadding(dp(14), dp(8), dp(14), dp(8))
+            this.background = createMechanicalButtonBackground(true)
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                this.rightMargin = dp(8)
+            }
+            this.layoutParams = lp
+        }
+
+        val shareBtn = TextView(this).apply {
+            this.text = "SHARE"
+            this.setTextColor(Color.parseColor("#38BDF8"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            this.typeface = Typeface.MONOSPACE
+            this.setPadding(dp(14), dp(8), dp(14), dp(8))
+            this.background = createMechanicalButtonBackground(false)
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                this.rightMargin = dp(8)
+            }
+            this.layoutParams = lp
+        }
+
+        val closeBtn = TextView(this).apply {
+            this.text = "CLOSE"
+            this.setTextColor(Color.parseColor("#94A3B8"))
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            this.typeface = Typeface.MONOSPACE
+            this.setPadding(dp(14), dp(8), dp(14), dp(8))
+            this.background = createMechanicalButtonBackground(false)
+            this.setOnClickListener {
+                try { rootContainer.removeView(overlay) } catch (_: Throwable) {}
+                audioExtractDialogOverlay = null
+            }
+        }
+
+        buttonRow.addView(openBtn)
+        buttonRow.addView(shareBtn)
+        buttonRow.addView(closeBtn)
+        card.addView(buttonRow)
+        overlay.addView(card)
+        rootContainer.addView(overlay)
+
+        VideoDownloaderPlugin.extractAudioDirect(
+            this,
+            srcUri,
+            currentItem.title,
+            onProgress = { pct ->
+                mainHandler.post {
+                    progressBar.progress = pct
+                    statusTv.text = "Extracting audio track ($pct%)..."
+                }
+            },
+            onSuccess = { outUri, fileName ->
+                mainHandler.post {
+                    progressBar.progress = 100
+                    statusTv.text = "Saved to Music/OmniDrop ($fileName)"
+                    statusTv.setTextColor(Color.parseColor("#10B981"))
+                    buttonRow.visibility = View.VISIBLE
+                    openBtn.setOnClickListener {
+                        try {
+                            val intent = Intent(Intent.ACTION_VIEW).apply {
+                                this.setDataAndType(outUri, "audio/*")
+                                this.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                            startActivity(intent)
+                        } catch (e: Exception) {
+                            flashTitleBanner("No audio player found to open file")
+                        }
+                    }
+                    shareBtn.setOnClickListener {
+                        try {
+                            val intent = Intent(Intent.ACTION_SEND).apply {
+                                this.type = "audio/*"
+                                this.putExtra(Intent.EXTRA_STREAM, outUri)
+                                this.putExtra(Intent.EXTRA_SUBJECT, fileName)
+                                this.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            startActivity(Intent.createChooser(intent, "Share Audio"))
+                        } catch (_: Exception) {}
+                    }
+                }
+            },
+            onError = { errMsg ->
+                mainHandler.post {
+                    statusTv.text = "Extraction failed: $errMsg"
+                    statusTv.setTextColor(Color.parseColor("#F43F5E"))
+                    buttonRow.visibility = View.VISIBLE
+                    openBtn.visibility = View.GONE
+                    shareBtn.visibility = View.GONE
+                    closeBtn.text = "DISMISS"
+                }
+            }
+        )
+    }
+
     override fun onPause() {
         super.onPause()
-        FloatingBubbleService.setOmniDropForeground(false)
-        saveCurrentPlaybackPosition()
-        val isPlaying = try { playerReady && videoView.isPlaying } catch (_: Throwable) { false }
-        if (isPlaying) {
-            try { videoView.pause() } catch (_: Throwable) {}
-            playPauseButton.text = "▶"
+        val inPip = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) isInPictureInPictureMode else false
+        if (!inPip) {
+            FloatingBubbleService.setOmniDropForeground(false)
+            saveCurrentPlaybackPosition()
+            val isPlaying = try { playerReady && videoView.isPlaying } catch (_: Throwable) { false }
+            if (isPlaying) {
+                try { videoView.pause() } catch (_: Throwable) {}
+                playPauseButton.text = "▶"
+            }
+        } else {
+            FloatingBubbleService.setOmniDropForeground(false)
         }
         mainHandler.removeCallbacks(updateProgressRunnable)
         mainHandler.removeCallbacks(hideControlsRunnable)
@@ -2051,16 +2440,22 @@ class VideoPlayerActivity : Activity() {
 
     override fun onStop() {
         super.onStop()
-        FloatingBubbleService.setOmniDropForeground(false)
+        val inPip = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) isInPictureInPictureMode else false
+        if (!inPip) {
+            FloatingBubbleService.setOmniDropForeground(false)
+        }
     }
 
     override fun onResume() {
         super.onResume()
-        FloatingBubbleService.setOmniDropForeground(true)
-        if (isControlsVisible) {
-            scheduleControlsAutoHide()
-        } else {
-            hideSystemUI()
+        val inPip = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) isInPictureInPictureMode else false
+        if (!inPip) {
+            FloatingBubbleService.setOmniDropForeground(true)
+            if (isControlsVisible) {
+                scheduleControlsAutoHide()
+            } else {
+                hideSystemUI()
+            }
         }
     }
 
@@ -2077,6 +2472,11 @@ class VideoPlayerActivity : Activity() {
         playerReady = false
         videoW = 0
         videoH = 0
+        if (isPipReceiverRegistered) {
+            try { unregisterReceiver(pipActionReceiver) } catch (_: Throwable) {}
+            isPipReceiverRegistered = false
+        }
+        audioExtractDialogOverlay?.let { try { rootContainer.removeView(it) } catch (_: Throwable) {} }
         FloatingBubbleService.setOmniDropForeground(false)
         saveCurrentPlaybackPosition()
         mainHandler.removeCallbacksAndMessages(null)
