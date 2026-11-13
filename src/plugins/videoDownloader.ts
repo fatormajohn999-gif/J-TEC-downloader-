@@ -46,11 +46,6 @@ export interface VideoDownloaderPlugin {
     floatingVibrate?: boolean;
     floatingHideInsideApp?: boolean;
     autoCheckUpdates?: boolean;
-    watchdogEnabled?: boolean;
-    watchdogPaused?: boolean;
-    watchdogInterval?: number;
-    watchdogActiveFrom?: string;
-    watchdogActiveTo?: string;
   }): Promise<{ saved: boolean }>;
   clearMetadataCache(): Promise<{ cleared: boolean }>;
   getLastCrash(): Promise<{ crash: string }>;
@@ -98,21 +93,15 @@ export interface VideoDownloaderPlugin {
     result: 'added' | 'already_added' | 'declined' | 'manual';
     error?: string;
   }>;
-  getWatchdogStatus(): Promise<{
+  getKeepAliveStatus(): Promise<{
     isRunning: boolean;
-    isPaused: boolean;
     lastPingTime: number;
     lastPingMs: number;
     lastPingStatus: string;
     nextPingTime: number;
     pingsToday: number;
     estimatedHoursThisMonth: number;
-    watchdogEnabled: boolean;
-    watchdogInterval: number;
-    watchdogActiveFrom: string;
-    watchdogActiveTo: string;
   }>;
-  setWatchdogPaused(options: { paused: boolean }): Promise<{ paused: boolean }>;
   addListener(
     eventName: 'onUrlReceived',
     listenerFunc: (data: { url: string }) => void
@@ -429,49 +418,30 @@ const VideoDownloaderWeb: VideoDownloaderPlugin = {
   async requestAddQuickTile() {
     return { supported: false, result: 'manual' as const };
   },
-  async getWatchdogStatus() {
+  async getKeepAliveStatus() {
     try {
-      const raw = localStorage.getItem('omnidrop_watchdog_state');
+      const raw = localStorage.getItem('omnidrop_keep_alive_state');
       const parsed = raw ? JSON.parse(raw) : {};
       return {
         isRunning: !!parsed.isRunning,
-        isPaused: !!parsed.isPaused,
         lastPingTime: parsed.lastPingTime || 0,
-        lastPingMs: parsed.lastPingMs || -1,
+        lastPingMs: parsed.lastPingMs ?? -1,
         lastPingStatus: parsed.lastPingStatus || 'IDLE',
         nextPingTime: parsed.nextPingTime || 0,
         pingsToday: parsed.pingsToday || 0,
         estimatedHoursThisMonth: parsed.estimatedHoursThisMonth || 0,
-        watchdogEnabled: !!parsed.watchdogEnabled,
-        watchdogInterval: parsed.watchdogInterval || 10,
-        watchdogActiveFrom: parsed.watchdogActiveFrom || '07:00',
-        watchdogActiveTo: parsed.watchdogActiveTo || '23:00',
       };
     } catch {
       return {
         isRunning: false,
-        isPaused: false,
         lastPingTime: 0,
         lastPingMs: -1,
         lastPingStatus: 'IDLE',
         nextPingTime: 0,
         pingsToday: 0,
         estimatedHoursThisMonth: 0,
-        watchdogEnabled: false,
-        watchdogInterval: 10,
-        watchdogActiveFrom: '07:00',
-        watchdogActiveTo: '23:00',
       };
     }
-  },
-  async setWatchdogPaused(options: { paused: boolean }) {
-    try {
-      const raw = localStorage.getItem('omnidrop_watchdog_state');
-      const parsed = raw ? JSON.parse(raw) : {};
-      parsed.isPaused = options.paused;
-      localStorage.setItem('omnidrop_watchdog_state', JSON.stringify(parsed));
-    } catch {}
-    return { paused: options.paused };
   },
   async addListener() {
     return {

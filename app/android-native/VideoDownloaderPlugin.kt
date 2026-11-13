@@ -658,6 +658,36 @@ class VideoDownloaderPlugin : Plugin() {
             return ret
         }
 
+        fun getTodayStatsSummary(context: Context): JSONObject {
+            val ret = JSONObject()
+            try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val summaryStr = prefs.getString(PREF_STATS_SUMMARY_KEY, "{}") ?: "{}"
+                val recordsStr = prefs.getString(PREF_STATS_RECORDS_KEY, "[]") ?: "[]"
+                val summary = JSONObject(summaryStr)
+                val records = JSONArray(recordsStr)
+                val totalDl = summary.optLong("totalDownloads", 0L)
+                val todayStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+                var todayCount = 0L
+                var todayBytes = 0L
+                for (i in 0 until records.length()) {
+                    val r = records.getJSONObject(i)
+                    if (r.optString("date") == todayStr) {
+                        todayCount += 1L
+                        todayBytes += r.optLong("bytes", 0L)
+                    }
+                }
+                ret.put("hasStats", totalDl > 0L || records.length() > 0)
+                ret.put("todayDownloads", todayCount)
+                ret.put("todayBytes", todayBytes)
+            } catch (_: Throwable) {
+                ret.put("hasStats", false)
+                ret.put("todayDownloads", 0L)
+                ret.put("todayBytes", 0L)
+            }
+            return ret
+        }
+
         fun resetStats(context: Context) {
             try {
                 val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -1274,12 +1304,6 @@ class VideoDownloaderPlugin : Plugin() {
         val floatingHideInsideApp = call.getBoolean("floatingHideInsideApp", true) ?: true
         val autoCheckUpdates = call.getBoolean("autoCheckUpdates", true) ?: true
 
-        val watchdogEnabled = call.getBoolean("watchdogEnabled", false) ?: false
-        val watchdogPaused = call.getBoolean("watchdogPaused", false) ?: false
-        val watchdogInterval = call.getInt("watchdogInterval", 10) ?: 10
-        val watchdogActiveFrom = call.getString("watchdogActiveFrom") ?: "07:00"
-        val watchdogActiveTo = call.getString("watchdogActiveTo") ?: "23:00"
-
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().apply {
             this.putString("backend_url", backendUrl)
@@ -1295,12 +1319,6 @@ class VideoDownloaderPlugin : Plugin() {
             this.putBoolean("floating_vibrate", floatingVibrate)
             this.putBoolean("floating_hide_inside_app", floatingHideInsideApp)
             this.putBoolean("auto_check_updates", autoCheckUpdates)
-
-            this.putBoolean("watchdog_enabled", watchdogEnabled)
-            this.putBoolean("watchdog_paused", watchdogPaused)
-            this.putInt("watchdog_interval_minutes", watchdogInterval)
-            this.putString("watchdog_active_from", watchdogActiveFrom)
-            this.putString("watchdog_active_to", watchdogActiveTo)
             this.apply()
         }
 
@@ -1496,65 +1514,43 @@ class VideoDownloaderPlugin : Plugin() {
     }
 
     @PluginMethod
-    fun getWatchdogStatus(call: PluginCall) {
+    fun getKeepAliveStatus(call: PluginCall) {
         val ctx = context ?: activity ?: run {
             call.reject("Context unavailable")
             return
         }
         val p = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val isServiceRunning = FloatingBubbleService.instance != null
-        val watchdogEnabled = p.getBoolean("watchdog_enabled", false)
-        val isPaused = p.getBoolean("watchdog_paused", false)
-        val lastPingTime = p.getLong("watchdog_last_ping_time", 0L)
-        val lastPingMs = p.getInt("watchdog_last_ping_ms", -1)
-        val lastPingStatus = p.getString("watchdog_last_ping_status", "IDLE") ?: "IDLE"
-        val nextPingTime = p.getLong("watchdog_next_ping_time", 0L)
-        val pingsToday = p.getInt("watchdog_pings_today", 0)
-        val interval = p.getInt("watchdog_interval_minutes", 10)
-        val activeFrom = p.getString("watchdog_active_from", "07:00") ?: "07:00"
-        val activeTo = p.getString("watchdog_active_to", "23:00") ?: "23:00"
+        val lastPingTime = p.getLong(FloatingBubbleService.PREF_KEEP_ALIVE_LAST_TIME, 0L)
+        val lastPingMs = p.getInt(FloatingBubbleService.PREF_KEEP_ALIVE_LAST_MS, -1)
+        val lastPingStatus = p.getString(FloatingBubbleService.PREF_KEEP_ALIVE_LAST_STATUS, "IDLE") ?: "IDLE"
+        val nextPingTime = p.getLong(FloatingBubbleService.PREF_KEEP_ALIVE_NEXT_TIME, 0L)
+
+        val todayDateStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+        val savedDate = p.getString(FloatingBubbleService.PREF_KEEP_ALIVE_LAST_DATE, "") ?: ""
+        val pingsToday = if (savedDate == todayDateStr) {
+            p.getInt(FloatingBubbleService.PREF_KEEP_ALIVE_PINGS_TODAY, 0)
+        } else {
+            0
+        }
 
         val currentMonthKey = SimpleDateFormat("yyyy-MM", Locale.US).format(Date())
-        val savedMonth = p.getString("watchdog_active_month_key", "")
+        val savedMonth = p.getString(FloatingBubbleService.PREF_KEEP_ALIVE_ACTIVE_MONTH_KEY, "") ?: ""
         val totalMinutes = if (savedMonth == currentMonthKey) {
-            p.getInt("watchdog_active_minutes_month", 0)
+            p.getInt(FloatingBubbleService.PREF_KEEP_ALIVE_ACTIVE_MINUTES_MONTH, 0)
         } else {
             0
         }
         val estimatedHours = Math.round((totalMinutes / 60.0) * 10.0) / 10.0
 
         val ret = JSObject().apply {
-            this.put("isRunning", isServiceRunning && watchdogEnabled)
-            this.put("isPaused", isPaused)
+            this.put("isRunning", isServiceRunning)
             this.put("lastPingTime", lastPingTime)
             this.put("lastPingMs", lastPingMs)
             this.put("lastPingStatus", lastPingStatus)
             this.put("nextPingTime", nextPingTime)
             this.put("pingsToday", pingsToday)
             this.put("estimatedHoursThisMonth", estimatedHours)
-            this.put("watchdogEnabled", watchdogEnabled)
-            this.put("watchdogInterval", interval)
-            this.put("watchdogActiveFrom", activeFrom)
-            this.put("watchdogActiveTo", activeTo)
-        }
-        call.resolve(ret)
-    }
-
-    @PluginMethod
-    fun setWatchdogPaused(call: PluginCall) {
-        val paused = call.getBoolean("paused", false) ?: false
-        val ctx = context ?: activity ?: run {
-            call.reject("Context unavailable")
-            return
-        }
-        val p = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        p.edit().apply {
-            this.putBoolean("watchdog_paused", paused)
-            this.apply()
-        }
-        FloatingBubbleService.instance?.syncViewsAndWatchdog()
-        val ret = JSObject().apply {
-            this.put("paused", paused)
         }
         call.resolve(ret)
     }
