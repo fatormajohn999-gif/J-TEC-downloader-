@@ -97,6 +97,8 @@ export interface VideoDownloaderPlugin {
   clearMetadataCache(): Promise<{ cleared: boolean }>;
   getLastCrash(): Promise<{ crash: string }>;
   clearLastCrash(): Promise<{ cleared: boolean }>;
+  getNetworkLog(): Promise<{ log: string }>;
+  clearNetworkLog(): Promise<{ cleared: boolean }>;
   getAppVersion(): Promise<{ versionName: string; versionCode: number }>;
   downloadAndInstallUpdate(options: {
     url: string;
@@ -353,6 +355,19 @@ const VideoDownloaderWeb: VideoDownloaderPlugin = {
     return { crash: '' };
   },
   async clearLastCrash() {
+    return { cleared: true };
+  },
+  async getNetworkLog() {
+    try {
+      return { log: localStorage.getItem('omnidrop_network_log') || '' };
+    } catch {
+      return { log: '' };
+    }
+  },
+  async clearNetworkLog() {
+    try {
+      localStorage.removeItem('omnidrop_network_log');
+    } catch {}
     return { cleared: true };
   },
   async getAppVersion() {

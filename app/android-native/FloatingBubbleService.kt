@@ -280,6 +280,9 @@ class FloatingBubbleService : Service() {
     private var activeDownloadOutputStream: OutputStream? = null
     private var activeTargetUri: Uri? = null
     private var activeNormalizedUrl: String? = null
+    @Volatile private var isWaitingForBytes: Boolean = false
+    @Volatile private var downloadWaitStartedAt: Long = 0L
+    @Volatile private var wakeRetryStatusText: String? = null
 
     // Download Queue
     private val downloadQueue = ArrayDeque<String>()
@@ -337,6 +340,16 @@ class FloatingBubbleService : Service() {
     // Threading
     private val mainHandler = Handler(Looper.getMainLooper())
     private val backgroundExecutor = Executors.newFixedThreadPool(3)
+
+    private val downloadWaitTimerRunnable = object : Runnable {
+        override fun run() {
+            if (!isDownloading || !isWaitingForBytes || isDownloadCancelled || isServiceDestroyed) return
+            val elapsedSec = ((System.currentTimeMillis() - downloadWaitStartedAt) / 1000L).coerceAtLeast(1L)
+            val override = wakeRetryStatusText
+            progressStatusText?.text = if (override != null) override else "CONNECTING... ${elapsedSec}s"
+            mainHandler.postDelayed(this, 1000L)
+        }
+    }
 
     // Periodic Update Check Runnable (5s after start, then every 4 hours)
     private val updateCheckRunnable = object : Runnable {
@@ -1694,8 +1707,17 @@ class FloatingBubbleService : Service() {
 
     private fun cancelCurrentDownload() {
         isDownloadCancelled = true
+        isWaitingForBytes = false
+        wakeRetryStatusText = null
+        mainHandler.removeCallbacks(downloadWaitTimerRunnable)
         try { activeDownloadOutputStream?.close() } catch (_: Exception) {}
-        try { activeDownloadConnection?.disconnect() } catch (_: Exception) {}
+        val connToAbort = activeDownloadConnection
+        activeDownloadConnection = null
+        if (connToAbort != null) {
+            Thread {
+                try { connToAbort.disconnect() } catch (_: Throwable) {}
+            }.start()
+        }
         activeTargetUri?.let { uri ->
             try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
         }
@@ -2138,6 +2160,9 @@ class FloatingBubbleService : Service() {
 
         isDownloading = true
         isDownloadCancelled = false
+        isWaitingForBytes = true
+        downloadWaitStartedAt = System.currentTimeMillis()
+        wakeRetryStatusText = null
         activeNormalizedUrl = normalizedUrl
         activeTargetUri = null
         activeDownloadConnection = null
@@ -2154,8 +2179,10 @@ class FloatingBubbleService : Service() {
             progressContainer?.visibility = View.VISIBLE
             finishedActionsLayout?.visibility = View.GONE
             segmentedProgressBar?.setProgress(0)
-            progressStatusText?.text = "Connecting to server..."
+            progressStatusText?.text = "CONNECTING... 1s"
             progressSpeedText?.text = ""
+            mainHandler.removeCallbacks(downloadWaitTimerRunnable)
+            mainHandler.postDelayed(downloadWaitTimerRunnable, 1000L)
         }
 
         backgroundExecutor.execute {
@@ -2164,65 +2191,14 @@ class FloatingBubbleService : Service() {
             var input: InputStream? = null
             var output: OutputStream? = null
             var title = "Video"
+            var streamSucceeded = false
+            val operationStartMs = System.currentTimeMillis()
+            val maxOperationMs = 300_000L
 
             try {
-                // Step 1: /health wake-up polling
-                var isReady = false
-                val healthUrl = "${backendUrl.removeSuffix("/")}/health"
-
-                for (attempt in 1..15) {
-                    if (isDownloadCancelled) throw InterruptedException("Cancelled")
-                    mainHandler.post {
-                        progressStatusText?.text = if (attempt > 1) "Waking server... ($attempt/15)" else "Connecting..."
-                    }
-                    try {
-                        val hConn = (URL(healthUrl).openConnection() as HttpURLConnection).apply {
-                            this.connectTimeout = 3000
-                            this.readTimeout = 3000
-                            if (apiKey.isNotBlank()) this.setRequestProperty("x-api-key", apiKey)
-                        }
-                        if (hConn.responseCode == HttpURLConnection.HTTP_OK) {
-                            isReady = true
-                            hConn.disconnect()
-                            break
-                        }
-                        hConn.disconnect()
-                    } catch (_: Exception) {}
-                    Thread.sleep(2000L)
-                }
-
                 if (isDownloadCancelled) throw InterruptedException("Cancelled")
 
-                if (!isReady) {
-                    val failPlat = VideoDownloaderPlugin.detectPlatformName(normalizedUrl)
-                    VideoDownloaderPlugin.recordFailedLink(this@FloatingBubbleService, normalizedUrl, failPlat, if (title.isNotBlank()) title else "Video", "Backend unreachable")
-                    VideoDownloaderPlugin.recordFailedStat(this@FloatingBubbleService)
-                    val notifyFail = prefs?.getBoolean("notify_download_fail", true) ?: true
-                    if (notifyFail) {
-                        NotificationHelper.showDownloadFailedNotification(this@FloatingBubbleService, "Download Failed", "Backend unreachable")
-                    }
-                    mainHandler.post {
-                        progressStatusText?.text = "Backend unreachable."
-                        progressSpeedText?.text = "ERR"
-                        isDownloading = false
-                        lastFailedUrl = normalizedUrl
-                        tabInnerFrame?.setFailed()
-                        panelMachineCard?.setGlowColor(Color.parseColor("#EF4444"))
-                        segmentedProgressBar?.setProgressColor(Color.parseColor("#EF4444"))
-                        retryBtn?.visibility = View.VISIBLE
-                        updateSmartKeyUI()
-                        performHapticFeedback(isSuccess = false)
-                        mainHandler.postDelayed({ processNextInQueue() }, 1200L)
-                    }
-                    return@execute
-                }
-
-                // Step 2: Fetch metadata via /info for History
-                mainHandler.post {
-                    progressStatusText?.text = "Extracting video metadata..."
-                }
-
-                title = "Video"
+                // Step 1: Optional POST /info with 25s timeout (failure never blocks download)
                 var thumbnail = ""
                 var uploader = "Creator"
                 var platform = ""
@@ -2230,36 +2206,41 @@ class FloatingBubbleService : Service() {
 
                 try {
                     val infoEndpoint = "${backendUrl.removeSuffix("/")}/info"
-                    val iConn = (URL(infoEndpoint).openConnection() as HttpURLConnection).apply {
-                        this.requestMethod = "POST"
-                        this.connectTimeout = 10000
-                        this.readTimeout = 12000
-                        this.doOutput = true
-                        this.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-                        if (apiKey.isNotBlank()) this.setRequestProperty("x-api-key", apiKey)
+                    val infoHeaders = HashMap<String, String>().apply {
+                        this["Content-Type"] = "application/json; charset=UTF-8"
+                        if (apiKey.isNotBlank()) this["x-api-key"] = apiKey
                     }
                     val iPayload = JSONObject().apply { this.put("url", normalizedUrl) }
-                    iConn.outputStream.use { os ->
-                        os.write(iPayload.toString().toByteArray(Charsets.UTF_8))
-                        os.flush()
-                    }
-                    if (iConn.responseCode == HttpURLConnection.HTTP_OK) {
-                        val resp = iConn.inputStream.bufferedReader().use { it.readText() }
-                        val json = JSONObject(resp)
-                        title = json.optString("title", "")
-                        thumbnail = json.optString("thumbnail", "")
-                        uploader = json.optString("uploader", "Creator")
-                        platform = json.optString("platform", "")
-                        val qArr = json.optJSONArray("qualities")
-                        if (qArr != null) {
-                            for (qi in 0 until qArr.length()) {
-                                val qItem = qArr.optString(qi, "").lowercase()
-                                if (qItem.isNotBlank()) availableQualities.add(qItem)
+                    val infoResp = VideoDownloaderPlugin.httpRequest(
+                        context = this@FloatingBubbleService,
+                        method = "POST",
+                        url = infoEndpoint,
+                        headers = infoHeaders,
+                        body = iPayload.toString(),
+                        connectTimeoutMs = 25000,
+                        readTimeoutMs = 25000,
+                        streamBody = false,
+                        connectionRefCallback = { activeDownloadConnection = it }
+                    )
+                    activeDownloadConnection = null
+                    if (infoResp.statusCode in 200..299) {
+                        val respText = infoResp.bodyText()
+                        if (respText.isNotBlank()) {
+                            val json = JSONObject(respText)
+                            title = json.optString("title", "")
+                            thumbnail = json.optString("thumbnail", "")
+                            uploader = json.optString("uploader", "Creator")
+                            platform = json.optString("platform", "")
+                            val qArr = json.optJSONArray("qualities")
+                            if (qArr != null) {
+                                for (qi in 0 until qArr.length()) {
+                                    val qItem = qArr.optString(qi, "").lowercase()
+                                    if (qItem.isNotBlank()) availableQualities.add(qItem)
+                                }
                             }
                         }
                     }
-                    iConn.disconnect()
-                } catch (_: Exception) {}
+                } catch (_: Throwable) {}
 
                 if (isDownloadCancelled) throw InterruptedException("Cancelled")
 
@@ -2279,83 +2260,185 @@ class FloatingBubbleService : Service() {
                     }
                 }
 
-                // Step 3: Stream download to MediaStore
-                mainHandler.post {
-                    progressStatusText?.text = "Streaming full-res media..."
+                // Step 2: Direct POST /download with wake-up retry only when needed (timeout, connection error, or HTTP 502/503/504)
+                val downloadEndpoint = "${backendUrl.removeSuffix("/")}/download"
+                val dlHeaders = HashMap<String, String>().apply {
+                    this["Content-Type"] = "application/json; charset=UTF-8"
+                    this["Accept"] = "*/*"
+                    if (apiKey.isNotBlank()) this["x-api-key"] = apiKey
                 }
 
-                val downloadEndpoint = "${backendUrl.removeSuffix("/")}/download"
-                val urlObj = URL(downloadEndpoint)
-                fun openDownloadConn(qualityToUse: String): HttpURLConnection {
-                    val c = (urlObj.openConnection() as HttpURLConnection).apply {
-                        this.requestMethod = "POST"
-                        this.connectTimeout = 30000
-                        this.readTimeout = 180000
-                        this.doInput = true
-                        this.doOutput = true
-                        this.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-                        if (apiKey.isNotBlank()) this.setRequestProperty("x-api-key", apiKey)
+                var activeResp: VideoDownloaderPlugin.HttpResponseData? = null
+                val maxAttempts = 6
+                for (attempt in 1..maxAttempts) {
+                    if (isDownloadCancelled) throw InterruptedException("Cancelled")
+                    val elapsedTotal = System.currentTimeMillis() - operationStartMs
+                    if (elapsedTotal >= maxOperationMs) {
+                        throw java.io.IOException("Timed out after 5m limit")
                     }
+
+                    if (attempt > 1) {
+                        val wakeMsg = "SERVER IS WAKING UP... attempt $attempt/$maxAttempts"
+                        wakeRetryStatusText = wakeMsg
+                        mainHandler.post {
+                            progressStatusText?.text = wakeMsg
+                        }
+                    }
+
                     val payload = JSONObject().apply {
                         this.put("url", normalizedUrl)
-                        this.put("quality", qualityToUse)
+                        this.put("quality", effectiveQuality)
                     }
-                    c.outputStream.use { os ->
-                        os.write(payload.toString().toByteArray(Charsets.UTF_8))
-                        os.flush()
+                    var resp = VideoDownloaderPlugin.httpRequest(
+                        context = this@FloatingBubbleService,
+                        method = "POST",
+                        url = downloadEndpoint,
+                        headers = dlHeaders,
+                        body = payload.toString(),
+                        connectTimeoutMs = 30000,
+                        readTimeoutMs = 180000,
+                        streamBody = true,
+                        connectionRefCallback = {
+                            conn = it
+                            activeDownloadConnection = it
+                        }
+                    )
+
+                    if (isDownloadCancelled) throw InterruptedException("Cancelled")
+
+                    if (resp.statusCode !in 200..299 &&
+                        resp.statusCode !in listOf(0, 502, 503, 504) &&
+                        fallbackToBest &&
+                        !effectiveQuality.equals("best", ignoreCase = true) &&
+                        !effectiveQuality.equals("audio", ignoreCase = true)
+                    ) {
+                        effectiveQuality = "best"
+                        val fallbackPayload = JSONObject().apply {
+                            this.put("url", normalizedUrl)
+                            this.put("quality", effectiveQuality)
+                        }
+                        resp = VideoDownloaderPlugin.httpRequest(
+                            context = this@FloatingBubbleService,
+                            method = "POST",
+                            url = downloadEndpoint,
+                            headers = dlHeaders,
+                            body = fallbackPayload.toString(),
+                            connectTimeoutMs = 30000,
+                            readTimeoutMs = 180000,
+                            streamBody = true,
+                            connectionRefCallback = {
+                                conn = it
+                                activeDownloadConnection = it
+                            }
+                        )
+                        if (isDownloadCancelled) throw InterruptedException("Cancelled")
                     }
-                    return c
+
+                    if (resp.statusCode in 200..299 && resp.inputStream != null) {
+                        activeResp = resp
+                        break
+                    }
+
+                    val isWakeRetryable = !resp.isNoInternet && (
+                        resp.isTimeout ||
+                        resp.isConnectionError ||
+                        resp.statusCode == 502 ||
+                        resp.statusCode == 503 ||
+                        resp.statusCode == 504
+                    )
+
+                    if (!isWakeRetryable) {
+                        isWaitingForBytes = false
+                        mainHandler.removeCallbacks(downloadWaitTimerRunnable)
+                        val immediateReason = resp.friendlyError.ifBlank { "Server returned ${resp.statusCode}" }
+                        lastFailedUrl = normalizedUrl
+                        currentDownloadSpeedMb = 0.0
+                        VideoDownloaderPlugin.recordFailedLink(this@FloatingBubbleService, normalizedUrl, cleanPlatform, title, immediateReason)
+                        VideoDownloaderPlugin.recordFailedStat(this@FloatingBubbleService)
+                        val notifyFail = prefs?.getBoolean("notify_download_fail", true) ?: true
+                        if (notifyFail) {
+                            NotificationHelper.showDownloadFailedNotification(this@FloatingBubbleService, "Download Failed", immediateReason)
+                        }
+                        mainHandler.post {
+                            progressStatusText?.text = immediateReason
+                            progressSpeedText?.text = "ERR"
+                            isDownloading = false
+                            speedArcGaugeView?.setSpeedMb(0f)
+                            tabInnerFrame?.setFailed()
+                            panelMachineCard?.setGlowColor(Color.parseColor("#EF4444"))
+                            segmentedProgressBar?.setProgressColor(Color.parseColor("#EF4444"))
+                            retryBtn?.visibility = View.VISIBLE
+                            updateSmartKeyUI()
+                            refreshClipboardHintChip()
+                            performHapticFeedback(isSuccess = false)
+                            mainHandler.postDelayed({ processNextInQueue() }, 1200L)
+                        }
+                        return@execute
+                    }
+
+                    if (attempt < maxAttempts) {
+                        val remainingMs = maxOperationMs - (System.currentTimeMillis() - operationStartMs)
+                        if (remainingMs <= 0L) {
+                            throw java.io.IOException("Timed out after 5m limit (${resp.friendlyError})")
+                        }
+                        val nextWakeMsg = "SERVER IS WAKING UP... attempt ${attempt + 1}/$maxAttempts"
+                        wakeRetryStatusText = nextWakeMsg
+                        mainHandler.post {
+                            progressStatusText?.text = nextWakeMsg
+                        }
+                        var slept = 0L
+                        val targetSleep = minOf(5000L, remainingMs)
+                        while (slept < targetSleep) {
+                            if (isDownloadCancelled) throw InterruptedException("Cancelled")
+                            val step = minOf(200L, targetSleep - slept)
+                            Thread.sleep(step)
+                            slept += step
+                        }
+                    } else {
+                        isWaitingForBytes = false
+                        mainHandler.removeCallbacks(downloadWaitTimerRunnable)
+                        val finalReason = resp.friendlyError.ifBlank { "Server failed after $maxAttempts attempts" }
+                        lastFailedUrl = normalizedUrl
+                        currentDownloadSpeedMb = 0.0
+                        VideoDownloaderPlugin.recordFailedLink(this@FloatingBubbleService, normalizedUrl, cleanPlatform, title, finalReason)
+                        VideoDownloaderPlugin.recordFailedStat(this@FloatingBubbleService)
+                        val notifyFail = prefs?.getBoolean("notify_download_fail", true) ?: true
+                        if (notifyFail) {
+                            NotificationHelper.showDownloadFailedNotification(this@FloatingBubbleService, "Download Failed", finalReason)
+                        }
+                        mainHandler.post {
+                            progressStatusText?.text = finalReason
+                            progressSpeedText?.text = "ERR"
+                            isDownloading = false
+                            speedArcGaugeView?.setSpeedMb(0f)
+                            tabInnerFrame?.setFailed()
+                            panelMachineCard?.setGlowColor(Color.parseColor("#EF4444"))
+                            segmentedProgressBar?.setProgressColor(Color.parseColor("#EF4444"))
+                            retryBtn?.visibility = View.VISIBLE
+                            updateSmartKeyUI()
+                            refreshClipboardHintChip()
+                            performHapticFeedback(isSuccess = false)
+                            mainHandler.postDelayed({ processNextInQueue() }, 1200L)
+                        }
+                        return@execute
+                    }
                 }
 
-                conn = openDownloadConn(effectiveQuality)
-                activeDownloadConnection = conn
+                val readyResp = activeResp ?: throw java.io.IOException("No response stream from server")
+                conn = readyResp.connection
+                val respStream = readyResp.inputStream ?: throw java.io.IOException("Empty response stream from server")
 
-                var respCode = conn.responseCode
-                if (respCode != HttpURLConnection.HTTP_OK && fallbackToBest && !effectiveQuality.equals("best", ignoreCase = true)) {
-                    try { conn.disconnect() } catch (_: Exception) {}
-                    effectiveQuality = "best"
-                    conn = openDownloadConn(effectiveQuality)
-                    activeDownloadConnection = conn
-                    respCode = conn.responseCode
-                }
-
-                if (respCode != HttpURLConnection.HTTP_OK) {
-                    val err = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: "HTTP $respCode"
-                    val shortReason = parseShortServerError(err)
-                    lastFailedUrl = normalizedUrl
-                    currentDownloadSpeedMb = 0.0
-                    VideoDownloaderPlugin.recordFailedLink(this@FloatingBubbleService, normalizedUrl, cleanPlatform, title, shortReason)
-                    VideoDownloaderPlugin.recordFailedStat(this@FloatingBubbleService)
-                    val notifyFail = prefs?.getBoolean("notify_download_fail", true) ?: true
-                    if (notifyFail) {
-                        NotificationHelper.showDownloadFailedNotification(this@FloatingBubbleService, "Download Failed", shortReason)
-                    }
-                    mainHandler.post {
-                        progressStatusText?.text = "Failed: $shortReason"
-                        progressSpeedText?.text = "ERR"
-                        isDownloading = false
-                        speedArcGaugeView?.setSpeedMb(0f)
-                        tabInnerFrame?.setFailed()
-                        panelMachineCard?.setGlowColor(Color.parseColor("#EF4444"))
-                        segmentedProgressBar?.setProgressColor(Color.parseColor("#EF4444"))
-                        retryBtn?.visibility = View.VISIBLE
-                        updateSmartKeyUI()
-                        refreshClipboardHintChip()
-                        performHapticFeedback(isSuccess = false)
-                        mainHandler.postDelayed({ processNextInQueue() }, 1200L)
-                    }
-                    return@execute
-                }
-
-                val contentType = conn.contentType ?: ""
+                val contentType = readyResp.contentType
                 if (contentType.contains("application/zip", ignoreCase = true)) {
+                    isWaitingForBytes = false
+                    mainHandler.removeCallbacks(downloadWaitTimerRunnable)
                     mainHandler.post {
-                        progressStatusText?.text = "Extracting photo slideshow archive..."
+                        progressStatusText?.text = "DOWNLOADING..."
                         segmentedProgressBar?.setProgress(30)
                         tabInnerFrame?.setDownloading(30)
                     }
 
-                    val zis = ZipInputStream(conn.inputStream)
+                    val zis = ZipInputStream(respStream)
                     val resolver = contentResolver
                     val savedUris = ArrayList<Uri>()
                     var zipEntry = zis.nextEntry
@@ -2422,6 +2505,7 @@ class FloatingBubbleService : Service() {
                         zipEntry = zis.nextEntry
                     }
                     zis.close()
+                    streamSucceeded = true
 
                     val totalPhotos = savedUris.size
                     val firstUri = savedUris.firstOrNull()?.toString() ?: ""
@@ -2570,8 +2654,8 @@ class FloatingBubbleService : Service() {
 
                 output = resolver.openOutputStream(targetUri)
                 activeDownloadOutputStream = output
-                input = conn.inputStream
-                val totalBytes = conn.contentLengthLong
+                input = respStream
+                val totalBytes = readyResp.contentLength
 
                 var bytesCopied: Long = 0
                 val buffer = ByteArray(8192)
@@ -2581,6 +2665,13 @@ class FloatingBubbleService : Service() {
 
                 while (input.read(buffer).also { bytesRead = it } != -1) {
                     if (isDownloadCancelled) throw InterruptedException("Cancelled")
+                    if (isWaitingForBytes) {
+                        isWaitingForBytes = false
+                        mainHandler.removeCallbacks(downloadWaitTimerRunnable)
+                        mainHandler.post {
+                            progressStatusText?.text = "DOWNLOADING..."
+                        }
+                    }
                     output?.write(buffer, 0, bytesRead)
                     bytesCopied += bytesRead
                     bytesSinceLastSample += bytesRead
@@ -2600,12 +2691,13 @@ class FloatingBubbleService : Service() {
                             segmentedProgressBar?.setProgress(pct)
                             tabInnerFrame?.setDownloading(pct)
                             speedArcGaugeView?.setSpeedMb(speedMbPerSec.toFloat())
-                            progressStatusText?.text = "$totalMb MB ($pct%)"
+                            progressStatusText?.text = "DOWNLOADING... $totalMb MB ($pct%)"
                             progressSpeedText?.text = String.format(Locale.US, "DN %.1f MB/s", speedMbPerSec)
                         }
                     }
                 }
                 output?.flush()
+                streamSucceeded = true
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     val updateValues = ContentValues().apply {
@@ -2698,7 +2790,7 @@ class FloatingBubbleService : Service() {
                     mainHandler.postDelayed({ processNextInQueue() }, 800L)
                 }
 
-            } catch (e: Exception) {
+            } catch (t: Throwable) {
                 if (targetUri != null) {
                     try { contentResolver.delete(targetUri, null, null) } catch (_: Exception) {}
                 }
@@ -2716,7 +2808,7 @@ class FloatingBubbleService : Service() {
                         refreshClipboardHintChip()
                     }
                 } else {
-                    val rawMsg = e.message ?: "Failed"
+                    val rawMsg = t.message ?: "Connection error"
                     val shortReason = parseShortServerError(rawMsg)
                     lastFailedUrl = normalizedUrl
                     val failPlat = VideoDownloaderPlugin.detectPlatformName(normalizedUrl)
@@ -2727,7 +2819,7 @@ class FloatingBubbleService : Service() {
                         NotificationHelper.showDownloadFailedNotification(this@FloatingBubbleService, "Download Failed", shortReason)
                     }
                     mainHandler.post {
-                        progressStatusText?.text = "Failed: $shortReason"
+                        progressStatusText?.text = shortReason
                         progressSpeedText?.text = "ERR"
                         isDownloading = false
                         speedArcGaugeView?.setSpeedMb(0f)
@@ -2742,11 +2834,18 @@ class FloatingBubbleService : Service() {
                     }
                 }
             } finally {
+                isWaitingForBytes = false
+                wakeRetryStatusText = null
+                mainHandler.removeCallbacks(downloadWaitTimerRunnable)
                 VideoDownloaderPlugin.inFlightDownloads.remove(normalizedUrl)
+                activeDownloadConnection = null
+                activeDownloadOutputStream = null
                 currentDownloadSpeedMb = 0.0
                 try { input?.close() } catch (_: Exception) {}
                 try { output?.close() } catch (_: Exception) {}
-                conn?.disconnect()
+                if (!streamSucceeded || isDownloadCancelled) {
+                    try { conn?.disconnect() } catch (_: Throwable) {}
+                }
             }
         }
     }
@@ -2886,15 +2985,17 @@ class FloatingBubbleService : Service() {
             try {
                 var netElapsed = -1
                 try {
-                    val nStart = System.currentTimeMillis()
-                    val nConn = (URL("https://www.gstatic.com/generate_204").openConnection() as HttpURLConnection).apply {
-                        this.connectTimeout = 3000
-                        this.readTimeout = 3000
+                    val resp = VideoDownloaderPlugin.httpRequest(
+                        context = this@FloatingBubbleService,
+                        method = "GET",
+                        url = "https://www.gstatic.com/generate_204",
+                        connectTimeoutMs = 5000,
+                        readTimeoutMs = 5000,
+                        streamBody = false
+                    )
+                    if (resp.statusCode in 200..204) {
+                        netElapsed = resp.elapsedMs.toInt()
                     }
-                    if (nConn.responseCode in 200..204) {
-                        netElapsed = (System.currentTimeMillis() - nStart).toInt()
-                    }
-                    nConn.disconnect()
                 } catch (_: Throwable) {}
 
                 mainHandler.post {
@@ -2911,7 +3012,11 @@ class FloatingBubbleService : Service() {
     private fun formatPingDisplay(pingMs: Int, stateStr: String): String {
         if (stateStr == "SLEEP") return "ZZ"
         if (stateStr == "WAKING") return "WAKE"
-        if (stateStr == "OFF" || pingMs < 0) return "OFF"
+        if (stateStr == "NO_RESPONSE" || stateStr == "OFF") return "NO RESP"
+        if (stateStr == "SLOW") {
+            return if (pingMs >= 0) String.format(Locale.US, "SLOW %.1fs", pingMs / 1000.0) else "SLOW"
+        }
+        if (pingMs < 0) return "OFF"
         return when {
             pingMs <= 999 -> "${pingMs}ms"
             pingMs < 10000 -> String.format(Locale.US, "%.1fs", pingMs / 1000.0)
@@ -2927,11 +3032,16 @@ class FloatingBubbleService : Service() {
             "ONLINE" -> {
                 serverLedDot?.background = createCircleDrawable(Color.parseColor("#10B981"))
                 serverStatusText?.text = formatPingDisplay(serverPingMs, serverState)
-                serverStatusText?.setTextColor(Color.parseColor("#00F0FF"))
+                serverStatusText?.setTextColor(Color.parseColor("#10B981"))
+            }
+            "SLOW" -> {
+                serverLedDot?.background = createCircleDrawable(Color.parseColor("#F59E0B"))
+                serverStatusText?.text = formatPingDisplay(serverPingMs, serverState)
+                serverStatusText?.setTextColor(Color.parseColor("#F59E0B"))
             }
             "SLEEP" -> {
                 serverLedDot?.background = createCircleDrawable(Color.parseColor("#64748B"))
-                serverStatusText?.text = "ZZ"
+                serverStatusText?.text = "ZZ SLEEP"
                 serverStatusText?.setTextColor(Color.parseColor("#94A3B8"))
             }
             "WAKING" -> {
@@ -2941,7 +3051,7 @@ class FloatingBubbleService : Service() {
             }
             else -> {
                 serverLedDot?.background = createCircleDrawable(Color.parseColor("#EF4444"))
-                serverStatusText?.text = "OFF"
+                serverStatusText?.text = "NO RESP"
                 serverStatusText?.setTextColor(Color.parseColor("#EF4444"))
             }
         }
@@ -3016,7 +3126,7 @@ class FloatingBubbleService : Service() {
                 keepAliveNextPingTime = 0L
                 mainHandler.post {
                     try {
-                        serverState = "OFF"
+                        serverState = "NO_RESPONSE"
                         serverPingMs = -1
                         updateInstrumentUI()
                         updateKeepAliveUI()
@@ -3035,36 +3145,31 @@ class FloatingBubbleService : Service() {
                 } catch (_: Throwable) {}
             }
 
-            var elapsed = -1
-            var resultStatus = "OFFLINE"
-            val start = System.currentTimeMillis()
+            val endpoint = "${urlSnapshot.removeSuffix("/")}/health"
+            val pingHeaders = HashMap<String, String>().apply {
+                this["User-Agent"] = "OmniDrop-KeepAlive/1.0"
+                if (keySnapshot.isNotBlank()) {
+                    this["x-api-key"] = keySnapshot
+                }
+            }
+            val resp = VideoDownloaderPlugin.httpRequest(
+                context = this@FloatingBubbleService,
+                method = "GET",
+                url = endpoint,
+                headers = pingHeaders,
+                connectTimeoutMs = 15000,
+                readTimeoutMs = 20000,
+                streamBody = false
+            )
 
-            try {
-                val endpoint = "${urlSnapshot.removeSuffix("/")}/health"
-                val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
-                    this.requestMethod = "GET"
-                    this.connectTimeout = 15000
-                    this.readTimeout = 15000
-                    this.setRequestProperty("User-Agent", "OmniDrop-KeepAlive/1.0")
-                    if (keySnapshot.isNotBlank()) {
-                        this.setRequestProperty("x-api-key", keySnapshot)
-                    }
-                }
-                val code = conn.responseCode
-                elapsed = (System.currentTimeMillis() - start).toInt()
-                conn.disconnect()
-                resultStatus = when {
-                    code in 200..299 -> "OK"
-                    code >= 500 -> "SLEEP"
-                    else -> "SLEEP"
-                }
-            } catch (t: Throwable) {
-                elapsed = (System.currentTimeMillis() - start).toInt()
-                resultStatus = when (t) {
-                    is SocketTimeoutException -> "SLEEP"
-                    is UnknownHostException, is ConnectException -> "OFFLINE"
-                    else -> if (elapsed >= 8000) "SLEEP" else "OFFLINE"
-                }
+            val elapsed = resp.elapsedMs.toInt()
+            val isSuccess200 = resp.statusCode in 200..299
+            val resultStatus = when {
+                isSuccess200 && elapsed < 1500 -> "OK"
+                isSuccess200 && elapsed <= 10000 -> "SLOW"
+                isSuccess200 -> "NO_RESPONSE"
+                resp.isTimeout -> "SLEEP"
+                else -> "NO_RESPONSE"
             }
 
             if (isServiceDestroyed) return
@@ -3080,7 +3185,7 @@ class FloatingBubbleService : Service() {
             keepAliveLastStatus = finalStatus
             keepAliveNextPingTime = nextTime
 
-            if (finalStatus == "OK" && keepAliveSessionFirstAwakeTime == 0L) {
+            if (isSuccess200 && keepAliveSessionFirstAwakeTime == 0L) {
                 keepAliveSessionFirstAwakeTime = now
             }
 
@@ -3151,13 +3256,21 @@ class FloatingBubbleService : Service() {
                                 pingGraphView?.addSample(finalElapsed)
                             }
                         }
+                        "SLOW" -> {
+                            serverPingMs = finalElapsed
+                            serverState = "SLOW"
+                            serverReactorView?.triggerFlash()
+                            if (finalElapsed > 0) {
+                                pingGraphView?.addSample(finalElapsed)
+                            }
+                        }
                         "SLEEP" -> {
                             serverPingMs = finalElapsed
                             serverState = "SLEEP"
                         }
                         else -> {
-                            serverPingMs = -1
-                            serverState = "OFF"
+                            serverPingMs = finalElapsed
+                            serverState = "NO_RESPONSE"
                         }
                     }
                     tabInnerFrame?.updateStatus(serverState, serverPingMs)
@@ -3189,8 +3302,9 @@ class FloatingBubbleService : Service() {
             val ledColor = when {
                 isKeepAlivePinging -> Color.parseColor("#F59E0B")
                 keepAliveLastStatus == "OK" -> Color.parseColor("#10B981")
+                keepAliveLastStatus == "SLOW" -> Color.parseColor("#F59E0B")
                 keepAliveLastStatus == "SLEEP" -> Color.parseColor("#64748B")
-                keepAliveLastStatus == "OFFLINE" -> Color.parseColor("#EF4444")
+                keepAliveLastStatus == "NO_RESPONSE" || keepAliveLastStatus == "OFFLINE" -> Color.parseColor("#EF4444")
                 else -> Color.parseColor("#10B981")
             }
             keepAliveLedDot?.background = createCircleDrawable(ledColor)
@@ -3209,14 +3323,23 @@ class FloatingBubbleService : Service() {
         } else if (keepAliveLastPingTime > 0L) {
             val clockStr = timeFormat.format(Date(keepAliveLastPingTime))
             val detailStr = when (keepAliveLastStatus) {
-                "OK" -> if (keepAliveLastPingMs >= 0) "${keepAliveLastPingMs}ms" else "OK"
-                "SLEEP" -> "sleeping"
-                "OFFLINE" -> "offline"
+                "OK" -> if (keepAliveLastPingMs >= 0) "${keepAliveLastPingMs}ms · AWAKE" else "AWAKE"
+                "SLOW" -> {
+                    val s = if (keepAliveLastPingMs >= 0) String.format(Locale.US, "%.1fs", keepAliveLastPingMs / 1000.0) else "slow"
+                    "AWAKE · SLOW $s"
+                }
+                "SLEEP" -> "ZZ SLEEPING"
+                "NO_RESPONSE", "OFFLINE" -> "NO RESPONSE"
                 else -> if (keepAliveLastPingMs >= 0) "${keepAliveLastPingMs}ms" else "--"
             }
             keepAliveLastPingLine?.text = "LAST PING $clockStr · $detailStr"
             keepAliveLastPingLine?.setTextColor(
-                if (keepAliveLastStatus == "OFFLINE") Color.parseColor("#F87171") else Color.parseColor("#CBD5E1")
+                when (keepAliveLastStatus) {
+                    "SLOW" -> Color.parseColor("#FBBF24")
+                    "NO_RESPONSE", "OFFLINE" -> Color.parseColor("#F87171")
+                    "OK" -> Color.parseColor("#34D399")
+                    else -> Color.parseColor("#CBD5E1")
+                }
             )
         } else {
             keepAliveLastPingLine?.text = if (isKeepAlivePinging) "LAST PING probing..." else "LAST PING pending..."
@@ -3240,19 +3363,20 @@ class FloatingBubbleService : Service() {
         }
 
         // 4. AWAKE FOR Xh Ym
-        val isAwakeRecent = keepAliveLastStatus == "OK" && keepAliveLastPingTime > 0L && (now - keepAliveLastPingTime) <= KEEP_ALIVE_FRESH_WINDOW_MS
+        val isAwakeStatus = keepAliveLastStatus == "OK" || keepAliveLastStatus == "SLOW"
+        val isAwakeRecent = isAwakeStatus && keepAliveLastPingTime > 0L && (now - keepAliveLastPingTime) <= KEEP_ALIVE_FRESH_WINDOW_MS
         if (isAwakeRecent && keepAliveSessionFirstAwakeTime > 0L) {
             val totalMin = ((now - keepAliveSessionFirstAwakeTime) / 60_000L).coerceAtLeast(0L)
             val hrs = totalMin / 60L
             val mins = totalMin % 60L
             val durStr = if (hrs > 0L) "${hrs}h ${mins}m" else "${mins}m"
             keepAliveAwakeForLine?.text = "AWAKE FOR $durStr"
-            keepAliveAwakeForLine?.setTextColor(Color.parseColor("#34D399"))
+            keepAliveAwakeForLine?.setTextColor(if (keepAliveLastStatus == "SLOW") Color.parseColor("#FBBF24") else Color.parseColor("#34D399"))
         } else if (keepAliveLastStatus == "SLEEP") {
-            keepAliveAwakeForLine?.text = "AWAKE FOR asleep"
+            keepAliveAwakeForLine?.text = "AWAKE FOR zz sleeping"
             keepAliveAwakeForLine?.setTextColor(Color.parseColor("#94A3B8"))
-        } else if (keepAliveLastStatus == "OFFLINE" || !hasUrl) {
-            keepAliveAwakeForLine?.text = "AWAKE FOR offline"
+        } else if (keepAliveLastStatus == "NO_RESPONSE" || keepAliveLastStatus == "OFFLINE" || !hasUrl) {
+            keepAliveAwakeForLine?.text = "AWAKE FOR no response"
             keepAliveAwakeForLine?.setTextColor(Color.parseColor("#F87171"))
         } else {
             keepAliveAwakeForLine?.text = "AWAKE FOR 0m"
@@ -3275,18 +3399,24 @@ class FloatingBubbleService : Service() {
         // 6. Reactor View State
         val reactor = serverReactorView ?: return
         when {
-            !hasUrl || keepAliveLastStatus == "OFFLINE" -> {
-                reactor.updateState("OFFLINE", 0)
+            !hasUrl || keepAliveLastStatus == "NO_RESPONSE" || keepAliveLastStatus == "OFFLINE" -> {
+                reactor.updateState("NO_RESPONSE", 0, keepAliveLastPingMs)
             }
             isKeepAlivePinging -> {
                 val sec = ((now - keepAlivePingStartedAt) / 1000L).toInt().coerceAtLeast(0)
-                reactor.updateState("WAKING", sec)
+                reactor.updateState("WAKING", sec, keepAliveLastPingMs)
+            }
+            keepAliveLastStatus == "SLOW" && isAwakeRecent -> {
+                reactor.updateState("SLOW", 0, keepAliveLastPingMs)
             }
             isAwakeRecent -> {
-                reactor.updateState("AWAKE", 0)
+                reactor.updateState("AWAKE", 0, keepAliveLastPingMs)
+            }
+            keepAliveLastStatus == "SLEEP" -> {
+                reactor.updateState("SLEEP", 0, keepAliveLastPingMs)
             }
             else -> {
-                reactor.updateState("SLEEP", 0)
+                reactor.updateState("SLEEP", 0, keepAliveLastPingMs)
             }
         }
     }
@@ -3312,6 +3442,7 @@ class FloatingBubbleService : Service() {
         mainHandler.removeCallbacks(trafficRunnable)
         mainHandler.removeCallbacks(idleFadeRunnable)
         mainHandler.removeCallbacks(updateCheckRunnable)
+        mainHandler.removeCallbacks(downloadWaitTimerRunnable)
         autoClearRunnable?.let { mainHandler.removeCallbacks(it) }
         serverReactorView?.stopAnimations()
 
@@ -3330,16 +3461,20 @@ class FloatingBubbleService : Service() {
     private fun checkAppUpdatesInBackground() {
         backgroundExecutor.execute {
             try {
-                val url = URL("https://api.github.com/repos/$GITHUB_REPO/releases/latest")
-                val conn = (url.openConnection() as HttpURLConnection).apply {
-                    this.connectTimeout = 8000
-                    this.readTimeout = 8000
-                    this.setRequestProperty("Accept", "application/vnd.github.v3+json")
-                    this.setRequestProperty("User-Agent", "OmniDrop-Android")
-                }
-                if (conn.responseCode == HttpURLConnection.HTTP_OK) {
-                    val responseText = conn.inputStream.bufferedReader().use { it.readText() }
-                    conn.disconnect()
+                val resp = VideoDownloaderPlugin.httpRequest(
+                    context = this@FloatingBubbleService,
+                    method = "GET",
+                    url = "https://api.github.com/repos/$GITHUB_REPO/releases/latest",
+                    headers = mapOf(
+                        "Accept" to "application/vnd.github.v3+json",
+                        "User-Agent" to "OmniDrop-Android"
+                    ),
+                    connectTimeoutMs = 8000,
+                    readTimeoutMs = 8000,
+                    streamBody = false
+                )
+                if (resp.statusCode in 200..299) {
+                    val responseText = resp.bodyText()
                     val releaseObj = JSONObject(responseText)
                     val tagName = releaseObj.optString("tag_name", "")
                     val body = releaseObj.optString("body", "")
@@ -3362,10 +3497,8 @@ class FloatingBubbleService : Service() {
                     if (remoteCode > currentCode && remoteCode != skippedVersion && remoteCode != lastNotified) {
                         showUpdateNotification(tagName, body, remoteCode)
                     }
-                } else {
-                    conn.disconnect()
                 }
-            } catch (_: Exception) {}
+            } catch (_: Throwable) {}
         }
     }
 
@@ -3624,7 +3757,7 @@ class FloatingBubbleService : Service() {
                 TabVisualState.DOWNLOADING -> Color.parseColor("#00F0FF")
                 else -> when (state) {
                     "ONLINE" -> Color.parseColor("#10B981")
-                    "SLEEP" -> Color.parseColor("#F59E0B")
+                    "SLOW", "WAKING", "SLEEP" -> Color.parseColor("#F59E0B")
                     else -> Color.parseColor("#EF4444")
                 }
             }
@@ -3656,13 +3789,22 @@ class FloatingBubbleService : Service() {
                                 canvas.drawText("ms", w * 0.5f, textY + (12f * density * scale), subTextPaint)
                             }
                         }
-                        "SLEEP" -> {
+                        "SLOW" -> {
                             textPaint.color = Color.parseColor("#F59E0B")
+                            val display = if (pingMs >= 0) String.format(Locale.US, "%.1fs", pingMs / 1000.0) else "SLOW"
+                            canvas.drawText(display, w * 0.5f, textY, textPaint)
+                        }
+                        "SLEEP" -> {
+                            textPaint.color = Color.parseColor("#94A3B8")
                             canvas.drawText("ZZ", w * 0.5f, textY, textPaint)
+                        }
+                        "WAKING" -> {
+                            textPaint.color = Color.parseColor("#F59E0B")
+                            canvas.drawText("...", w * 0.5f, textY, textPaint)
                         }
                         else -> {
                             textPaint.color = Color.parseColor("#EF4444")
-                            canvas.drawText("OFF", w * 0.5f, textY, textPaint)
+                            canvas.drawText("ERR", w * 0.5f, textY, textPaint)
                         }
                     }
                 }
@@ -3936,8 +4078,9 @@ class FloatingBubbleService : Service() {
         private val density = context.resources.displayMetrics.density
         private val scaledDensity = context.resources.displayMetrics.scaledDensity
 
-        private var mode: String = "SLEEP" // AWAKE, WAKING, SLEEP, OFFLINE
+        private var mode: String = "SLEEP" // AWAKE, SLOW, WAKING, SLEEP, NO_RESPONSE
         private var wakingSeconds: Int = 0
+        private var lastLatencyMs: Int = -1
         private var animPhase: Float = 0f
         private var flashAlpha: Float = 0f
 
@@ -3978,10 +4121,11 @@ class FloatingBubbleService : Service() {
             this.textSize = 8.5f * scaledDensity
         }
 
-        fun updateState(newMode: String, wakingSec: Int) {
-            val changed = (mode != newMode) || (wakingSeconds != wakingSec)
+        fun updateState(newMode: String, wakingSec: Int, latencyMs: Int = -1) {
+            val changed = (mode != newMode) || (wakingSeconds != wakingSec) || (lastLatencyMs != latencyMs)
             mode = newMode
             wakingSeconds = wakingSec
+            lastLatencyMs = latencyMs
             if (changed) {
                 postInvalidate()
             }
@@ -3995,7 +4139,7 @@ class FloatingBubbleService : Service() {
                 this.interpolator = LinearInterpolator()
                 this.addUpdateListener { va ->
                     animPhase = va.animatedValue as Float
-                    if (mode == "AWAKE" || mode == "WAKING") {
+                    if (mode == "AWAKE" || mode == "SLOW" || mode == "WAKING") {
                         invalidate()
                     }
                 }
@@ -4057,6 +4201,18 @@ class FloatingBubbleService : Service() {
                     primaryTextPaint.color = Color.parseColor("#34D399")
                     canvas.drawText("AWAKE", cx, cy + (3.5f * density), primaryTextPaint)
                 }
+                "SLOW" -> {
+                    val alpha = (155 + (100 * pulseNorm)).toInt().coerceIn(0, 255)
+                    ringPaint.color = Color.parseColor("#F59E0B")
+                    ringPaint.alpha = alpha
+                    canvas.drawCircle(cx, cy, radius, ringPaint)
+
+                    primaryTextPaint.color = Color.parseColor("#FBBF24")
+                    canvas.drawText("AWAKE", cx, cy - (1.5f * density), primaryTextPaint)
+                    subTextPaint.color = Color.parseColor("#FDE68A")
+                    val slowSecStr = if (lastLatencyMs >= 0) String.format(Locale.US, "SLOW %.1fs", lastLatencyMs / 1000.0) else "SLOW"
+                    canvas.drawText(slowSecStr, cx, cy + (9.5f * density), subTextPaint)
+                }
                 "WAKING" -> {
                     ringPaint.color = Color.parseColor("#F59E0B")
                     ringPaint.alpha = 255
@@ -4072,13 +4228,15 @@ class FloatingBubbleService : Service() {
                         canvas.drawText("WAKING", cx, cy + (3.5f * density), primaryTextPaint)
                     }
                 }
-                "OFFLINE" -> {
+                "NO_RESPONSE", "OFFLINE" -> {
                     ringPaint.color = Color.parseColor("#EF4444")
                     ringPaint.alpha = 230
                     canvas.drawCircle(cx, cy, radius, ringPaint)
 
                     primaryTextPaint.color = Color.parseColor("#F87171")
-                    canvas.drawText("OFFLINE", cx, cy + (3.5f * density), primaryTextPaint)
+                    canvas.drawText("NO", cx, cy - (1.5f * density), primaryTextPaint)
+                    subTextPaint.color = Color.parseColor("#FCA5A5")
+                    canvas.drawText("RESPONSE", cx, cy + (9.5f * density), subTextPaint)
                 }
                 else -> {
                     ringPaint.color = Color.parseColor("#64748B")

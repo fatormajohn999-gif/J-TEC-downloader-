@@ -39,12 +39,16 @@ import com.getcapacitor.PluginCall
 import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
+import java.net.ConnectException
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
+import java.net.UnknownHostException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -76,6 +80,293 @@ class VideoDownloaderPlugin : Plugin() {
 
         // In-flight download lock keyed by normalized sourceUrl
         val inFlightDownloads = ConcurrentHashMap<String, Boolean>()
+
+        private val networkLogLock = Any()
+        private const val NETWORK_LOG_FILE = "network_log.txt"
+
+        data class HttpResponseData(
+            val statusCode: Int,
+            val bodyBytes: ByteArray?,
+            val inputStream: InputStream?,
+            val contentType: String,
+            val contentLength: Long,
+            val elapsedMs: Long,
+            val connection: HttpURLConnection?,
+            val errorDetail: String?,
+            val isTimeout: Boolean,
+            val isNoInternet: Boolean,
+            val isConnectionError: Boolean,
+            val friendlyError: String,
+            val locationHeader: String? = null
+        ) {
+            fun bodyText(): String = bodyBytes?.toString(Charsets.UTF_8) ?: ""
+        }
+
+        fun hasInternetConnection(context: Context?): Boolean {
+            if (context == null) return true
+            return try {
+                val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return true
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    val network = cm.activeNetwork ?: return false
+                    val caps = cm.getNetworkCapabilities(network) ?: return false
+                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                } else {
+                    @Suppress("DEPRECATION")
+                    cm.activeNetworkInfo?.isConnected == true
+                }
+            } catch (_: Throwable) {
+                true
+            }
+        }
+
+        fun extractJsonErrorDetail(raw: String?): String {
+            if (raw.isNullOrBlank()) return ""
+            val trimmed = raw.trim()
+            try {
+                if (trimmed.startsWith("{")) {
+                    val json = JSONObject(trimmed)
+                    if (json.has("detail")) {
+                        val d = json.optString("detail", "").trim()
+                        if (d.isNotBlank()) return d.replace("\n", " ").take(120)
+                    }
+                    if (json.has("error")) {
+                        val e = json.optString("error", "").trim()
+                        if (e.isNotBlank()) return e.replace("\n", " ").take(120)
+                    }
+                }
+            } catch (_: Throwable) {}
+            return trimmed.replace("\n", " ").trim().take(120)
+        }
+
+        fun logNetworkEvent(
+            context: Context?,
+            method: String,
+            fullUrl: String,
+            statusCode: Int,
+            elapsedMs: Long,
+            errorText: String?
+        ) {
+            if (context == null) return
+            try {
+                val pathOnly = try {
+                    val p = Uri.parse(fullUrl).path
+                    if (!p.isNullOrBlank()) p else "/"
+                } catch (_: Throwable) {
+                    "/"
+                }
+                val timeStr = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+                val statusStr = if (statusCode > 0) statusCode.toString() else "ERR"
+                val detailStr = if (!errorText.isNullOrBlank()) {
+                    errorText.replace("\n", " ").trim().take(90)
+                } else {
+                    "OK"
+                }
+                val entry = "$timeStr | $method $pathOnly | $statusStr | ${elapsedMs}ms | $detailStr"
+                synchronized(networkLogLock) {
+                    val file = File(context.filesDir, NETWORK_LOG_FILE)
+                    val lines = if (file.exists()) {
+                        file.readLines(Charsets.UTF_8).filter { it.isNotBlank() }.toMutableList()
+                    } else {
+                        mutableListOf()
+                    }
+                    lines.add(entry)
+                    val trimmed = if (lines.size > 20) lines.takeLast(20) else lines
+                    file.writeText(trimmed.joinToString("\n") + "\n", Charsets.UTF_8)
+                }
+            } catch (_: Throwable) {}
+        }
+
+        fun httpRequest(
+            context: Context?,
+            method: String,
+            url: String,
+            headers: Map<String, String> = emptyMap(),
+            body: String? = null,
+            connectTimeoutMs: Int = 30000,
+            readTimeoutMs: Int = 180000,
+            streamBody: Boolean = false,
+            followRedirects: Boolean = true,
+            connectionRefCallback: ((HttpURLConnection) -> Unit)? = null
+        ): HttpResponseData {
+            val startMs = System.currentTimeMillis()
+            var conn: HttpURLConnection? = null
+            try {
+                conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                    this.requestMethod = method
+                    this.connectTimeout = connectTimeoutMs
+                    this.readTimeout = readTimeoutMs
+                    this.instanceFollowRedirects = followRedirects
+                    this.doInput = true
+                    this.setRequestProperty("Connection", "keep-alive")
+                    for ((k, v) in headers) {
+                        this.setRequestProperty(k, v)
+                    }
+                    if (body != null) {
+                        this.doOutput = true
+                        if (!headers.containsKey("Content-Type")) {
+                            this.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                        }
+                    }
+                }
+                connectionRefCallback?.invoke(conn)
+
+                if (body != null) {
+                    conn.outputStream.use { os ->
+                        os.write(body.toByteArray(Charsets.UTF_8))
+                        os.flush()
+                    }
+                }
+
+                val code = conn.responseCode
+                val elapsed = System.currentTimeMillis() - startMs
+                val cType = conn.contentType ?: ""
+                val cLen = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    conn.contentLengthLong
+                } else {
+                    conn.contentLength.toLong()
+                }
+                val location = conn.getHeaderField("Location")
+
+                if (code in 200..299) {
+                    if (streamBody) {
+                        logNetworkEvent(context, method, url, code, elapsed, null)
+                        return HttpResponseData(
+                            statusCode = code,
+                            bodyBytes = null,
+                            inputStream = conn.inputStream,
+                            contentType = cType,
+                            contentLength = cLen,
+                            elapsedMs = elapsed,
+                            connection = conn,
+                            errorDetail = null,
+                            isTimeout = false,
+                            isNoInternet = false,
+                            isConnectionError = false,
+                            friendlyError = "",
+                            locationHeader = location
+                        )
+                    } else {
+                        val bytes = conn.inputStream.use { it.readBytes() }
+                        logNetworkEvent(context, method, url, code, elapsed, null)
+                        return HttpResponseData(
+                            statusCode = code,
+                            bodyBytes = bytes,
+                            inputStream = null,
+                            contentType = cType,
+                            contentLength = cLen,
+                            elapsedMs = elapsed,
+                            connection = null,
+                            errorDetail = null,
+                            isTimeout = false,
+                            isNoInternet = false,
+                            isConnectionError = false,
+                            friendlyError = "",
+                            locationHeader = location
+                        )
+                    }
+                } else {
+                    val errBytes = try {
+                        (conn.errorStream ?: conn.inputStream)?.use { it.readBytes() }
+                    } catch (_: Throwable) {
+                        null
+                    }
+                    val rawErrText = errBytes?.toString(Charsets.UTF_8) ?: ""
+                    val detail = extractJsonErrorDetail(rawErrText)
+                    val friendly = when (code) {
+                        502, 503, 504 -> "Server returned $code (starting up)"
+                        301, 302, 303, 307, 308 -> "Redirect $code"
+                        else -> if (detail.isNotBlank()) "Server returned $code: $detail" else "Server returned $code"
+                    }
+                    logNetworkEvent(context, method, url, code, elapsed, friendly)
+                    return HttpResponseData(
+                        statusCode = code,
+                        bodyBytes = errBytes,
+                        inputStream = null,
+                        contentType = cType,
+                        contentLength = cLen,
+                        elapsedMs = elapsed,
+                        connection = null,
+                        errorDetail = detail.ifBlank { null },
+                        isTimeout = false,
+                        isNoInternet = false,
+                        isConnectionError = false,
+                        friendlyError = friendly,
+                        locationHeader = location
+                    )
+                }
+            } catch (t: Throwable) {
+                val elapsed = System.currentTimeMillis() - startMs
+                try { conn?.disconnect() } catch (_: Throwable) {}
+                val online = hasInternetConnection(context)
+                var isTimeout = false
+                var isNoInternet = false
+                var isConnErr = false
+                val friendly = when (t) {
+                    is SocketTimeoutException -> {
+                        isTimeout = true
+                        val isConnectPhase = t.message?.contains("connect", ignoreCase = true) == true ||
+                            elapsed <= (connectTimeoutMs + 2500L)
+                        val timeoutSec = if (isConnectPhase) {
+                            (connectTimeoutMs / 1000).coerceAtLeast(1)
+                        } else {
+                            (readTimeoutMs / 1000).coerceAtLeast(1)
+                        }
+                        "Timed out after ${timeoutSec}s"
+                    }
+                    is UnknownHostException -> {
+                        if (!online) {
+                            isNoInternet = true
+                            "No internet"
+                        } else {
+                            isConnErr = true
+                            "Host unreachable (${(t.message ?: "DNS failed").take(50)})"
+                        }
+                    }
+                    is ConnectException -> {
+                        if (!online) {
+                            isNoInternet = true
+                            "No internet"
+                        } else {
+                            isConnErr = true
+                            "Connection refused (${(t.message ?: "unreachable").take(50)})"
+                        }
+                    }
+                    is IOException -> {
+                        if (!online) {
+                            isNoInternet = true
+                            "No internet"
+                        } else {
+                            isConnErr = true
+                            "Connection error: ${(t.message ?: "I/O failed").take(60)}"
+                        }
+                    }
+                    else -> {
+                        if (!online) {
+                            isNoInternet = true
+                            "No internet"
+                        } else {
+                            "Error: ${(t.message ?: t.javaClass.simpleName).take(70)}"
+                        }
+                    }
+                }
+                logNetworkEvent(context, method, url, 0, elapsed, friendly)
+                return HttpResponseData(
+                    statusCode = 0,
+                    bodyBytes = null,
+                    inputStream = null,
+                    contentType = "",
+                    contentLength = -1L,
+                    elapsedMs = elapsed,
+                    connection = null,
+                    errorDetail = t.message,
+                    isTimeout = isTimeout,
+                    isNoInternet = isNoInternet,
+                    isConnectionError = isConnErr,
+                    friendlyError = friendly,
+                    locationHeader = null
+                )
+            }
+        }
 
         fun normalizeUrl(rawUrl: String): String {
             val trimmed = rawUrl.trim()
@@ -1767,11 +2058,14 @@ class VideoDownloaderPlugin : Plugin() {
             var targetUri: Uri? = null
             var finalTitle = rawTitle
             var cleanPlatform = "Other"
+            var streamSucceeded = false
+            val operationStartMs = System.currentTimeMillis()
+            val maxOperationMs = 300_000L
 
             try {
-                reportProgress(10, "Fetching video details...")
+                reportProgress(10, "CONNECTING... Fetching details")
 
-                // Step 1: Pre-fetch video metadata via POST /info
+                // Step 1: Optional POST /info with 25s timeout (failure never blocks download)
                 var thumbnail = ""
                 var uploader = "Creator"
                 var platform = ""
@@ -1783,43 +2077,46 @@ class VideoDownloaderPlugin : Plugin() {
                     } else {
                         "https://$backendUrl/info"
                     }
-                    val iConn = (URL(infoEndpoint).openConnection() as HttpURLConnection).apply {
-                        this.requestMethod = "POST"
-                        this.connectTimeout = 10000
-                        this.readTimeout = 12000
-                        this.doOutput = true
-                        this.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                    val infoHeaders = HashMap<String, String>().apply {
+                        this["Content-Type"] = "application/json; charset=UTF-8"
                         if (!apiKey.isNullOrBlank()) {
-                            this.setRequestProperty("x-api-key", apiKey.trim())
+                            this["x-api-key"] = apiKey.trim()
                         }
                     }
                     val iPayload = JSONObject().apply {
                         this.put("url", normalizedUrl)
                     }
-                    iConn.outputStream.use { os ->
-                        os.write(iPayload.toString().toByteArray(Charsets.UTF_8))
-                        os.flush()
-                    }
-                    if (iConn.responseCode == HttpURLConnection.HTTP_OK) {
-                        val respStr = iConn.inputStream.bufferedReader().use { it.readText() }
-                        val json = JSONObject(respStr)
-                        if (json.has("title") && !json.optString("title").isNullOrBlank()) {
-                            finalTitle = json.optString("title")
-                        }
-                        thumbnail = json.optString("thumbnail", "")
-                        uploader = json.optString("uploader", "Creator")
-                        platform = json.optString("platform", "")
-                        val qArr = json.optJSONArray("qualities")
-                        if (qArr != null) {
-                            for (qi in 0 until qArr.length()) {
-                                val qItem = qArr.optString(qi, "").lowercase(Locale.US)
-                                if (qItem.isNotBlank()) availableQualities.add(qItem)
+                    val infoResp = httpRequest(
+                        context = context,
+                        method = "POST",
+                        url = infoEndpoint,
+                        headers = infoHeaders,
+                        body = iPayload.toString(),
+                        connectTimeoutMs = 25000,
+                        readTimeoutMs = 25000,
+                        streamBody = false
+                    )
+                    if (infoResp.statusCode in 200..299) {
+                        val respStr = infoResp.bodyText()
+                        if (respStr.isNotBlank()) {
+                            val json = JSONObject(respStr)
+                            if (json.has("title") && !json.optString("title").isNullOrBlank()) {
+                                finalTitle = json.optString("title")
+                            }
+                            thumbnail = json.optString("thumbnail", "")
+                            uploader = json.optString("uploader", "Creator")
+                            platform = json.optString("platform", "")
+                            val qArr = json.optJSONArray("qualities")
+                            if (qArr != null) {
+                                for (qi in 0 until qArr.length()) {
+                                    val qItem = qArr.optString(qi, "").lowercase(Locale.US)
+                                    if (qItem.isNotBlank()) availableQualities.add(qItem)
+                                }
                             }
                         }
                     }
-                    iConn.disconnect()
-                } catch (_: Exception) {
-                    // Fall back gracefully
+                } catch (_: Throwable) {
+                    // Optional /info failure never blocks download
                 }
 
                 // Clean platform: never use "Video" as platform
@@ -1844,8 +2141,6 @@ class VideoDownloaderPlugin : Plugin() {
                     }
                 }
 
-                reportProgress(20, "Connecting to download server...")
-
                 val isAudio = effectiveQuality.equals("audio", ignoreCase = true)
                 val ext = if (isAudio) ".mp3" else ".mp4"
                 val mediaType = if (isAudio) "audio/mpeg" else "video/mp4"
@@ -1859,65 +2154,123 @@ class VideoDownloaderPlugin : Plugin() {
                     .ifBlank { "$cleanPlatform video - $dateStr" }
                 val fileName = buildStyledFileName(context, cleanTitle, cleanPlatform, ext)
 
-                val urlObj = URL(endpoint)
-                fun openPipelineConnection(qToUse: String): HttpURLConnection {
-                    val c = (urlObj.openConnection() as HttpURLConnection).apply {
-                        this.requestMethod = "POST"
-                        this.connectTimeout = 30000
-                        this.readTimeout = 180000
-                        this.doInput = true
-                        this.doOutput = true
-                        this.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-                        this.setRequestProperty("Accept", "*/*")
-                        if (!apiKey.isNullOrBlank()) {
-                            this.setRequestProperty("x-api-key", apiKey.trim())
-                        }
+                // Step 2: Direct POST /download with wake-up retry only on timeout, connection error, or HTTP 502/503/504
+                val dlHeaders = HashMap<String, String>().apply {
+                    this["Content-Type"] = "application/json; charset=UTF-8"
+                    this["Accept"] = "*/*"
+                    if (!apiKey.isNullOrBlank()) {
+                        this["x-api-key"] = apiKey.trim()
                     }
+                }
+
+                var downloadResp: HttpResponseData? = null
+                val maxAttempts = 6
+                for (attempt in 1..maxAttempts) {
+                    val elapsedTotal = System.currentTimeMillis() - operationStartMs
+                    if (elapsedTotal >= maxOperationMs) {
+                        throw IOException("Timed out after 5m limit")
+                    }
+
+                    val statusMsg = if (attempt == 1) {
+                        "CONNECTING..."
+                    } else {
+                        "SERVER IS WAKING UP... attempt $attempt/$maxAttempts"
+                    }
+                    reportProgress(15 + (attempt * 2), statusMsg)
+
                     val jsonPayload = JSONObject().apply {
                         this.put("url", normalizedUrl)
-                        this.put("quality", qToUse)
+                        this.put("quality", effectiveQuality)
                     }
-                    c.outputStream.use { os ->
-                        os.write(jsonPayload.toString().toByteArray(Charsets.UTF_8))
-                        os.flush()
+
+                    var resp = httpRequest(
+                        context = context,
+                        method = "POST",
+                        url = endpoint,
+                        headers = dlHeaders,
+                        body = jsonPayload.toString(),
+                        connectTimeoutMs = 30000,
+                        readTimeoutMs = 180000,
+                        streamBody = true,
+                        connectionRefCallback = { connection = it }
+                    )
+
+                    if (resp.statusCode !in 200..299 &&
+                        resp.statusCode !in listOf(0, 502, 503, 504) &&
+                        fallbackToBest &&
+                        !effectiveQuality.equals("best", ignoreCase = true) &&
+                        !effectiveQuality.equals("audio", ignoreCase = true)
+                    ) {
+                        effectiveQuality = "best"
+                        val fallbackPayload = JSONObject().apply {
+                            this.put("url", normalizedUrl)
+                            this.put("quality", effectiveQuality)
+                        }
+                        resp = httpRequest(
+                            context = context,
+                            method = "POST",
+                            url = endpoint,
+                            headers = dlHeaders,
+                            body = fallbackPayload.toString(),
+                            connectTimeoutMs = 30000,
+                            readTimeoutMs = 180000,
+                            streamBody = true,
+                            connectionRefCallback = { connection = it }
+                        )
                     }
-                    return c
+
+                    if (resp.statusCode in 200..299 && resp.inputStream != null) {
+                        downloadResp = resp
+                        break
+                    }
+
+                    val isWakeRetryable = !resp.isNoInternet && (
+                        resp.isTimeout ||
+                        resp.isConnectionError ||
+                        resp.statusCode == 502 ||
+                        resp.statusCode == 503 ||
+                        resp.statusCode == 504
+                    )
+
+                    if (!isWakeRetryable) {
+                        val immediateMsg = resp.friendlyError.ifBlank { "Server returned ${resp.statusCode}" }
+                        recordFailedLink(context, normalizedUrl, cleanPlatform, finalTitle, immediateMsg)
+                        recordFailedStat(context)
+                        if (notifyFail) {
+                            NotificationHelper.showDownloadFailedNotification(context, "Download Failed", immediateMsg.take(120))
+                        }
+                        callToResolve?.reject(immediateMsg)
+                        return@Thread
+                    }
+
+                    if (attempt < maxAttempts) {
+                        val remainingMs = maxOperationMs - (System.currentTimeMillis() - operationStartMs)
+                        if (remainingMs <= 0L) {
+                            throw IOException("Timed out after 5m limit (${resp.friendlyError})")
+                        }
+                        reportProgress(15 + (attempt * 2), "SERVER IS WAKING UP... attempt ${attempt + 1}/$maxAttempts")
+                        val waitMs = minOf(5000L, remainingMs)
+                        Thread.sleep(waitMs)
+                    } else {
+                        val finalErr = resp.friendlyError.ifBlank { "Server failed after $maxAttempts attempts" }
+                        recordFailedLink(context, normalizedUrl, cleanPlatform, finalTitle, finalErr)
+                        recordFailedStat(context)
+                        if (notifyFail) {
+                            NotificationHelper.showDownloadFailedNotification(context, "Download Failed", finalErr.take(120))
+                        }
+                        callToResolve?.reject(finalErr)
+                        return@Thread
+                    }
                 }
 
-                connection = openPipelineConnection(effectiveQuality)
-                var responseCode = connection.responseCode
-                if (responseCode != HttpURLConnection.HTTP_OK && fallbackToBest && !effectiveQuality.equals("best", ignoreCase = true)) {
-                    try { connection.disconnect() } catch (_: Exception) {}
-                    effectiveQuality = "best"
-                    connection = openPipelineConnection(effectiveQuality)
-                    responseCode = connection.responseCode
-                }
+                val activeResp = downloadResp ?: throw IOException("No response stream from server")
+                connection = activeResp.connection
+                val responseStream = activeResp.inputStream ?: throw IOException("Empty response stream from server")
 
-                if (responseCode != HttpURLConnection.HTTP_OK) {
-                    val errorText = try {
-                        connection.errorStream?.bufferedReader()?.use { it.readText() } ?: "HTTP $responseCode"
-                    } catch (e: Exception) {
-                        "HTTP $responseCode"
-                    }
-
-                    val cleanMsg = try {
-                        val parsed = JSONObject(errorText)
-                        parsed.optString("detail", parsed.optString("error", errorText))
-                    } catch (e: Exception) {
-                        errorText
-                    }
-
-                    if (notifyFail) {
-                        NotificationHelper.showDownloadFailedNotification(context, "Download Failed", cleanMsg.take(120))
-                    }
-                    callToResolve?.reject("Download failed: $cleanMsg")
-                    return@Thread
-                }
-
-                val contentType = connection.contentType ?: ""
+                val contentType = activeResp.contentType
                 if (contentType.contains("application/zip", ignoreCase = true)) {
-                    reportProgress(35, "Extracting photo slideshow archive...")
-                    val zis = ZipInputStream(connection.inputStream)
+                    reportProgress(35, "DOWNLOADING...")
+                    val zis = ZipInputStream(responseStream)
                     val resolver = context.contentResolver
                     val savedUris = ArrayList<Uri>()
                     var zipEntry = zis.nextEntry
@@ -1978,6 +2331,7 @@ class VideoDownloaderPlugin : Plugin() {
                     zis.close()
 
                     val totalPhotos = savedUris.size
+                    streamSucceeded = true
                     val firstUri = savedUris.firstOrNull()?.toString() ?: ""
                     val archiveFileName = "$finalTitle [TikTok photos]"
 
@@ -2036,7 +2390,7 @@ class VideoDownloaderPlugin : Plugin() {
                     return@Thread
                 }
 
-                reportProgress(30, "Preparing phone gallery storage...")
+                reportProgress(30, "DOWNLOADING...")
 
                 val resolver = context.contentResolver
                 val contentValues = ContentValues().apply {
@@ -2076,19 +2430,23 @@ class VideoDownloaderPlugin : Plugin() {
                     return@Thread
                 }
 
-                inputStream = connection.inputStream
-                val totalBytes = connection.contentLengthLong
+                inputStream = responseStream
+                val totalBytes = activeResp.contentLength
                 var bytesCopied: Long = 0
                 var lastSampleBytes: Long = 0
                 val buffer = ByteArray(8192)
                 var bytesRead: Int
                 var lastProgressReportTime: Long = System.currentTimeMillis()
-
-                reportProgress(40, "Saving directly to gallery...", 0.0)
+                var firstBytesReported = false
 
                 while (inputStream.read(buffer).also { bytesRead = it } != -1) {
                     outputStream.write(buffer, 0, bytesRead)
                     bytesCopied += bytesRead
+
+                    if (!firstBytesReported) {
+                        firstBytesReported = true
+                        reportProgress(40, "DOWNLOADING...", 0.0)
+                    }
 
                     val now = System.currentTimeMillis()
                     val elapsedMs = now - lastProgressReportTime
@@ -2103,10 +2461,11 @@ class VideoDownloaderPlugin : Plugin() {
                             75
                         }
                         val mb = String.format(Locale.US, "%.1f", bytesCopied / (1024.0 * 1024.0))
-                        reportProgress(pct, "Saving to gallery: $mb MB...", speedMb)
+                        reportProgress(pct, "DOWNLOADING... $mb MB", speedMb)
                     }
                 }
                 outputStream.flush()
+                streamSucceeded = true
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     val updateValues = ContentValues().apply {
@@ -2163,13 +2522,13 @@ class VideoDownloaderPlugin : Plugin() {
                 }
                 callToResolve?.resolve(res)
 
-            } catch (e: Exception) {
+            } catch (t: Throwable) {
                 if (targetUri != null) {
                     try {
                         context.contentResolver.delete(targetUri, null, null)
                     } catch (_: Exception) {}
                 }
-                val rawErr = e.message ?: "Unknown error"
+                val rawErr = t.message ?: "Unknown error"
                 recordFailedLink(context, normalizedUrl, cleanPlatform, finalTitle, rawErr)
                 recordFailedStat(context)
                 val notifyFailPref = try {
@@ -2179,12 +2538,14 @@ class VideoDownloaderPlugin : Plugin() {
                 if (notifyFailPref) {
                     NotificationHelper.showDownloadFailedNotification(context, "Download Failed", rawErr.take(120))
                 }
-                callToResolve?.reject("Native download error: $rawErr")
+                callToResolve?.reject(rawErr)
             } finally {
                 inFlightDownloads.remove(normalizedUrl)
                 try { inputStream?.close() } catch (_: Exception) {}
                 try { outputStream?.close() } catch (_: Exception) {}
-                connection?.disconnect()
+                if (!streamSucceeded) {
+                    try { connection?.disconnect() } catch (_: Throwable) {}
+                }
             }
         }.start()
     }
@@ -2779,13 +3140,14 @@ class VideoDownloaderPlugin : Plugin() {
             var connection: HttpURLConnection? = null
             var inputStream: InputStream? = null
             var outputStream: OutputStream? = null
+            var streamSucceeded = false
 
             try {
-                val updatesDir = java.io.File(context.cacheDir, "updates")
+                val updatesDir = File(context.cacheDir, "updates")
                 if (!updatesDir.exists()) {
                     updatesDir.mkdirs()
                 }
-                val apkFile = java.io.File(updatesDir, "OmniDrop.apk")
+                val apkFile = File(updatesDir, "OmniDrop.apk")
 
                 // If file already exists with exact size, skip re-download
                 val alreadyDownloaded = apkFile.exists() && (expectedSize > 0 && apkFile.length() == expectedSize)
@@ -2798,44 +3160,48 @@ class VideoDownloaderPlugin : Plugin() {
                     var currentUrl = downloadUrl
                     var redirectCount = 0
                     val maxRedirects = 6
+                    var okResp: HttpResponseData? = null
+                    val updateHeaders = mapOf(
+                        "User-Agent" to "OmniDrop-Android",
+                        "Accept" to "application/octet-stream"
+                    )
 
                     while (redirectCount < maxRedirects) {
-                        val u = URL(currentUrl)
-                        connection = (u.openConnection() as HttpURLConnection).apply {
-                            this.instanceFollowRedirects = true
-                            this.connectTimeout = 15000
-                            this.readTimeout = 30000
-                            this.setRequestProperty("User-Agent", "OmniDrop-Android")
-                            this.setRequestProperty("Accept", "application/octet-stream")
-                        }
-
-                        val code = connection.responseCode
+                        val resp = httpRequest(
+                            context = context,
+                            method = "GET",
+                            url = currentUrl,
+                            headers = updateHeaders,
+                            connectTimeoutMs = 15000,
+                            readTimeoutMs = 30000,
+                            streamBody = true,
+                            followRedirects = false,
+                            connectionRefCallback = { connection = it }
+                        )
+                        val code = resp.statusCode
                         if (code == HttpURLConnection.HTTP_MOVED_PERM ||
                             code == HttpURLConnection.HTTP_MOVED_TEMP ||
                             code == HttpURLConnection.HTTP_SEE_OTHER ||
                             code == 307 || code == 308) {
-                            val location = connection.getHeaderField("Location")
-                            connection.disconnect()
+                            val location = resp.locationHeader
                             if (location.isNullOrBlank()) {
-                                throw java.io.IOException("Redirect with empty Location header")
+                                throw IOException("Redirect with empty Location header")
                             }
-                            currentUrl = if (location.startsWith("http")) location else URL(u, location).toString()
+                            currentUrl = if (location.startsWith("http")) location else URL(URL(currentUrl), location).toString()
                             redirectCount++
-                        } else if (code == HttpURLConnection.HTTP_OK) {
+                        } else if (code in 200..299 && resp.inputStream != null) {
+                            okResp = resp
                             break
                         } else {
-                            throw java.io.IOException("HTTP error $code from update server")
+                            throw IOException(resp.friendlyError.ifBlank { "HTTP error $code from update server" })
                         }
                     }
 
-                    val serverContentLength = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                        connection!!.contentLengthLong
-                    } else {
-                        connection!!.contentLength.toLong()
-                    }
+                    val finalResp = okResp ?: throw IOException("Update download failed after redirects")
+                    val serverContentLength = finalResp.contentLength
                     val totalBytes = if (expectedSize > 0) expectedSize else (if (serverContentLength > 0) serverContentLength else 0L)
 
-                    inputStream = connection!!.inputStream
+                    inputStream = finalResp.inputStream!!
                     outputStream = java.io.FileOutputStream(apkFile)
 
                     val buffer = ByteArray(8192)
@@ -2874,16 +3240,17 @@ class VideoDownloaderPlugin : Plugin() {
                     }
 
                     outputStream.flush()
+                    streamSucceeded = true
                 }
 
                 // Check final file size
                 val finalLength = apkFile.length()
                 if (expectedSize > 0 && finalLength != expectedSize) {
                     apkFile.delete()
-                    throw java.io.IOException("Download incomplete: file size ($finalLength) does not match expected size ($expectedSize)")
+                    throw IOException("Download incomplete: file size ($finalLength) does not match expected size ($expectedSize)")
                 } else if (finalLength < 1000) {
                     apkFile.delete()
-                    throw java.io.IOException("Downloaded APK file is corrupted or too small ($finalLength bytes)")
+                    throw IOException("Downloaded APK file is corrupted or too small ($finalLength bytes)")
                 }
 
                 // Final 100% progress report
@@ -2935,12 +3302,14 @@ class VideoDownloaderPlugin : Plugin() {
                     this.put("needPermission", false)
                 }
                 call.resolve(ret)
-            } catch (e: Exception) {
-                call.reject("Update install failed: ${e.message ?: "Unknown error"}")
+            } catch (t: Throwable) {
+                call.reject("Update install failed: ${t.message ?: "Unknown error"}")
             } finally {
                 try { inputStream?.close() } catch (_: Exception) {}
                 try { outputStream?.close() } catch (_: Exception) {}
-                connection?.disconnect()
+                if (!streamSucceeded) {
+                    try { connection?.disconnect() } catch (_: Throwable) {}
+                }
             }
         }.start()
     }
@@ -2948,7 +3317,7 @@ class VideoDownloaderPlugin : Plugin() {
     @PluginMethod
     fun getLastCrash(call: PluginCall) {
         try {
-            val file = java.io.File(context.filesDir, "last_crash.txt")
+            val file = File(context.filesDir, "last_crash.txt")
             val text = if (file.exists()) file.readText(Charsets.UTF_8) else ""
             val ret = JSObject().apply {
                 this.put("crash", text)
@@ -2965,7 +3334,7 @@ class VideoDownloaderPlugin : Plugin() {
     @PluginMethod
     fun clearLastCrash(call: PluginCall) {
         try {
-            val file = java.io.File(context.filesDir, "last_crash.txt")
+            val file = File(context.filesDir, "last_crash.txt")
             if (file.exists()) {
                 file.delete()
             }
@@ -2974,6 +3343,46 @@ class VideoDownloaderPlugin : Plugin() {
             }
             call.resolve(ret)
         } catch (e: Exception) {
+            val ret = JSObject().apply {
+                this.put("cleared", false)
+            }
+            call.resolve(ret)
+        }
+    }
+
+    @PluginMethod
+    fun getNetworkLog(call: PluginCall) {
+        try {
+            val text = synchronized(networkLogLock) {
+                val file = File(context.filesDir, NETWORK_LOG_FILE)
+                if (file.exists()) file.readText(Charsets.UTF_8).trim() else ""
+            }
+            val ret = JSObject().apply {
+                this.put("log", text)
+            }
+            call.resolve(ret)
+        } catch (_: Throwable) {
+            val ret = JSObject().apply {
+                this.put("log", "")
+            }
+            call.resolve(ret)
+        }
+    }
+
+    @PluginMethod
+    fun clearNetworkLog(call: PluginCall) {
+        try {
+            synchronized(networkLogLock) {
+                val file = File(context.filesDir, NETWORK_LOG_FILE)
+                if (file.exists()) {
+                    file.delete()
+                }
+            }
+            val ret = JSObject().apply {
+                this.put("cleared", true)
+            }
+            call.resolve(ret)
+        } catch (_: Throwable) {
             val ret = JSObject().apply {
                 this.put("cleared", false)
             }

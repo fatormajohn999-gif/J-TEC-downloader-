@@ -54,6 +54,8 @@ export const AboutScreen: React.FC<AboutScreenProps> = ({
   const [isRefreshingRelease, setIsRefreshingRelease] = useState(false);
   const [crashLog, setCrashLog] = useState<string>('');
   const [isCopied, setIsCopied] = useState(false);
+  const [networkLog, setNetworkLog] = useState<string>('');
+  const [isNetworkCopied, setIsNetworkCopied] = useState(false);
   const [appVersion, setAppVersion] = useState<{ versionName: string; versionCode: number }>({
     versionName: '1.0.0',
     versionCode: 1,
@@ -172,6 +174,11 @@ export const AboutScreen: React.FC<AboutScreenProps> = ({
           setCrashLog(res?.crash || '');
         })
         .catch(() => setCrashLog(''));
+      VideoDownloader.getNetworkLog()
+        .then((res) => {
+          setNetworkLog(res?.log || '');
+        })
+        .catch(() => setNetworkLog(''));
     } else if (activeSubScreen === 'stats') {
       loadStats();
     } else if (activeSubScreen === 'whatsnew' && latestRelease?.tagName && onMarkWhatsNewSeen) {
@@ -224,6 +231,22 @@ export const AboutScreen: React.FC<AboutScreenProps> = ({
     try {
       await VideoDownloader.clearLastCrash();
       setCrashLog('');
+    } catch {}
+  };
+
+  const handleCopyNetworkLog = async () => {
+    if (!networkLog) return;
+    try {
+      await navigator.clipboard.writeText(networkLog);
+      setIsNetworkCopied(true);
+      setTimeout(() => setIsNetworkCopied(false), 2000);
+    } catch {}
+  };
+
+  const handleClearNetworkLog = async () => {
+    try {
+      await VideoDownloader.clearNetworkLog();
+      setNetworkLog('');
     } catch {}
   };
 
@@ -870,6 +893,49 @@ export const AboutScreen: React.FC<AboutScreenProps> = ({
             <div className="py-2.5 text-center font-mono text-xs text-slate-400 flex items-center justify-center gap-2">
               <div className="w-2 h-2 rounded-full led-emerald" />
               <span>No crashes recorded</span>
+            </div>
+          )}
+        </div>
+
+        {/* Network Log Section */}
+        <div className="machine-surface rounded-xl p-4 space-y-3">
+          <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+            <div className="flex items-center gap-2">
+              <span className={`w-2 h-2 rounded-full ${networkLog ? 'led-cyan' : 'led-emerald'}`} />
+              <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
+                DIAGNOSTICS // NETWORK LOG
+              </h3>
+            </div>
+            {networkLog && (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleCopyNetworkLog}
+                  className="px-2 py-1 rounded bg-slate-900 border border-slate-700 hover:border-accent-strong font-mono text-[10px] text-accent-soft flex items-center gap-1 active:scale-95"
+                  title="Copy network log"
+                >
+                  <Copy className="w-3 h-3" />
+                  <span>{isNetworkCopied ? 'COPIED' : 'COPY'}</span>
+                </button>
+                <button
+                  onClick={handleClearNetworkLog}
+                  className="px-2 py-1 rounded bg-red-950/60 border border-red-500/50 hover:border-red-400 font-mono text-[10px] text-red-300 flex items-center gap-1 active:scale-95"
+                  title="Clear network log"
+                >
+                  <Trash2 className="w-3 h-3" />
+                  <span>CLEAR</span>
+                </button>
+              </div>
+            )}
+          </div>
+
+          {networkLog ? (
+            <div className="p-3 rounded-lg bg-black/90 border border-slate-800 font-mono text-[10.5px] text-slate-300 max-h-56 overflow-y-auto whitespace-pre-wrap select-text leading-relaxed">
+              {networkLog}
+            </div>
+          ) : (
+            <div className="py-2.5 text-center font-mono text-xs text-slate-400 flex items-center justify-center gap-2">
+              <div className="w-2 h-2 rounded-full led-emerald" />
+              <span>No network events recorded</span>
             </div>
           )}
         </div>

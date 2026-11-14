@@ -1502,11 +1502,13 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                 : keepAliveStatus.lastPingTime > 0
                 ? `${formatKeepAliveClock(keepAliveStatus.lastPingTime)} · ${
                     keepAliveStatus.lastPingStatus === 'OK' && keepAliveStatus.lastPingMs >= 0
-                      ? `${keepAliveStatus.lastPingMs}ms`
+                      ? `${keepAliveStatus.lastPingMs}ms (Awake)`
+                      : keepAliveStatus.lastPingStatus === 'SLOW' && keepAliveStatus.lastPingMs >= 0
+                      ? `Awake · Slow ${(keepAliveStatus.lastPingMs / 1000).toFixed(1)}s`
                       : keepAliveStatus.lastPingStatus === 'SLEEP'
-                      ? 'Sleeping'
-                      : keepAliveStatus.lastPingStatus === 'OFFLINE'
-                      ? 'Offline'
+                      ? 'ZZ Sleeping'
+                      : keepAliveStatus.lastPingStatus === 'NO_RESPONSE' || keepAliveStatus.lastPingStatus === 'OFFLINE'
+                      ? 'No response'
                       : 'Failed'
                   }`
                 : 'Never'}
