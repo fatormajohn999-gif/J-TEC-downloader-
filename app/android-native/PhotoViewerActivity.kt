@@ -23,6 +23,7 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
+import android.view.WindowManager
 import android.view.animation.AlphaAnimation
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -94,6 +95,7 @@ class PhotoViewerActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         try {
+            applyPrivacyScreenFlag()
             // Read extras
             val incomingUris = intent.getStringArrayListExtra("photo_uris")
             if (incomingUris != null) {
@@ -745,8 +747,21 @@ class PhotoViewerActivity : Activity() {
         }
     }
 
+    private fun applyPrivacyScreenFlag() {
+        try {
+            val prefs = getSharedPreferences(VideoDownloaderPlugin.PREFS_NAME, Context.MODE_PRIVATE)
+            val hideInRecents = prefs.getBoolean("privacy_hide_recents", false)
+            if (hideInRecents) {
+                window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+            } else {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+            }
+        } catch (_: Throwable) {}
+    }
+
     override fun onResume() {
         super.onResume()
+        applyPrivacyScreenFlag()
         FloatingBubbleService.setOmniDropForeground(true)
     }
 

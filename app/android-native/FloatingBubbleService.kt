@@ -84,6 +84,9 @@ class FloatingBubbleService : Service() {
         private const val PREF_FLOATING_AUTO_CLEAR = "floating_auto_clear"
         private const val PREF_FLOATING_VIBRATE = "floating_vibrate"
         private const val PREF_FLOATING_HIDE_INSIDE_APP = "floating_hide_inside_app"
+        private const val PREF_FLOATING_SIDE = "floating_side"
+        private const val PREF_FLOATING_SIZE = "floating_size"
+        private const val PREF_FLOATING_OPACITY = "floating_opacity"
         private const val PREF_AUTO_CHECK_UPDATES = "auto_check_updates"
         private const val PREF_SKIPPED_UPDATE_VERSION = "skipped_update_version"
         private const val PREF_LAST_NOTIFIED_UPDATE_VERSION = "last_notified_update_version"
@@ -265,6 +268,8 @@ class FloatingBubbleService : Service() {
     private var backendUrl: String = ""
     private var apiKey: String = ""
     private var defaultQuality: String = "best"
+    private var floatingSize: String = "medium"
+    private var floatingOpacityPercent: Int = 45
     private var lastFinishedFileUri: String? = null
     private var lastFailedUrl: String? = null
     @Volatile private var currentDownloadSpeedMb: Double = 0.0
@@ -286,7 +291,8 @@ class FloatingBubbleService : Service() {
     // Idle Fade Runnable (5 seconds without interaction)
     private val idleFadeRunnable = Runnable {
         if (!isDownloading && !isPanelOpen) {
-            tabRootView?.animate()?.alpha(0.45f)?.setDuration(400L)?.start()
+            val targetAlpha = (floatingOpacityPercent.coerceIn(15, 100) / 100f)
+            tabRootView?.animate()?.alpha(targetAlpha)?.setDuration(400L)?.start()
         }
     }
 
@@ -439,6 +445,8 @@ class FloatingBubbleService : Service() {
             hideInsideAppEnabled = p.getBoolean(PREF_FLOATING_HIDE_INSIDE_APP, true)
             autoCheckUpdatesEnabled = p.getBoolean(PREF_AUTO_CHECK_UPDATES, true)
             isCompactMode = p.getBoolean(PREF_PANEL_COMPACT, false)
+            floatingSize = p.getString(PREF_FLOATING_SIZE, "medium") ?: "medium"
+            floatingOpacityPercent = p.getInt(PREF_FLOATING_OPACITY, 45).coerceIn(15, 100)
 
             isTabEnabled = p.getBoolean("floating_bubble_enabled", false)
 
@@ -467,7 +475,10 @@ class FloatingBubbleService : Service() {
         newAutoClear: Boolean = true,
         newVibrate: Boolean = true,
         newHideInsideApp: Boolean = true,
-        newAutoCheckUpdates: Boolean = true
+        newAutoCheckUpdates: Boolean = true,
+        newFloatingSide: String? = null,
+        newFloatingSize: String? = null,
+        newFloatingOpacity: Int? = null
     ) {
         backendUrl = newUrl.trim()
         apiKey = newApiKey.trim()
@@ -477,6 +488,15 @@ class FloatingBubbleService : Service() {
         vibrateEnabled = newVibrate
         hideInsideAppEnabled = newHideInsideApp
         autoCheckUpdatesEnabled = newAutoCheckUpdates
+        if (!newFloatingSide.isNullOrBlank()) {
+            isLeftEdge = newFloatingSide.equals("left", ignoreCase = true)
+        }
+        if (!newFloatingSize.isNullOrBlank()) {
+            floatingSize = newFloatingSize.lowercase()
+        }
+        if (newFloatingOpacity != null) {
+            floatingOpacityPercent = newFloatingOpacity.coerceIn(15, 100)
+        }
         prefs?.edit()?.apply {
             this.putString(PREF_BACKEND_URL, backendUrl)
             this.putString(PREF_API_KEY, apiKey)
@@ -486,11 +506,16 @@ class FloatingBubbleService : Service() {
             this.putBoolean(PREF_FLOATING_VIBRATE, vibrateEnabled)
             this.putBoolean(PREF_FLOATING_HIDE_INSIDE_APP, hideInsideAppEnabled)
             this.putBoolean(PREF_AUTO_CHECK_UPDATES, autoCheckUpdatesEnabled)
+            this.putBoolean(PREF_TAB_IS_LEFT, isLeftEdge)
+            this.putString(PREF_FLOATING_SIDE, if (isLeftEdge) "left" else "right")
+            this.putString(PREF_FLOATING_SIZE, floatingSize)
+            this.putInt(PREF_FLOATING_OPACITY, floatingOpacityPercent)
             this.apply()
         }
         mainHandler.post {
             updateAutoDownloadUI()
             updateKeepAliveUI()
+            applyTabAppearanceLive()
             if (isPanelOpen) {
                 measureNetPing()
             }
@@ -501,6 +526,34 @@ class FloatingBubbleService : Service() {
             handler.removeCallbacks(keepAliveRunnable)
             handler.post(keepAliveRunnable)
         }
+    }
+
+    private fun computeTabDimensions(sizeName: String): Pair<Int, Int> {
+        val density = resources.displayMetrics.density
+        return when (sizeName.lowercase()) {
+            "small" -> Pair((24 * density).toInt(), (58 * density).toInt())
+            "large" -> Pair((36 * density).toInt(), (92 * density).toInt())
+            else -> Pair((30 * density).toInt(), (74 * density).toInt())
+        }
+    }
+
+    private fun applyTabAppearanceLive() {
+        val root = tabRootView ?: return
+        val lp = tabLayoutParams ?: return
+        val (tabWidth, tabHeight) = computeTabDimensions(floatingSize)
+        val screenWidth = resources.displayMetrics.widthPixels
+        val screenHeight = resources.displayMetrics.heightPixels
+
+        lp.width = tabWidth
+        lp.height = tabHeight
+        lp.x = if (isLeftEdge) 0 else (screenWidth - tabWidth)
+        lp.y = tabYPosition.coerceIn(40, (screenHeight - tabHeight - 80).coerceAtLeast(40))
+
+        tabInnerFrame?.setIsLeft(isLeftEdge)
+        try {
+            windowManager?.updateViewLayout(root, lp)
+            updateGestureExclusion(root)
+        } catch (_: Exception) {}
     }
 
     fun onAppForegroundChanged(inForeground: Boolean) {
@@ -603,9 +656,7 @@ class FloatingBubbleService : Service() {
     // 1. METAL LATCH EDGE TAB
     // -------------------------------------------------------------------------
     private fun initEdgeTab() {
-        val density = resources.displayMetrics.density
-        val tabWidth = (30 * density).toInt()
-        val tabHeight = (74 * density).toInt()
+        val (tabWidth, tabHeight) = computeTabDimensions(floatingSize)
 
         val root = FrameLayout(this).apply {
             this.visibility = if (hideInsideAppEnabled && isOmniDropInForeground) View.GONE else View.VISIBLE
@@ -639,7 +690,7 @@ class FloatingBubbleService : Service() {
         }
         tabLayoutParams = lp
 
-        setupTabTouchListener(root, lp, tabWidth, tabHeight)
+        setupTabTouchListener(root, lp)
 
         try {
             windowManager?.addView(root, lp)
@@ -658,7 +709,7 @@ class FloatingBubbleService : Service() {
         }
     }
 
-    private fun setupTabTouchListener(view: View, lp: WindowManager.LayoutParams, tabWidth: Int, tabHeight: Int) {
+    private fun setupTabTouchListener(view: View, lp: WindowManager.LayoutParams) {
         view.setOnTouchListener(object : View.OnTouchListener {
             private var initialX = 0
             private var initialY = 0
@@ -669,6 +720,8 @@ class FloatingBubbleService : Service() {
             override fun onTouch(v: View, event: MotionEvent): Boolean {
                 val screenWidth = resources.displayMetrics.widthPixels
                 val screenHeight = resources.displayMetrics.heightPixels
+                val currentW = lp.width
+                val currentH = lp.height
 
                 when (event.action) {
                     MotionEvent.ACTION_DOWN -> {
@@ -685,7 +738,7 @@ class FloatingBubbleService : Service() {
                     }
                     MotionEvent.ACTION_MOVE -> {
                         val dy = (event.rawY - touchStartY).toInt()
-                        lp.y = (initialY + dy).coerceIn(40, screenHeight - tabHeight - 80)
+                        lp.y = (initialY + dy).coerceIn(40, (screenHeight - currentH - 80).coerceAtLeast(40))
                         windowManager?.updateViewLayout(v, lp)
                         return true
                     }
@@ -710,11 +763,12 @@ class FloatingBubbleService : Service() {
                         // Snap to nearest edge
                         val finalCenterX = event.rawX
                         isLeftEdge = finalCenterX < (screenWidth / 2)
-                        lp.x = if (isLeftEdge) 0 else (screenWidth - tabWidth)
+                        lp.x = if (isLeftEdge) 0 else (screenWidth - currentW)
                         tabYPosition = lp.y
 
                         prefs?.edit()?.apply {
                             this.putBoolean(PREF_TAB_IS_LEFT, isLeftEdge)
+                            this.putString(PREF_FLOATING_SIDE, if (isLeftEdge) "left" else "right")
                             this.putInt(PREF_TAB_Y, tabYPosition)
                             this.apply()
                         }
@@ -2143,6 +2197,10 @@ class FloatingBubbleService : Service() {
                     val failPlat = VideoDownloaderPlugin.detectPlatformName(normalizedUrl)
                     VideoDownloaderPlugin.recordFailedLink(this@FloatingBubbleService, normalizedUrl, failPlat, if (title.isNotBlank()) title else "Video", "Backend unreachable")
                     VideoDownloaderPlugin.recordFailedStat(this@FloatingBubbleService)
+                    val notifyFail = prefs?.getBoolean("notify_download_fail", true) ?: true
+                    if (notifyFail) {
+                        NotificationHelper.showDownloadFailedNotification(this@FloatingBubbleService, "Download Failed", "Backend unreachable")
+                    }
                     mainHandler.post {
                         progressStatusText?.text = "Backend unreachable."
                         progressSpeedText?.text = "ERR"
@@ -2168,6 +2226,7 @@ class FloatingBubbleService : Service() {
                 var thumbnail = ""
                 var uploader = "Creator"
                 var platform = ""
+                val availableQualities = HashSet<String>()
 
                 try {
                     val infoEndpoint = "${backendUrl.removeSuffix("/")}/info"
@@ -2191,6 +2250,13 @@ class FloatingBubbleService : Service() {
                         thumbnail = json.optString("thumbnail", "")
                         uploader = json.optString("uploader", "Creator")
                         platform = json.optString("platform", "")
+                        val qArr = json.optJSONArray("qualities")
+                        if (qArr != null) {
+                            for (qi in 0 until qArr.length()) {
+                                val qItem = qArr.optString(qi, "").lowercase()
+                                if (qItem.isNotBlank()) availableQualities.add(qItem)
+                            }
+                        }
                     }
                     iConn.disconnect()
                 } catch (_: Exception) {}
@@ -2205,6 +2271,14 @@ class FloatingBubbleService : Service() {
                     title = "$cleanPlatform video - $dateStr"
                 }
 
+                val fallbackToBest = prefs?.getBoolean("fallback_to_best", true) ?: true
+                var effectiveQuality = VideoDownloaderPlugin.resolveEffectiveQuality(this@FloatingBubbleService, defaultQuality)
+                if (fallbackToBest && availableQualities.isNotEmpty() && !effectiveQuality.equals("best", ignoreCase = true) && !effectiveQuality.equals("audio", ignoreCase = true)) {
+                    if (!availableQualities.contains(effectiveQuality.lowercase())) {
+                        effectiveQuality = "best"
+                    }
+                }
+
                 // Step 3: Stream download to MediaStore
                 mainHandler.post {
                     progressStatusText?.text = "Streaming full-res media..."
@@ -2212,27 +2286,39 @@ class FloatingBubbleService : Service() {
 
                 val downloadEndpoint = "${backendUrl.removeSuffix("/")}/download"
                 val urlObj = URL(downloadEndpoint)
-                conn = (urlObj.openConnection() as HttpURLConnection).apply {
-                    this.requestMethod = "POST"
-                    this.connectTimeout = 30000
-                    this.readTimeout = 180000
-                    this.doInput = true
-                    this.doOutput = true
-                    this.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-                    if (apiKey.isNotBlank()) this.setRequestProperty("x-api-key", apiKey)
+                fun openDownloadConn(qualityToUse: String): HttpURLConnection {
+                    val c = (urlObj.openConnection() as HttpURLConnection).apply {
+                        this.requestMethod = "POST"
+                        this.connectTimeout = 30000
+                        this.readTimeout = 180000
+                        this.doInput = true
+                        this.doOutput = true
+                        this.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                        if (apiKey.isNotBlank()) this.setRequestProperty("x-api-key", apiKey)
+                    }
+                    val payload = JSONObject().apply {
+                        this.put("url", normalizedUrl)
+                        this.put("quality", qualityToUse)
+                    }
+                    c.outputStream.use { os ->
+                        os.write(payload.toString().toByteArray(Charsets.UTF_8))
+                        os.flush()
+                    }
+                    return c
                 }
+
+                conn = openDownloadConn(effectiveQuality)
                 activeDownloadConnection = conn
 
-                val payload = JSONObject().apply {
-                    this.put("url", normalizedUrl)
-                    this.put("quality", defaultQuality)
-                }
-                conn.outputStream.use { os ->
-                    os.write(payload.toString().toByteArray(Charsets.UTF_8))
-                    os.flush()
+                var respCode = conn.responseCode
+                if (respCode != HttpURLConnection.HTTP_OK && fallbackToBest && !effectiveQuality.equals("best", ignoreCase = true)) {
+                    try { conn.disconnect() } catch (_: Exception) {}
+                    effectiveQuality = "best"
+                    conn = openDownloadConn(effectiveQuality)
+                    activeDownloadConnection = conn
+                    respCode = conn.responseCode
                 }
 
-                val respCode = conn.responseCode
                 if (respCode != HttpURLConnection.HTTP_OK) {
                     val err = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: "HTTP $respCode"
                     val shortReason = parseShortServerError(err)
@@ -2240,6 +2326,10 @@ class FloatingBubbleService : Service() {
                     currentDownloadSpeedMb = 0.0
                     VideoDownloaderPlugin.recordFailedLink(this@FloatingBubbleService, normalizedUrl, cleanPlatform, title, shortReason)
                     VideoDownloaderPlugin.recordFailedStat(this@FloatingBubbleService)
+                    val notifyFail = prefs?.getBoolean("notify_download_fail", true) ?: true
+                    if (notifyFail) {
+                        NotificationHelper.showDownloadFailedNotification(this@FloatingBubbleService, "Download Failed", shortReason)
+                    }
                     mainHandler.post {
                         progressStatusText?.text = "Failed: $shortReason"
                         progressSpeedText?.text = "ERR"
@@ -2373,13 +2463,16 @@ class FloatingBubbleService : Service() {
                     VideoDownloaderPlugin.removeFailedLinkByUrl(this@FloatingBubbleService, normalizedUrl)
                     VideoDownloaderPlugin.recordDownloadStat(this@FloatingBubbleService, "TikTok", "photo", (totalPhotos.toLong() * 800L * 1024L))
 
-                    NotificationHelper.showDownloadFinishedNotification(
-                        this@FloatingBubbleService,
-                        "Saved $totalPhotos photos",
-                        "Saved to Pictures/OmniDrop",
-                        firstUri,
-                        isImage = true
-                    )
+                    val notifyFinish = prefs?.getBoolean("notify_download_finish", true) ?: true
+                    if (notifyFinish) {
+                        NotificationHelper.showDownloadFinishedNotification(
+                            this@FloatingBubbleService,
+                            "Saved $totalPhotos photos",
+                            "Saved to Pictures/OmniDrop",
+                            firstUri,
+                            isImage = true
+                        )
+                    }
 
                     mainHandler.post {
                         tabInnerFrame?.setFinished()
@@ -2424,7 +2517,7 @@ class FloatingBubbleService : Service() {
                     return@execute
                 }
 
-                val isAudio = defaultQuality.equals("audio", ignoreCase = true)
+                val isAudio = effectiveQuality.equals("audio", ignoreCase = true)
                 val ext = if (isAudio) ".mp3" else ".mp4"
                 val mediaType = if (isAudio) "audio/mpeg" else "video/mp4"
                 val cleanTitle = title
@@ -2433,7 +2526,7 @@ class FloatingBubbleService : Service() {
                     .trim()
                     .take(80)
                     .ifBlank { "$cleanPlatform video - $dateStr" }
-                val fileName = "$cleanTitle [$cleanPlatform]$ext"
+                val fileName = VideoDownloaderPlugin.buildStyledFileName(this@FloatingBubbleService, cleanTitle, cleanPlatform, ext)
 
                 val resolver = contentResolver
                 val contentValues = ContentValues().apply {
@@ -2544,7 +2637,7 @@ class FloatingBubbleService : Service() {
                     this.put("thumbnail", thumbnail)
                     this.put("uploader", uploader)
                     this.put("platform", cleanPlatform)
-                    this.put("quality", defaultQuality)
+                    this.put("quality", effectiveQuality)
                     this.put("savedAt", savedTimestamp)
                     this.put("fileName", fileName)
                     this.put("fileUri", targetUri.toString())
@@ -2554,12 +2647,15 @@ class FloatingBubbleService : Service() {
                 VideoDownloaderPlugin.removeFailedLinkByUrl(this, normalizedUrl)
                 VideoDownloaderPlugin.recordDownloadStat(this, cleanPlatform, if (isAudio) "audio" else "video", bytesCopied)
 
-                NotificationHelper.showDownloadFinishedNotification(
-                    this,
-                    "Saved to Gallery",
-                    "$fileName saved to ${if (isAudio) "Music/OmniDrop" else "Movies/OmniDrop"}",
-                    targetUri.toString()
-                )
+                val notifyFinish = prefs?.getBoolean("notify_download_finish", true) ?: true
+                if (notifyFinish) {
+                    NotificationHelper.showDownloadFinishedNotification(
+                        this,
+                        "Saved to Gallery",
+                        "$fileName saved to ${if (isAudio) "Music/OmniDrop" else "Movies/OmniDrop"}",
+                        targetUri.toString()
+                    )
+                }
 
                 currentDownloadSpeedMb = 0.0
                 mainHandler.post {
@@ -2626,6 +2722,10 @@ class FloatingBubbleService : Service() {
                     val failPlat = VideoDownloaderPlugin.detectPlatformName(normalizedUrl)
                     VideoDownloaderPlugin.recordFailedLink(this@FloatingBubbleService, normalizedUrl, failPlat, title, shortReason)
                     VideoDownloaderPlugin.recordFailedStat(this@FloatingBubbleService)
+                    val notifyFail = prefs?.getBoolean("notify_download_fail", true) ?: true
+                    if (notifyFail) {
+                        NotificationHelper.showDownloadFailedNotification(this@FloatingBubbleService, "Download Failed", shortReason)
+                    }
                     mainHandler.post {
                         progressStatusText?.text = "Failed: $shortReason"
                         progressSpeedText?.text = "ERR"
@@ -3513,6 +3613,10 @@ class FloatingBubbleService : Service() {
             canvas.drawPath(path, bevelLightPaint)
             canvas.drawLine(w * 0.5f, h * 0.15f, w * 0.5f, h * 0.85f, highlightLinePaint)
 
+            val scale = (h / (74f * density)).coerceIn(0.75f, 1.35f)
+            textPaint.textSize = (10f * scale) * context.resources.displayMetrics.scaledDensity
+            subTextPaint.textSize = (8f * scale) * context.resources.displayMetrics.scaledDensity
+
             // 3. Status LED Dot
             val ledColor = when (visualState) {
                 TabVisualState.FINISHED -> Color.parseColor("#34D399")
@@ -3525,18 +3629,18 @@ class FloatingBubbleService : Service() {
                 }
             }
             ledPaint.color = ledColor
-            canvas.drawCircle(w * 0.5f, 15f * density, 3.5f * density, ledPaint)
+            canvas.drawCircle(w * 0.5f, h * 0.20f, 3.5f * density * scale, ledPaint)
 
             // 4. Center Display Text / Symbol
-            val textY = 44f * density
+            val textY = h * 0.60f
             when (visualState) {
                 TabVisualState.FINISHED -> {
-                    symbolPaint.textSize = 17f * context.resources.displayMetrics.scaledDensity
-                    canvas.drawText("✓", w * 0.5f, textY + (2f * density), symbolPaint)
+                    symbolPaint.textSize = (17f * scale) * context.resources.displayMetrics.scaledDensity
+                    canvas.drawText("✓", w * 0.5f, textY + (2f * density * scale), symbolPaint)
                 }
                 TabVisualState.FAILED -> {
-                    symbolPaint.textSize = 19f * context.resources.displayMetrics.scaledDensity
-                    canvas.drawText("!", w * 0.5f, textY + (2f * density), symbolPaint)
+                    symbolPaint.textSize = (19f * scale) * context.resources.displayMetrics.scaledDensity
+                    canvas.drawText("!", w * 0.5f, textY + (2f * density * scale), symbolPaint)
                 }
                 TabVisualState.DOWNLOADING -> {
                     textPaint.color = Color.parseColor("#00F0FF")
@@ -3549,7 +3653,7 @@ class FloatingBubbleService : Service() {
                             val display = if (pingMs in 0..999) "$pingMs" else if (pingMs > 999) String.format(Locale.US, "%.1fs", pingMs / 1000.0) else "—"
                             canvas.drawText(display, w * 0.5f, textY, textPaint)
                             if (pingMs in 0..999) {
-                                canvas.drawText("ms", w * 0.5f, textY + (12f * density), subTextPaint)
+                                canvas.drawText("ms", w * 0.5f, textY + (12f * density * scale), subTextPaint)
                             }
                         }
                         "SLEEP" -> {

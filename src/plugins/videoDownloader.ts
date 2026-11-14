@@ -1,6 +1,31 @@
 import { registerPlugin, PluginListenerHandle } from '@capacitor/core';
 import { DownloadHistoryItem, VideoLibraryItem, PhotoLibraryItem, FailedDownloadItem, CollectionItem, DownloadStatsData } from '../types';
 
+export interface SystemChecksResult {
+  overlayGranted: boolean;
+  notificationsGranted: boolean;
+  mediaGranted: boolean;
+  installUpdatesGranted: boolean;
+  batteryUnrestricted: boolean;
+  floatingServiceRunning: boolean;
+}
+
+export interface NetworkStatusResult {
+  isMobileData: boolean;
+  isMetered: boolean;
+  transport: 'wifi' | 'cellular' | 'ethernet' | 'unknown';
+}
+
+export interface StorageUsageResult {
+  videoBytes: number;
+  videoCount: number;
+  photoBytes: number;
+  photoCount: number;
+  audioBytes: number;
+  audioCount: number;
+  totalBytes: number;
+}
+
 export interface VideoDownloaderPlugin {
   hasOverlayPermission(): Promise<{ granted: boolean }>;
   requestOverlayPermission(): Promise<{ requested: boolean }>;
@@ -31,6 +56,7 @@ export interface VideoDownloaderPlugin {
   showPersistentNotification(options?: { title?: string; message?: string }): Promise<void>;
   dismissPersistentNotification(): Promise<void>;
   showDownloadNotification(options: { title: string; message: string; filePath?: string }): Promise<void>;
+  showDownloadFailedNotification(options: { title: string; message: string }): Promise<void>;
   getLastSharedUrl(): Promise<{ url: string }>;
   saveNativeSettings(options: {
     backendUrl: string;
@@ -46,7 +72,28 @@ export interface VideoDownloaderPlugin {
     floatingVibrate?: boolean;
     floatingHideInsideApp?: boolean;
     autoCheckUpdates?: boolean;
+    dataSaver?: boolean;
+    mobileDataPromptMb?: string;
+    fallbackToBestQuality?: boolean;
+    fileNameStyle?: string;
+    notifyDownloadFinish?: boolean;
+    notifyDownloadFail?: boolean;
+    playerDefaultSpeed?: number;
+    playerDefaultFitMode?: 'fit' | 'fill';
+    playerResumePlayback?: boolean;
+    playerKeepScreenOn?: boolean;
+    playerAutoPip?: boolean;
+    playerGesturesEnabled?: boolean;
+    floatingSize?: 'small' | 'medium' | 'large';
+    floatingOpacity?: number;
+    hideInRecents?: boolean;
   }): Promise<{ saved: boolean }>;
+  getSystemChecks(): Promise<SystemChecksResult>;
+  requestNotificationPermission(): Promise<{ requested: boolean; granted?: boolean; openedSettings?: boolean }>;
+  requestInstallPermission(): Promise<{ requested: boolean }>;
+  requestBatteryUnrestricted(): Promise<{ requested: boolean }>;
+  getNetworkStatus(): Promise<NetworkStatusResult>;
+  getStorageUsage(): Promise<StorageUsageResult>;
   clearMetadataCache(): Promise<{ cleared: boolean }>;
   getLastCrash(): Promise<{ crash: string }>;
   clearLastCrash(): Promise<{ cleared: boolean }>;
@@ -222,11 +269,79 @@ const VideoDownloaderWeb: VideoDownloaderPlugin = {
       }
     }
   },
+  async showDownloadFailedNotification(options) {
+    if ('Notification' in window && Notification.permission === 'granted') {
+      try {
+        new Notification(options.title, {
+          body: options.message,
+          icon: '/icon.svg',
+        });
+      } catch {
+        // Ignored
+      }
+    }
+  },
   async getLastSharedUrl() {
     return { url: '' };
   },
   async saveNativeSettings() {
     return { saved: true };
+  },
+  async getSystemChecks() {
+    const notificationsGranted =
+      typeof window !== 'undefined' && 'Notification' in window
+        ? Notification.permission === 'granted'
+        : false;
+    return {
+      overlayGranted: false,
+      notificationsGranted,
+      mediaGranted: true,
+      installUpdatesGranted: false,
+      batteryUnrestricted: false,
+      floatingServiceRunning: false,
+    };
+  },
+  async requestNotificationPermission() {
+    if (typeof window !== 'undefined' && 'Notification' in window && Notification.requestPermission) {
+      try {
+        const perm = await Notification.requestPermission();
+        return { requested: true, granted: perm === 'granted' };
+      } catch {}
+    }
+    return { requested: false, granted: false };
+  },
+  async requestInstallPermission() {
+    return { requested: false };
+  },
+  async requestBatteryUnrestricted() {
+    return { requested: false };
+  },
+  async getNetworkStatus() {
+    try {
+      const nav = navigator as any;
+      const conn = nav?.connection || nav?.mozConnection || nav?.webkitConnection;
+      if (conn) {
+        const connType = String(conn.type || '').toLowerCase();
+        const isCellular = connType === 'cellular' || Boolean(conn.saveData);
+        return {
+          isMobileData: isCellular,
+          isMetered: isCellular || Boolean(conn.saveData),
+          transport: connType === 'wifi' ? 'wifi' : connType === 'cellular' ? 'cellular' : connType === 'ethernet' ? 'ethernet' : 'unknown',
+        };
+      }
+    } catch {}
+    return { isMobileData: false, isMetered: false, transport: 'unknown' };
+  },
+  async getStorageUsage() {
+    return {
+      videoBytes: 0,
+      videoCount: 0,
+      photoBytes: 0,
+      photoCount: 0,
+      audioBytes: 0,
+      audioCount: 0,
+      totalBytes: 0,
+    };
   },
   async clearMetadataCache() {
     try {

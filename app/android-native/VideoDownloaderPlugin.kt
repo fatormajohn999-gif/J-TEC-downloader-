@@ -1,5 +1,6 @@
 package com.omnidrop.app.plugin
 
+import android.Manifest
 import android.app.Activity
 import android.app.StatusBarManager
 import android.content.ComponentName
@@ -7,11 +8,19 @@ import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.drawable.Icon
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.PowerManager
+import android.view.WindowManager
+import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import java.util.concurrent.Executor
 import java.util.function.Consumer
 import android.provider.MediaStore
@@ -136,6 +145,64 @@ class VideoDownloaderPlugin : Plugin() {
                     val guessed = detectPlatformName(fallbackUrl)
                     if (guessed != "Other") guessed else "Other"
                 }
+            }
+        }
+
+        fun isOnMobileData(context: Context): Boolean {
+            try {
+                val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    val network = cm.activeNetwork ?: return false
+                    val caps = cm.getNetworkCapabilities(network) ?: return false
+                    if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+                    ) {
+                        return false
+                    }
+                    if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)) {
+                        return false
+                    }
+                    return caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+                } else {
+                    @Suppress("DEPRECATION")
+                    val info = cm.activeNetworkInfo ?: return false
+                    @Suppress("DEPRECATION")
+                    return info.type == ConnectivityManager.TYPE_MOBILE
+                }
+            } catch (_: Throwable) {
+                return false
+            }
+        }
+
+        fun resolveEffectiveQuality(context: Context, requestedQuality: String): String {
+            return try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val dataSaver = prefs.getBoolean("data_saver", false)
+                val q = requestedQuality.lowercase(Locale.US)
+                if (dataSaver && isOnMobileData(context) && (q == "best" || q == "1080p")) {
+                    "720p"
+                } else {
+                    requestedQuality
+                }
+            } catch (_: Throwable) {
+                requestedQuality
+            }
+        }
+
+        fun buildStyledFileName(context: Context, cleanTitle: String, cleanPlatform: String, ext: String): String {
+            val style = try {
+                context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .getString("file_name_style", "title_platform") ?: "title_platform"
+            } catch (_: Throwable) {
+                "title_platform"
+            }
+            return when (style) {
+                "platform_title_date" -> {
+                    val dateOnly = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+                    "$cleanPlatform - $cleanTitle - $dateOnly$ext"
+                }
+                "title_only" -> "$cleanTitle$ext"
+                else -> "$cleanTitle [$cleanPlatform]$ext"
             }
         }
 
@@ -860,6 +927,7 @@ class VideoDownloaderPlugin : Plugin() {
                 updatesDir.deleteRecursively()
             }
         } catch (_: Exception) {}
+        applyPrivacyScreenFlag()
         val intent = activity.intent
         handleIncomingIntent(intent)
     }
@@ -910,6 +978,23 @@ class VideoDownloaderPlugin : Plugin() {
     override fun handleOnResume() {
         super.handleOnResume()
         FloatingBubbleService.setOmniDropForeground(true)
+        applyPrivacyScreenFlag()
+    }
+
+    private fun applyPrivacyScreenFlag() {
+        try {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val hideRecents = prefs.getBoolean("privacy_hide_recents", false)
+            activity?.runOnUiThread {
+                try {
+                    if (hideRecents) {
+                        activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                    } else {
+                        activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                    }
+                } catch (_: Throwable) {}
+            }
+        } catch (_: Throwable) {}
     }
 
     override fun handleOnPause() {
@@ -1282,6 +1367,12 @@ class VideoDownloaderPlugin : Plugin() {
             this.remove(PREF_METADATA_MAP)
             this.apply()
         }
+        try {
+            val thumbCacheDir = java.io.File(context.cacheDir, "thumbnails")
+            if (thumbCacheDir.exists()) {
+                thumbCacheDir.deleteRecursively()
+            }
+        } catch (_: Throwable) {}
         val res = JSObject().apply {
             this.put("cleared", true)
         }
@@ -1298,11 +1389,28 @@ class VideoDownloaderPlugin : Plugin() {
         val autoPlayNext = call.getBoolean("autoPlayNext", true) ?: true
         val repeatMode = call.getString("repeatMode") ?: "off"
         val floatingSide = call.getString("floatingSide") ?: "right"
+        val floatingSize = call.getString("floatingSize") ?: "medium"
+        val floatingOpacity = call.getInt("floatingOpacity", 45) ?: 45
         val floatingShowMs = call.getBoolean("floatingShowMs", true) ?: true
         val floatingAutoClear = call.getBoolean("floatingAutoClear", true) ?: true
         val floatingVibrate = call.getBoolean("floatingVibrate", true) ?: true
         val floatingHideInsideApp = call.getBoolean("floatingHideInsideApp", true) ?: true
         val autoCheckUpdates = call.getBoolean("autoCheckUpdates", true) ?: true
+
+        // New Download, Player & Privacy prefs
+        val dataSaver = call.getBoolean("dataSaver", false) ?: false
+        val mobileDataPromptMb = call.getString("mobileDataPromptMb") ?: "off"
+        val fallbackToBestQuality = call.getBoolean("fallbackToBestQuality", true) ?: true
+        val fileNameStyle = call.getString("fileNameStyle") ?: "title_platform"
+        val notifyDownloadFinish = call.getBoolean("notifyDownloadFinish", true) ?: true
+        val notifyDownloadFail = call.getBoolean("notifyDownloadFail", true) ?: true
+        val playerDefaultSpeed = (call.getDouble("playerDefaultSpeed", 1.0) ?: 1.0).toFloat()
+        val playerDefaultFitMode = call.getString("playerDefaultFitMode") ?: "fit"
+        val playerResumePlayback = call.getBoolean("playerResumePlayback", true) ?: true
+        val playerKeepScreenOn = call.getBoolean("playerKeepScreenOn", true) ?: true
+        val playerAutoPip = call.getBoolean("playerAutoPip", true) ?: true
+        val playerGesturesEnabled = call.getBoolean("playerGesturesEnabled", true) ?: true
+        val hideInRecents = call.getBoolean("hideInRecents", false) ?: false
 
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().apply {
@@ -1314,13 +1422,31 @@ class VideoDownloaderPlugin : Plugin() {
             this.putBoolean("auto_play_next", autoPlayNext)
             this.putString("repeat_mode", repeatMode)
             this.putString("floating_side", floatingSide)
+            this.putBoolean("tab_is_left", floatingSide.equals("left", ignoreCase = true))
+            this.putString("floating_size", floatingSize.lowercase(Locale.US))
+            this.putInt("floating_opacity", floatingOpacity.coerceIn(15, 100))
             this.putBoolean("floating_show_ms", floatingShowMs)
             this.putBoolean("floating_auto_clear", floatingAutoClear)
             this.putBoolean("floating_vibrate", floatingVibrate)
             this.putBoolean("floating_hide_inside_app", floatingHideInsideApp)
             this.putBoolean("auto_check_updates", autoCheckUpdates)
+            this.putBoolean("data_saver", dataSaver)
+            this.putString("mobile_data_prompt_mb", mobileDataPromptMb)
+            this.putBoolean("fallback_to_best", fallbackToBestQuality)
+            this.putString("file_name_style", fileNameStyle)
+            this.putBoolean("notify_download_finish", notifyDownloadFinish)
+            this.putBoolean("notify_download_fail", notifyDownloadFail)
+            this.putFloat("player_default_speed", playerDefaultSpeed)
+            this.putString("player_default_fit_mode", playerDefaultFitMode)
+            this.putBoolean("player_resume_playback", playerResumePlayback)
+            this.putBoolean("player_keep_screen_on", playerKeepScreenOn)
+            this.putBoolean("player_auto_pip", playerAutoPip)
+            this.putBoolean("player_brightness_volume_gestures", playerGesturesEnabled)
+            this.putBoolean("privacy_hide_recents", hideInRecents)
             this.apply()
         }
+
+        applyPrivacyScreenFlag()
 
         FloatingBubbleService.instance?.updateSettings(
             backendUrl,
@@ -1330,7 +1456,10 @@ class VideoDownloaderPlugin : Plugin() {
             floatingAutoClear,
             floatingVibrate,
             floatingHideInsideApp,
-            autoCheckUpdates
+            autoCheckUpdates,
+            floatingSide,
+            floatingSize,
+            floatingOpacity
         )
 
         FloatingBubbleService.syncService(context)
@@ -1646,6 +1775,7 @@ class VideoDownloaderPlugin : Plugin() {
                 var thumbnail = ""
                 var uploader = "Creator"
                 var platform = ""
+                val availableQualities = HashSet<String>()
 
                 try {
                     val infoEndpoint = if (backendUrl.startsWith("http://") || backendUrl.startsWith("https://")) {
@@ -1679,6 +1809,13 @@ class VideoDownloaderPlugin : Plugin() {
                         thumbnail = json.optString("thumbnail", "")
                         uploader = json.optString("uploader", "Creator")
                         platform = json.optString("platform", "")
+                        val qArr = json.optJSONArray("qualities")
+                        if (qArr != null) {
+                            for (qi in 0 until qArr.length()) {
+                                val qItem = qArr.optString(qi, "").lowercase(Locale.US)
+                                if (qItem.isNotBlank()) availableQualities.add(qItem)
+                            }
+                        }
                     }
                     iConn.disconnect()
                 } catch (_: Exception) {
@@ -1686,7 +1823,7 @@ class VideoDownloaderPlugin : Plugin() {
                 }
 
                 // Clean platform: never use "Video" as platform
-                val cleanPlatform = cleanPlatformName(platform, normalizedUrl)
+                cleanPlatform = cleanPlatformName(platform, normalizedUrl)
 
                 // Fallback title if /info failed or had no title: "<platform> video - <date and time>"
                 val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
@@ -1695,9 +1832,21 @@ class VideoDownloaderPlugin : Plugin() {
                     finalTitle = "$cleanPlatform video - $dateStr"
                 }
 
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val fallbackToBest = prefs.getBoolean("fallback_to_best", true)
+                val notifyFinish = prefs.getBoolean("notify_download_finish", true)
+                val notifyFail = prefs.getBoolean("notify_download_fail", true)
+
+                var effectiveQuality = resolveEffectiveQuality(context, quality)
+                if (fallbackToBest && availableQualities.isNotEmpty() && !effectiveQuality.equals("best", ignoreCase = true) && !effectiveQuality.equals("audio", ignoreCase = true)) {
+                    if (!availableQualities.contains(effectiveQuality.lowercase(Locale.US))) {
+                        effectiveQuality = "best"
+                    }
+                }
+
                 reportProgress(20, "Connecting to download server...")
 
-                val isAudio = quality.equals("audio", ignoreCase = true)
+                val isAudio = effectiveQuality.equals("audio", ignoreCase = true)
                 val ext = if (isAudio) ".mp3" else ".mp4"
                 val mediaType = if (isAudio) "audio/mpeg" else "video/mp4"
 
@@ -1708,32 +1857,42 @@ class VideoDownloaderPlugin : Plugin() {
                     .trim()
                     .take(80)
                     .ifBlank { "$cleanPlatform video - $dateStr" }
-                val fileName = "$cleanTitle [$cleanPlatform]$ext"
+                val fileName = buildStyledFileName(context, cleanTitle, cleanPlatform, ext)
 
                 val urlObj = URL(endpoint)
-                connection = (urlObj.openConnection() as HttpURLConnection).apply {
-                    this.requestMethod = "POST"
-                    this.connectTimeout = 30000
-                    this.readTimeout = 180000
-                    this.doInput = true
-                    this.doOutput = true
-                    this.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-                    this.setRequestProperty("Accept", "*/*")
-                    if (!apiKey.isNullOrBlank()) {
-                        this.setRequestProperty("x-api-key", apiKey.trim())
+                fun openPipelineConnection(qToUse: String): HttpURLConnection {
+                    val c = (urlObj.openConnection() as HttpURLConnection).apply {
+                        this.requestMethod = "POST"
+                        this.connectTimeout = 30000
+                        this.readTimeout = 180000
+                        this.doInput = true
+                        this.doOutput = true
+                        this.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                        this.setRequestProperty("Accept", "*/*")
+                        if (!apiKey.isNullOrBlank()) {
+                            this.setRequestProperty("x-api-key", apiKey.trim())
+                        }
                     }
+                    val jsonPayload = JSONObject().apply {
+                        this.put("url", normalizedUrl)
+                        this.put("quality", qToUse)
+                    }
+                    c.outputStream.use { os ->
+                        os.write(jsonPayload.toString().toByteArray(Charsets.UTF_8))
+                        os.flush()
+                    }
+                    return c
                 }
 
-                val jsonPayload = JSONObject().apply {
-                    this.put("url", normalizedUrl)
-                    this.put("quality", quality)
-                }
-                connection.outputStream.use { os ->
-                    os.write(jsonPayload.toString().toByteArray(Charsets.UTF_8))
-                    os.flush()
+                connection = openPipelineConnection(effectiveQuality)
+                var responseCode = connection.responseCode
+                if (responseCode != HttpURLConnection.HTTP_OK && fallbackToBest && !effectiveQuality.equals("best", ignoreCase = true)) {
+                    try { connection.disconnect() } catch (_: Exception) {}
+                    effectiveQuality = "best"
+                    connection = openPipelineConnection(effectiveQuality)
+                    responseCode = connection.responseCode
                 }
 
-                val responseCode = connection.responseCode
                 if (responseCode != HttpURLConnection.HTTP_OK) {
                     val errorText = try {
                         connection.errorStream?.bufferedReader()?.use { it.readText() } ?: "HTTP $responseCode"
@@ -1748,6 +1907,9 @@ class VideoDownloaderPlugin : Plugin() {
                         errorText
                     }
 
+                    if (notifyFail) {
+                        NotificationHelper.showDownloadFailedNotification(context, "Download Failed", cleanMsg.take(120))
+                    }
                     callToResolve?.reject("Download failed: $cleanMsg")
                     return@Thread
                 }
@@ -1821,13 +1983,15 @@ class VideoDownloaderPlugin : Plugin() {
 
                     reportProgress(100, "Saved $totalPhotos photos to Pictures/OmniDrop!")
 
-                    NotificationHelper.showDownloadFinishedNotification(
-                        context,
-                        "Saved $totalPhotos photos",
-                        "Saved to Pictures/OmniDrop",
-                        firstUri,
-                        isImage = true
-                    )
+                    if (notifyFinish) {
+                        NotificationHelper.showDownloadFinishedNotification(
+                            context,
+                            "Saved $totalPhotos photos",
+                            "Saved to Pictures/OmniDrop",
+                            firstUri,
+                            isImage = true
+                        )
+                    }
 
                     val metaObj = JSONObject().apply {
                         this.put("type", "photo")
@@ -1953,12 +2117,14 @@ class VideoDownloaderPlugin : Plugin() {
 
                 reportProgress(100, "Saved to ${if (isAudio) "Music/OmniDrop" else "Movies/OmniDrop"}!")
 
-                NotificationHelper.showDownloadFinishedNotification(
-                    context,
-                    "Saved to Gallery",
-                    "$fileName saved to ${if (isAudio) "Music/OmniDrop" else "Movies/OmniDrop"}",
-                    targetUri.toString()
-                )
+                if (notifyFinish) {
+                    NotificationHelper.showDownloadFinishedNotification(
+                        context,
+                        "Saved to Gallery",
+                        "$fileName saved to ${if (isAudio) "Music/OmniDrop" else "Movies/OmniDrop"}",
+                        targetUri.toString()
+                    )
+                }
 
                 // Save to SharedPreferences metadata store (keyed by fileName, up to 500)
                 val metaObj = JSONObject().apply {
@@ -1981,7 +2147,7 @@ class VideoDownloaderPlugin : Plugin() {
                     this.put("thumbnail", thumbnail)
                     this.put("uploader", uploader)
                     this.put("platform", cleanPlatform)
-                    this.put("quality", quality)
+                    this.put("quality", effectiveQuality)
                     this.put("savedAt", System.currentTimeMillis())
                     this.put("fileName", fileName)
                     this.put("fileUri", targetUri.toString())
@@ -2006,6 +2172,13 @@ class VideoDownloaderPlugin : Plugin() {
                 val rawErr = e.message ?: "Unknown error"
                 recordFailedLink(context, normalizedUrl, cleanPlatform, finalTitle, rawErr)
                 recordFailedStat(context)
+                val notifyFailPref = try {
+                    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                        .getBoolean("notify_download_fail", true)
+                } catch (_: Throwable) { true }
+                if (notifyFailPref) {
+                    NotificationHelper.showDownloadFailedNotification(context, "Download Failed", rawErr.take(120))
+                }
                 callToResolve?.reject("Native download error: $rawErr")
             } finally {
                 inFlightDownloads.remove(normalizedUrl)
@@ -2050,11 +2223,30 @@ class VideoDownloaderPlugin : Plugin() {
             arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val anyMissing = perms.any {
-                androidx.core.content.ContextCompat.checkSelfPermission(context, it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+            val missing = perms.filter {
+                ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
             }
-            if (anyMissing) {
-                androidx.core.app.ActivityCompat.requestPermissions(activity, perms, 992)
+            if (missing.isNotEmpty()) {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val alreadyAsked = prefs.getBoolean("asked_media_permissions", false)
+                val act = activity
+                val shouldShow = act != null && missing.any { ActivityCompat.shouldShowRequestPermissionRationale(act, it) }
+                if (!alreadyAsked || shouldShow) {
+                    prefs.edit().putBoolean("asked_media_permissions", true).apply()
+                    if (act != null) {
+                        ActivityCompat.requestPermissions(act, perms, 992)
+                    }
+                } else {
+                    try {
+                        val intent = Intent(
+                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.parse("package:" + context.packageName)
+                        ).apply {
+                            this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        context.startActivity(intent)
+                    } catch (_: Throwable) {}
+                }
             }
         }
         val res = JSObject().apply {
@@ -3229,5 +3421,306 @@ class VideoDownloaderPlugin : Plugin() {
             call.reject("Failed to share audio: ${e.message ?: "Unknown error"}")
         }
     }
+
+    @PluginMethod
+    fun showDownloadFailedNotification(call: PluginCall) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        if (!prefs.getBoolean("notify_download_fail", true)) {
+            call.resolve()
+            return
+        }
+        val title = call.getString("title") ?: "Download Failed"
+        val message = call.getString("message") ?: "Download could not complete."
+        NotificationHelper.showDownloadFailedNotification(context, title, message)
+        call.resolve()
+    }
+
+    @PluginMethod
+    fun getSystemChecks(call: PluginCall) {
+        val ctx = context
+        val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+        val overlayGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try { Settings.canDrawOverlays(ctx) } catch (_: Throwable) { true }
+        } else {
+            true
+        }
+
+        val postNotifGranted = if (Build.VERSION.SDK_INT >= 33) {
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+        val notificationsEnabled = try {
+            NotificationManagerCompat.from(ctx).areNotificationsEnabled()
+        } catch (_: Throwable) {
+            true
+        }
+        val notificationsGranted = postNotifGranted && notificationsEnabled
+
+        val mediaGranted = if (Build.VERSION.SDK_INT >= 33) {
+            val v = ContextCompat.checkSelfPermission(ctx, Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED
+            val i = ContextCompat.checkSelfPermission(ctx, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
+            v && i
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+
+        val installUpdatesGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try { ctx.packageManager.canRequestPackageInstalls() } catch (_: Throwable) { true }
+        } else {
+            true
+        }
+
+        val batteryUnrestricted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try {
+                val pm = ctx.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                pm?.isIgnoringBatteryOptimizations(ctx.packageName) ?: true
+            } catch (_: Throwable) {
+                true
+            }
+        } else {
+            true
+        }
+
+        val floatingServiceRunning = (FloatingBubbleService.instance != null) && prefs.getBoolean("floating_bubble_enabled", false)
+
+        val ret = JSObject().apply {
+            this.put("overlayGranted", overlayGranted)
+            this.put("notificationsGranted", notificationsGranted)
+            this.put("mediaGranted", mediaGranted)
+            this.put("installUpdatesGranted", installUpdatesGranted)
+            this.put("batteryUnrestricted", batteryUnrestricted)
+            this.put("floatingServiceRunning", floatingServiceRunning)
+        }
+        call.resolve(ret)
+    }
+
+    @PluginMethod
+    fun requestNotificationPermission(call: PluginCall) {
+        val ctx = context
+        val act = activity
+        val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+        if (Build.VERSION.SDK_INT >= 33 && act != null) {
+            val postGranted = ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+            if (!postGranted) {
+                val alreadyAsked = prefs.getBoolean("asked_post_notifications", false)
+                val shouldShow = ActivityCompat.shouldShowRequestPermissionRationale(act, Manifest.permission.POST_NOTIFICATIONS)
+                if (!alreadyAsked || shouldShow) {
+                    prefs.edit().putBoolean("asked_post_notifications", true).apply()
+                    ActivityCompat.requestPermissions(act, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 993)
+                    val ret = JSObject().apply { this.put("requested", true) }
+                    call.resolve(ret)
+                    return
+                }
+            }
+        }
+
+        try {
+            val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                    this.putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName)
+                    this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            } else {
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + ctx.packageName)).apply {
+                    this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            }
+            ctx.startActivity(intent)
+        } catch (_: Throwable) {}
+
+        val ret = JSObject().apply { this.put("requested", true) }
+        call.resolve(ret)
+    }
+
+    @PluginMethod
+    fun requestInstallPermission(call: PluginCall) {
+        val ctx = context
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                val intent = Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:" + ctx.packageName)
+                ).apply {
+                    this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                ctx.startActivity(intent)
+            } catch (_: Throwable) {
+                try {
+                    val fallback = Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:" + ctx.packageName)
+                    ).apply {
+                        this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    ctx.startActivity(fallback)
+                } catch (_: Throwable) {}
+            }
+        }
+        val ret = JSObject().apply { this.put("requested", true) }
+        call.resolve(ret)
+    }
+
+    @PluginMethod
+    fun requestBatteryUnrestricted(call: PluginCall) {
+        val ctx = context
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try {
+                val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).apply {
+                    this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                ctx.startActivity(intent)
+            } catch (_: Throwable) {
+                try {
+                    val fallback = Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:" + ctx.packageName)
+                    ).apply {
+                        this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    ctx.startActivity(fallback)
+                } catch (_: Throwable) {}
+            }
+        }
+        val ret = JSObject().apply { this.put("requested", true) }
+        call.resolve(ret)
+    }
+
+    @PluginMethod
+    fun getNetworkStatus(call: PluginCall) {
+        val ctx = context
+        var isMobile = false
+        var isMetered = false
+        var transport = "unknown"
+
+        try {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            if (cm != null) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    val net = cm.activeNetwork
+                    val caps = if (net != null) cm.getNetworkCapabilities(net) else null
+                    if (caps != null) {
+                        when {
+                            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> transport = "wifi"
+                            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> transport = "ethernet"
+                            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> {
+                                transport = "cellular"
+                                isMobile = true
+                            }
+                        }
+                        isMetered = !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+                    }
+                } else {
+                    @Suppress("DEPRECATION")
+                    val info = cm.activeNetworkInfo
+                    if (info != null) {
+                        @Suppress("DEPRECATION")
+                        when (info.type) {
+                            ConnectivityManager.TYPE_WIFI -> transport = "wifi"
+                            ConnectivityManager.TYPE_ETHERNET -> transport = "ethernet"
+                            ConnectivityManager.TYPE_MOBILE -> {
+                                transport = "cellular"
+                                isMobile = true
+                                isMetered = true
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_: Throwable) {}
+
+        val ret = JSObject().apply {
+            this.put("isMobileData", isMobile)
+            this.put("isMetered", isMetered)
+            this.put("transport", transport)
+        }
+        call.resolve(ret)
+    }
+
+    @PluginMethod
+    fun getStorageUsage(call: PluginCall) {
+        val ctx = context
+        Thread {
+            var videoBytes = 0L
+            var videoCount = 0
+            var photoBytes = 0L
+            var photoCount = 0
+            var audioBytes = 0L
+            var audioCount = 0
+
+            fun queryBucket(collection: Uri): Pair<Long, Int> {
+                var sumBytes = 0L
+                var count = 0
+                try {
+                    val pathCol = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        MediaStore.MediaColumns.RELATIVE_PATH
+                    } else {
+                        MediaStore.MediaColumns.DATA
+                    }
+                    val projection = arrayOf(MediaStore.MediaColumns.SIZE, pathCol)
+                    val selection = "$pathCol LIKE ?"
+                    val args = arrayOf("%OmniDrop%")
+                    ctx.contentResolver.query(collection, projection, selection, args, null)?.use { cursor ->
+                        val sizeIdx = cursor.getColumnIndex(MediaStore.MediaColumns.SIZE)
+                        while (cursor.moveToNext()) {
+                            count++
+                            if (sizeIdx >= 0) {
+                                val s = cursor.getLong(sizeIdx)
+                                if (s > 0) sumBytes += s
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {}
+                return Pair(sumBytes, count)
+            }
+
+            try {
+                val vidUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+                } else {
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                }
+                val imgUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+                } else {
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                }
+                val audUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+                } else {
+                    MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                }
+
+                val v = queryBucket(vidUri)
+                videoBytes = v.first
+                videoCount = v.second
+
+                val p = queryBucket(imgUri)
+                photoBytes = p.first
+                photoCount = p.second
+
+                val a = queryBucket(audUri)
+                audioBytes = a.first
+                audioCount = a.second
+            } catch (_: Throwable) {}
+
+            val totalBytes = videoBytes + photoBytes + audioBytes
+            val ret = JSObject().apply {
+                this.put("videoBytes", videoBytes)
+                this.put("videoCount", videoCount)
+                this.put("photoBytes", photoBytes)
+                this.put("photoCount", photoCount)
+                this.put("audioBytes", audioBytes)
+                this.put("audioCount", audioCount)
+                this.put("totalBytes", totalBytes)
+            }
+            call.resolve(ret)
+        }.start()
+    }
 }
+
 

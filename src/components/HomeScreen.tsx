@@ -18,7 +18,7 @@ import {
 } from 'lucide-react';
 import { Capacitor } from '@capacitor/core';
 import { VideoInfo, AppSettings, PlatformType, DownloadHistoryItem, FailedDownloadItem } from '../types';
-import { isSupportedUrl, fetchVideoInfo, downloadVideoFile, wakeUpServerUntilReady, normalizeUrl } from '../services/api';
+import { isSupportedUrl, fetchVideoInfo, downloadVideoFile, wakeUpServerUntilReady, normalizeUrl, resolveEffectiveQuality } from '../services/api';
 import { VideoDownloader } from '../plugins/videoDownloader';
 import { EmptyState } from './EmptyState';
 import { SpeedArcGauge } from './SpeedArcGauge';
@@ -103,10 +103,28 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     fileName: string;
   } | null>(null);
 
+  const [isMobileData, setIsMobileData] = useState<boolean>(false);
+  const [mobileDataConfirm, setMobileDataConfirm] = useState<{
+    open: boolean;
+    sizeMb: number;
+    url: string;
+    force: boolean;
+  } | null>(null);
+
   // Failed downloads modal state
   const [failedLinks, setFailedLinks] = useState<FailedDownloadItem[]>([]);
   const [failedModalOpen, setFailedModalOpen] = useState<boolean>(false);
   const [copiedFailedId, setCopiedFailedId] = useState<string | null>(null);
+
+  const refreshNetworkStatus = useCallback(async () => {
+    try {
+      const net = await VideoDownloader.getNetworkStatus();
+      setIsMobileData(Boolean(net?.isMobileData));
+      return Boolean(net?.isMobileData);
+    } catch {
+      return false;
+    }
+  }, []);
 
   const loadTodayStats = useCallback(async () => {
     try {
@@ -141,6 +159,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   useEffect(() => {
     loadTodayStats();
     loadFailedLinks();
+    refreshNetworkStatus();
 
     let hFailed: any = null;
     let hFinished: any = null;
@@ -155,15 +174,25 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       } catch {}
     })();
 
-    const onFocus = () => loadTodayStats();
+    const onFocus = () => {
+      loadTodayStats();
+      refreshNetworkStatus();
+    };
     window.addEventListener('focus', onFocus);
 
     return () => {
       window.removeEventListener('focus', onFocus);
-      if (hFailed && hFailed.remove) hFailed.remove();
-      if (hFinished && hFinished.remove) hFinished.remove();
+      if (hFailed && handleRemove(hFailed)) {}
+      if (hFinished && handleRemove(hFinished)) {}
     };
-  }, [loadFailedLinks, loadTodayStats]);
+  }, [loadFailedLinks, loadTodayStats, refreshNetworkStatus]);
+
+  function handleRemove(h: any): boolean {
+    if (h && typeof h.remove === 'function') {
+      h.remove();
+    }
+    return true;
+  }
 
   // Sync if pendingUrl was passed from Share Target or Clipboard detector
   useEffect(() => {
@@ -262,14 +291,16 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
   };
 
-  const handleStartDownload = async (force: boolean = false) => {
+  const handleStartDownload = async (force: boolean = false, skipMobilePrompt: boolean = false) => {
     const targetUrl = videoInfo ? videoInfo.url : normalizeUrl(inputUrl.trim());
     if (!targetUrl) {
       setErrorMessage('Please paste or inspect a video URL first.');
       return;
     }
 
-    if (!force && isNative) {
+    const onCellular = await refreshNetworkStatus();
+
+    if (!force && isNative && !skipMobilePrompt) {
       try {
         const dup = await VideoDownloader.checkDuplicate({ url: targetUrl });
         if (dup && dup.exists) {
@@ -286,6 +317,25 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       }
     }
 
+    // Mobile data size alert check
+    const limitSetting = settings.mobileDataPromptMb ?? 'off';
+    if (!skipMobilePrompt && onCellular && limitSetting !== 'off') {
+      const rawBytes = videoInfo?.filesize || videoInfo?.filesize_approx || 0;
+      const limitMb = typeof limitSetting === 'number' ? limitSetting : Number(limitSetting);
+      if (rawBytes > 0 && limitMb > 0) {
+        const fileSizeMb = rawBytes / (1024 * 1024);
+        if (fileSizeMb > limitMb) {
+          setMobileDataConfirm({
+            open: true,
+            sizeMb: fileSizeMb,
+            url: targetUrl,
+            force,
+          });
+          return;
+        }
+      }
+    }
+
     setIsDownloading(true);
     setDownloadProgress(10);
     setDownloadStatusText('Connecting to downloader...');
@@ -293,6 +343,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     setErrorMessage(null);
     setSuccessMessage(null);
     setDuplicateDialog(null);
+    setMobileDataConfirm(null);
 
     const titleToUse = videoInfo?.title || 'video';
     const uploaderToUse = videoInfo?.uploader || 'Creator';
@@ -300,10 +351,23 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     const durationToUse = videoInfo?.duration || 0;
     const platformToUse = videoInfo?.platform || 'other';
 
-    try {
-      const fileName = await downloadVideoFile(
+    let { effectiveQuality } = resolveEffectiveQuality(selectedQuality, Boolean(settings.dataSaver), onCellular);
+    const fallbackAllowed = settings.fallbackToBestQuality !== false;
+    if (
+      fallbackAllowed &&
+      videoInfo?.qualities &&
+      videoInfo.qualities.length > 0 &&
+      effectiveQuality !== 'best' &&
+      effectiveQuality !== 'audio' &&
+      !videoInfo.qualities.map((q) => q.toLowerCase()).includes(effectiveQuality.toLowerCase())
+    ) {
+      effectiveQuality = 'best';
+    }
+
+    const runDownload = async (qualityArg: string) =>
+      downloadVideoFile(
         targetUrl,
-        selectedQuality,
+        qualityArg,
         titleToUse,
         settings,
         (pct, text, speedMb) => {
@@ -315,12 +379,29 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         }
       );
 
+    try {
+      let fileName: string;
+      let usedQuality = effectiveQuality;
       try {
-        await VideoDownloader.showDownloadNotification({
-          title: 'Download Completed',
-          message: `${titleToUse.substring(0, 40)} saved to gallery!`,
-        });
-      } catch {}
+        fileName = await runDownload(effectiveQuality);
+      } catch (firstErr: any) {
+        if (fallbackAllowed && effectiveQuality !== 'best') {
+          usedQuality = 'best';
+          setDownloadStatusText('Fallback: retrying with best quality...');
+          fileName = await runDownload('best');
+        } else {
+          throw firstErr;
+        }
+      }
+
+      if (settings.notifyDownloadFinish !== false) {
+        try {
+          await VideoDownloader.showDownloadNotification({
+            title: 'Download Completed',
+            message: `${titleToUse.substring(0, 40)} saved to gallery!`,
+          });
+        } catch {}
+      }
 
       onDownloadCompleted({
         url: targetUrl,
@@ -328,7 +409,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         thumbnail: thumbToUse,
         uploader: uploaderToUse,
         duration: durationToUse,
-        quality: selectedQuality,
+        quality: usedQuality,
         platform: platformToUse,
         fileName,
       });
@@ -336,7 +417,16 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       setSuccessMessage(`SAVED: ${fileName}`);
       loadTodayStats();
     } catch (err: any) {
-      setErrorMessage(err.message || 'Download failed. Please check network/backend.');
+      const msg = err?.message || 'Download failed. Please check network/backend.';
+      setErrorMessage(msg);
+      if (settings.notifyDownloadFail !== false) {
+        try {
+          await VideoDownloader.showDownloadFailedNotification({
+            title: 'Download Failed',
+            message: msg.substring(0, 120),
+          });
+        } catch {}
+      }
     } finally {
       setIsDownloading(false);
       setDownloadSpeedMb(0);
@@ -624,8 +714,15 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           {/* Quality Selector Segmented Switch */}
           {(!videoInfo || videoInfo.type !== 'photo') && (
             <div>
-              <div className="text-[10px] font-mono text-slate-400 mb-1 uppercase tracking-wider">
-                STREAM QUALITY // ENCODE
+              <div className="flex items-center justify-between gap-2 mb-1">
+                <div className="text-[10px] font-mono text-slate-400 uppercase tracking-wider">
+                  STREAM QUALITY // ENCODE
+                </div>
+                {settings.dataSaver && isMobileData && (selectedQuality === 'best' || selectedQuality === '1080p') && (
+                  <span className="font-mono text-[9px] font-bold text-amber-300 bg-amber-950/60 border border-amber-500/40 px-1.5 py-0.5 rounded whitespace-nowrap">
+                    DATA SAVER · 720P CAP
+                  </span>
+                )}
               </div>
               <div className="grid grid-cols-4 gap-1 p-1 bg-slate-950 rounded-lg border border-slate-800">
                 {QUALITY_OPTIONS.map((q) => {
@@ -969,6 +1066,59 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                   </div>
                 ))
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MOBILE DATA SIZE ALERT MODAL */}
+      {mobileDataConfirm && mobileDataConfirm.open && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fade-in">
+          <div className="w-full max-w-sm rounded-2xl bg-[#090D15] border border-amber-500/70 p-5 shadow-[0_0_25px_rgba(245,158,11,0.25)] space-y-4">
+            <div className="flex items-center justify-between pb-2 border-b border-amber-500/30">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="w-2.5 h-2.5 rounded-full led-amber shrink-0" />
+                <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider truncate">
+                  MOBILE DATA ALERT // LARGE FILE
+                </h3>
+              </div>
+              <button
+                onClick={() => setMobileDataConfirm(null)}
+                className="p-1 text-slate-400 hover:text-white shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="font-mono text-xs text-slate-300 leading-relaxed">
+              You are on mobile data. This file is{' '}
+              <span className="text-amber-300 font-bold tabular-nums">
+                {mobileDataConfirm.sizeMb.toFixed(1)} MB
+              </span>{' '}
+              (above your{' '}
+              <span className="text-white font-bold tabular-nums">
+                {settings.mobileDataPromptMb} MB
+              </span>{' '}
+              limit). Continue downloading?
+            </p>
+
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                onClick={() => setMobileDataConfirm(null)}
+                className="machine-btn px-4 py-1.5 rounded-lg font-mono text-xs text-slate-300 whitespace-nowrap"
+              >
+                CANCEL
+              </button>
+              <button
+                onClick={() => {
+                  const wasForce = mobileDataConfirm.force;
+                  setMobileDataConfirm(null);
+                  handleStartDownload(wasForce, true);
+                }}
+                className="machine-btn-primary px-4 py-1.5 rounded-lg font-mono text-xs font-bold whitespace-nowrap"
+              >
+                DOWNLOAD ANYWAY
+              </button>
             </div>
           </div>
         </div>

@@ -11,6 +11,8 @@ export interface VideoInfo {
   id?: string;
   url: string;
   imageCount?: number;
+  filesize?: number;
+  filesize_approx?: number;
 }
 
 export interface VideoLibraryItem {
@@ -56,6 +58,10 @@ export interface DownloadHistoryItem {
 }
 
 export type AccentTheme = 'cyan' | 'purple' | 'green' | 'amber' | 'red';
+export type FileNameStyle = 'title_platform' | 'platform_title_date' | 'title_only';
+export type FloatingSize = 'small' | 'medium' | 'large';
+export type FloatingOpacity = 30 | 45 | 70 | 100;
+export type MobileDataPromptMb = 'off' | 50 | 100 | 200;
 
 export interface AppSettings {
   backendUrl: string;
@@ -76,6 +82,29 @@ export interface AppSettings {
   skippedUpdateVersion?: number;
   accentColor?: AccentTheme;
   reduceAnimations?: boolean;
+
+  // 1. Downloads
+  dataSaver?: boolean;
+  mobileDataPromptMb?: MobileDataPromptMb;
+  fallbackToBestQuality?: boolean;
+  fileNameStyle?: FileNameStyle;
+  notifyDownloadFinish?: boolean;
+  notifyDownloadFail?: boolean;
+
+  // 2. Player
+  playerDefaultSpeed?: 0.5 | 1 | 1.5 | 2;
+  playerDefaultFitMode?: 'fit' | 'fill';
+  playerResumePlayback?: boolean;
+  playerKeepScreenOn?: boolean;
+  playerAutoPip?: boolean;
+  playerGesturesEnabled?: boolean;
+
+  // 3. Floating Tab appearance
+  floatingSize?: FloatingSize;
+  floatingOpacity?: FloatingOpacity;
+
+  // 4. Privacy
+  hideInRecents?: boolean;
 }
 
 export interface AppUpdateInfo {

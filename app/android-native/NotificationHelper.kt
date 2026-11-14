@@ -144,4 +144,41 @@ object NotificationHelper {
 
         NotificationManagerCompat.from(context).notify(downloadNotificationCounter++, notification)
     }
+
+    /**
+     * Shows notification when a video download fails
+     */
+    fun showDownloadFailedNotification(
+        context: Context,
+        title: String,
+        message: String
+    ) {
+        ensureChannels(context)
+
+        val mainClass = try {
+            Class.forName("com.omnidrop.app.MainActivity")
+        } catch (_: Exception) {
+            null
+        }
+        val openIntent = if (mainClass != null) Intent(context, mainClass) else Intent()
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            downloadNotificationCounter,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
+        )
+
+        val notification = NotificationCompat.Builder(context, CHANNEL_DOWNLOADS_ID)
+            .setContentTitle(title)
+            .setContentText(message)
+            .setSmallIcon(android.R.drawable.stat_notify_error)
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+
+        try {
+            NotificationManagerCompat.from(context).notify(downloadNotificationCounter++, notification)
+        } catch (_: Throwable) {}
+    }
 }

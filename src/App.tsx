@@ -14,6 +14,7 @@ import { AboutScreen } from './components/AboutScreen';
 import { ServerWakingBanner } from './components/ServerWakingBanner';
 import { ClipboardPromptModal } from './components/ClipboardPromptModal';
 import { BootSplash } from './components/BootSplash';
+import { FirstRunSetupModal, SETUP_COMPLETED_STORAGE_KEY } from './components/FirstRunSetupModal';
 import { AppSettings, AppUpdateInfo, DownloadHistoryItem, PlatformType } from './types';
 import { checkServerHealth, isSupportedUrl } from './services/api';
 import { VideoDownloader } from './plugins/videoDownloader';
@@ -33,6 +34,18 @@ const DEFAULT_SETTINGS: AppSettings = {
   backendUrl: '',
   apiKey: '',
   defaultQuality: 'best',
+  dataSaver: false,
+  mobileDataPromptMb: 'off',
+  fallbackToBestQuality: true,
+  fileNameStyle: 'title_platform',
+  notifyDownloadFinish: true,
+  notifyDownloadFail: true,
+  playerDefaultSpeed: 1,
+  playerDefaultFitMode: 'fit',
+  playerResumePlayback: true,
+  playerKeepScreenOn: true,
+  playerAutoPip: true,
+  playerGesturesEnabled: true,
   floatingBubbleEnabled: false,
   persistentNotificationEnabled: false,
   autoDetectClipboard: true,
@@ -40,10 +53,13 @@ const DEFAULT_SETTINGS: AppSettings = {
   autoPlayNext: true,
   repeatMode: 'off',
   floatingSide: 'right',
+  floatingSize: 'medium',
+  floatingOpacity: 45,
   floatingShowMs: true,
   floatingAutoClear: true,
   floatingVibrate: true,
   floatingHideInsideApp: true,
+  hideInRecents: false,
   autoCheckUpdates: true,
   accentColor: 'cyan',
   reduceAnimations: false,
@@ -68,9 +84,21 @@ export default function App() {
   });
 
   const [showBootSplash, setShowBootSplash] = useState<boolean>(() => !settings.reduceAnimations);
+  const [showSetupGuide, setShowSetupGuide] = useState<boolean>(false);
   const [currentTab, setCurrentTab] = useState<NavTab>('home');
   const prevTabIndexRef = useRef<number>(0);
   const [tabDirection, setTabDirection] = useState<'left' | 'right' | 'none'>('none');
+
+  // Trigger first-run setup wizard automatically after BootSplash finishes on first launch
+  useEffect(() => {
+    if (!showBootSplash) {
+      try {
+        if (!localStorage.getItem(SETUP_COMPLETED_STORAGE_KEY)) {
+          setShowSetupGuide(true);
+        }
+      } catch {}
+    }
+  }, [showBootSplash]);
 
   const [hasUpdateWaiting, setHasUpdateWaiting] = useState(false);
   const [latestRelease, setLatestRelease] = useState<AppUpdateInfo | null>(() => getCachedUpdateInfo());
@@ -109,46 +137,49 @@ export default function App() {
     });
   }, []);
 
+  const syncNativePrefsPayload = (s: AppSettings) => ({
+    backendUrl: s.backendUrl,
+    apiKey: s.apiKey,
+    defaultQuality: s.defaultQuality,
+    autoDownload: true,
+    autoDownloadOnPaste: s.autoDownloadOnPaste,
+    autoPlayNext: s.autoPlayNext,
+    repeatMode: s.repeatMode,
+    floatingSide: s.floatingSide,
+    floatingSize: s.floatingSize ?? 'medium',
+    floatingOpacity: s.floatingOpacity ?? 45,
+    floatingShowMs: s.floatingShowMs,
+    floatingAutoClear: s.floatingAutoClear ?? true,
+    floatingVibrate: s.floatingVibrate ?? true,
+    floatingHideInsideApp: s.floatingHideInsideApp ?? true,
+    autoCheckUpdates: s.autoCheckUpdates ?? true,
+    dataSaver: s.dataSaver ?? false,
+    mobileDataPromptMb: String(s.mobileDataPromptMb ?? 'off'),
+    fallbackToBestQuality: s.fallbackToBestQuality ?? true,
+    fileNameStyle: s.fileNameStyle ?? 'title_platform',
+    notifyDownloadFinish: s.notifyDownloadFinish ?? true,
+    notifyDownloadFail: s.notifyDownloadFail ?? true,
+    playerDefaultSpeed: s.playerDefaultSpeed ?? 1,
+    playerDefaultFitMode: s.playerDefaultFitMode ?? 'fit',
+    playerResumePlayback: s.playerResumePlayback ?? true,
+    playerKeepScreenOn: s.playerKeepScreenOn ?? true,
+    playerAutoPip: s.playerAutoPip ?? true,
+    playerGesturesEnabled: s.playerGesturesEnabled ?? true,
+    hideInRecents: s.hideInRecents ?? false,
+  });
+
   // Persist settings
   const handleUpdateSettings = (newSettings: AppSettings) => {
     setSettings(newSettings);
     applyAppearanceToDom(newSettings);
     try {
       localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(newSettings));
-      VideoDownloader.saveNativeSettings({
-        backendUrl: newSettings.backendUrl,
-        apiKey: newSettings.apiKey,
-        defaultQuality: newSettings.defaultQuality,
-        autoDownload: true,
-        autoDownloadOnPaste: newSettings.autoDownloadOnPaste,
-        autoPlayNext: newSettings.autoPlayNext,
-        repeatMode: newSettings.repeatMode,
-        floatingSide: newSettings.floatingSide,
-        floatingShowMs: newSettings.floatingShowMs,
-        floatingAutoClear: newSettings.floatingAutoClear ?? true,
-        floatingVibrate: newSettings.floatingVibrate ?? true,
-        floatingHideInsideApp: newSettings.floatingHideInsideApp ?? true,
-        autoCheckUpdates: newSettings.autoCheckUpdates ?? true,
-      }).catch(() => {});
+      VideoDownloader.saveNativeSettings(syncNativePrefsPayload(newSettings)).catch(() => {});
     } catch {}
   };
 
   useEffect(() => {
-    VideoDownloader.saveNativeSettings({
-      backendUrl: settings.backendUrl,
-      apiKey: settings.apiKey,
-      defaultQuality: settings.defaultQuality,
-      autoDownload: true,
-      autoDownloadOnPaste: settings.autoDownloadOnPaste,
-      autoPlayNext: settings.autoPlayNext,
-      repeatMode: settings.repeatMode,
-      floatingSide: settings.floatingSide,
-      floatingShowMs: settings.floatingShowMs,
-      floatingAutoClear: settings.floatingAutoClear ?? true,
-      floatingVibrate: settings.floatingVibrate ?? true,
-      floatingHideInsideApp: settings.floatingHideInsideApp ?? true,
-      autoCheckUpdates: settings.autoCheckUpdates ?? true,
-    }).catch(() => {});
+    VideoDownloader.saveNativeSettings(syncNativePrefsPayload(settings)).catch(() => {});
 
     // Check updates & latest release notes on app open (throttled to at most once per hour)
     checkForAppUpdate(false)
@@ -454,6 +485,7 @@ export default function App() {
               onUpdateSettings={handleUpdateSettings}
               onRefreshHealth={refreshHealth}
               onUpdateAvailableChange={setHasUpdateWaiting}
+              onOpenSetupGuide={() => setShowSetupGuide(true)}
             />
           )}
 
@@ -477,6 +509,15 @@ export default function App() {
           handleSelectTab('home');
         }}
         onDismiss={() => setDetectedClipboardUrl('')}
+      />
+
+      {/* First-Run Setup Wizard Modal */}
+      <FirstRunSetupModal
+        isOpen={showSetupGuide}
+        settings={settings}
+        onUpdateSettings={handleUpdateSettings}
+        onClose={() => setShowSetupGuide(false)}
+        onRefreshHealth={refreshHealth}
       />
 
       {/* Bottom Navigation */}

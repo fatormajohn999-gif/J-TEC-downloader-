@@ -110,11 +110,16 @@ const handleInfo = async (req: Request, res: Response) => {
 
       try {
         const info = JSON.parse(stdout);
-        const formats: Array<{ height?: number; vcodec?: string }> = info.formats || [];
+        const formats: Array<{ height?: number; vcodec?: string; filesize?: number; filesize_approx?: number }> = info.formats || [];
         const detectedHeights = new Set<number>();
+        let estFilesize = info.filesize || info.filesize_approx || 0;
         for (const f of formats) {
           if (typeof f.height === 'number') {
             detectedHeights.add(f.height);
+          }
+          const fsVal = f.filesize || f.filesize_approx || 0;
+          if (fsVal > estFilesize) {
+            estFilesize = fsVal;
           }
         }
 
@@ -147,6 +152,7 @@ const handleInfo = async (req: Request, res: Response) => {
           qualities,
           platform,
           id: info.id || '',
+          filesize: estFilesize > 0 ? estFilesize : undefined,
         });
       } catch {
         return res.status(500).json({ error: 'Failed to parse video metadata response.' });

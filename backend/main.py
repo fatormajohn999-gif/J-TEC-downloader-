@@ -525,6 +525,16 @@ async def get_video_info(payload: InfoRequest):
     elif "facebook" in extractor or "fb" in url:
         platform = "facebook"
 
+    est_filesize = info.get("filesize") or info.get("filesize_approx") or 0
+    if not est_filesize and formats:
+        best_fmt_sizes = [
+            (f.get("filesize") or f.get("filesize_approx") or 0)
+            for f in formats
+            if f.get("vcodec") != "none"
+        ]
+        if best_fmt_sizes:
+            est_filesize = max(best_fmt_sizes)
+
     return {
         "type": "video",
         "title": info.get("title") or "Video Download",
@@ -534,6 +544,7 @@ async def get_video_info(payload: InfoRequest):
         "qualities": qualities,
         "platform": platform,
         "id": info.get("id") or "",
+        "filesize": est_filesize if est_filesize and est_filesize > 0 else None,
     }
 
 @app.post("/download", dependencies=[Depends(verify_api_key)])

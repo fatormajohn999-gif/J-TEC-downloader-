@@ -219,6 +219,8 @@ export async function fetchVideoInfo(url: string, settings: AppSettings): Promis
       platform: rawPlatform,
       id: data.id,
       url: normalized,
+      filesize: typeof data.filesize === 'number' ? data.filesize : undefined,
+      filesize_approx: typeof data.filesize_approx === 'number' ? data.filesize_approx : undefined,
     };
   } catch (err: any) {
     if (err.name === 'AbortError') {
@@ -226,6 +228,45 @@ export async function fetchVideoInfo(url: string, settings: AppSettings): Promis
     }
     throw err;
   }
+}
+
+export function resolveEffectiveQuality(
+  requestedQuality: string,
+  dataSaver: boolean | undefined,
+  isMobileData: boolean
+): { effectiveQuality: string; cappedByDataSaver: boolean } {
+  const q = (requestedQuality || 'best').toLowerCase();
+  if (dataSaver && isMobileData && (q === 'best' || q === '1080p')) {
+    return { effectiveQuality: '720p', cappedByDataSaver: true };
+  }
+  return { effectiveQuality: q, cappedByDataSaver: false };
+}
+
+export function formatDownloadFileName(
+  title: string,
+  platform: string,
+  ext: string,
+  style: AppSettings['fileNameStyle'] = 'title_platform'
+): string {
+  const cleanTitle =
+    (title || 'video')
+      .replace(/[\\/:*?"<>|\r\n]/g, '_')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 75) || 'OmniDrop';
+  const platClean =
+    !platform || platform === 'other' || platform === 'video'
+      ? 'Other'
+      : platform.charAt(0).toUpperCase() + platform.slice(1);
+  const dateStr = new Date().toISOString().slice(0, 10);
+
+  if (style === 'platform_title_date') {
+    return `${platClean} - ${cleanTitle} - ${dateStr}${ext}`;
+  }
+  if (style === 'title_only') {
+    return `${cleanTitle}${ext}`;
+  }
+  return `${cleanTitle} [${platClean}]${ext}`;
 }
 
 export async function downloadVideoFile(
@@ -365,15 +406,16 @@ export async function downloadVideoFile(
 
     if (onProgress) onProgress(98, 'Saving file to device...');
 
-    const sanitizedTitle = title.replace(/[^a-zA-Z0-9_\-]/g, '_').substring(0, 50) || 'OmniDrop';
-    let fileName = serverFileName;
-    if (!fileName) {
-      if (isZip) {
-        fileName = `${sanitizedTitle} [TikTok photos].zip`;
-      } else {
-        const ext = quality === 'audio' ? '.mp3' : '.mp4';
-        fileName = `${sanitizedTitle}${ext}`;
-      }
+    const ext = quality === 'audio' ? '.mp3' : '.mp4';
+    const inferredPlatform = detectPlatform(normalized);
+    let fileName: string;
+    if (isZip) {
+      const sanitizedTitle = title.replace(/[^a-zA-Z0-9_\- ]/g, '_').trim().substring(0, 60) || 'TikTok_photos';
+      fileName = serverFileName || `${sanitizedTitle} [TikTok photos].zip`;
+    } else if (settings.fileNameStyle && settings.fileNameStyle !== 'title_platform') {
+      fileName = formatDownloadFileName(title, inferredPlatform, ext, settings.fileNameStyle);
+    } else {
+      fileName = formatDownloadFileName(title, inferredPlatform, ext, 'title_platform');
     }
 
     const blobUrl = window.URL.createObjectURL(blob);

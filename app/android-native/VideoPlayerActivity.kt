@@ -198,6 +198,11 @@ class VideoPlayerActivity : Activity() {
     // Repeat modes: "off", "one", "all"
     private var currentRepeatMode = "off"
     private var autoPlayNext = true
+    private var resumePlaybackEnabled = true
+    private var keepScreenOnEnabled = true
+    private var autoPipEnabled = true
+    private var gesturesEnabled = true
+    private var hideInRecentsEnabled = false
     private var consecutiveLoadFailures = 0
 
     // Safe playback and video sizing state
@@ -254,15 +259,15 @@ class VideoPlayerActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         try {
-            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
             touchSlop = ViewConfiguration.get(this).scaledTouchSlop
 
             parseIntentData()
-            loadNativeSettings()
+            loadNativeSettings(applyInitialPlaybackDefaults = (savedInstanceState == null))
+            applyWindowFlagsFromSettings()
 
             if (savedInstanceState != null) {
-                currentSpeedIndex = savedInstanceState.getInt("saved_speed", 1)
+                currentSpeedIndex = savedInstanceState.getInt("saved_speed", currentSpeedIndex)
                 isOrientationLockedByUser = savedInstanceState.getBoolean("orient_locked", false)
                 currentIndex = savedInstanceState.getInt("saved_index", currentIndex)
                 currentRepeatMode = savedInstanceState.getString("saved_repeat", currentRepeatMode) ?: "off"
@@ -317,10 +322,42 @@ class VideoPlayerActivity : Activity() {
         }
     }
 
-    private fun loadNativeSettings() {
+    private fun loadNativeSettings(applyInitialPlaybackDefaults: Boolean = false) {
         val prefs = getSharedPreferences(VideoDownloaderPlugin.PREFS_NAME, Context.MODE_PRIVATE)
         autoPlayNext = prefs.getBoolean("auto_play_next", true)
         currentRepeatMode = prefs.getString("repeat_mode", "off") ?: "off"
+        resumePlaybackEnabled = prefs.getBoolean("player_resume_playback", true)
+        keepScreenOnEnabled = prefs.getBoolean("player_keep_screen_on", true)
+        autoPipEnabled = prefs.getBoolean("player_auto_pip", true)
+        gesturesEnabled = prefs.getBoolean("player_brightness_volume_gestures", true)
+        hideInRecentsEnabled = prefs.getBoolean("privacy_hide_recents", false)
+
+        if (applyInitialPlaybackDefaults) {
+            val defaultSpeed = prefs.getFloat("player_default_speed", 1.0f)
+            currentSpeedIndex = when {
+                defaultSpeed <= 0.6f -> 0
+                defaultSpeed <= 1.1f -> 1
+                defaultSpeed <= 1.6f -> 2
+                else -> 3
+            }
+            val defaultFit = prefs.getString("player_default_fit_mode", "fit") ?: "fit"
+            sessionFillMode = defaultFit.equals("fill", ignoreCase = true)
+        }
+    }
+
+    private fun applyWindowFlagsFromSettings() {
+        try {
+            if (keepScreenOnEnabled) {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            } else {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+            if (hideInRecentsEnabled) {
+                window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+            } else {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+            }
+        } catch (_: Throwable) {}
     }
 
     private fun dp(value: Int): Int {
@@ -852,10 +889,12 @@ class VideoPlayerActivity : Activity() {
                     if (activeTouchMode == TouchMode.NONE) {
                         if (Math.hypot(dx.toDouble(), dy.toDouble()) > touchSlop) {
                             if (Math.abs(dy) > Math.abs(dx)) {
-                                if (touchDownX < rootContainer.width / 2) {
-                                    activeTouchMode = TouchMode.VERTICAL_BRIGHTNESS
-                                } else {
-                                    activeTouchMode = TouchMode.VERTICAL_VOLUME
+                                if (gesturesEnabled) {
+                                    if (touchDownX < rootContainer.width / 2) {
+                                        activeTouchMode = TouchMode.VERTICAL_BRIGHTNESS
+                                    } else {
+                                        activeTouchMode = TouchMode.VERTICAL_VOLUME
+                                    }
                                 }
                             } else {
                                 activeTouchMode = TouchMode.HORIZONTAL_FLING
@@ -1736,13 +1775,15 @@ class VideoPlayerActivity : Activity() {
                         }
                     }
 
-                    // Restore saved playback position
-                    val uriStr = item.uri
-                    if (uriStr.isNotBlank()) {
-                        val prefs = getSharedPreferences(PREFS_PLAYBACK, Context.MODE_PRIVATE)
-                        val savedPos = prefs.getInt(uriStr, 0)
-                        if (savedPos > 1000 && duration > 0 && savedPos < duration - 3000) {
-                            try { videoView.seekTo(savedPos) } catch (_: Throwable) {}
+                    // Restore saved playback position if enabled in Settings
+                    if (resumePlaybackEnabled) {
+                        val uriStr = item.uri
+                        if (uriStr.isNotBlank()) {
+                            val prefs = getSharedPreferences(PREFS_PLAYBACK, Context.MODE_PRIVATE)
+                            val savedPos = prefs.getInt(uriStr, 0)
+                            if (savedPos > 1000 && duration > 0 && savedPos < duration - 3000) {
+                                try { videoView.seekTo(savedPos) } catch (_: Throwable) {}
+                            }
                         }
                     }
 
@@ -2190,7 +2231,7 @@ class VideoPlayerActivity : Activity() {
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (autoPipEnabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val isPlaying = try { playerReady && videoView.isPlaying } catch (_: Throwable) { false }
             if (isPlaying && !isInPictureInPictureMode) {
                 enterPipMode()
@@ -2461,6 +2502,8 @@ class VideoPlayerActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        loadNativeSettings(applyInitialPlaybackDefaults = false)
+        applyWindowFlagsFromSettings()
         val inPip = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) isInPictureInPictureMode else false
         if (!inPip) {
             FloatingBubbleService.setOmniDropForeground(true)
