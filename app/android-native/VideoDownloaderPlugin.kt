@@ -247,24 +247,6 @@ class VideoDownloaderPlugin : Plugin() {
             return emptyList()
         }
 
-        data class HttpResponseData(
-            val statusCode: Int,
-            val bodyBytes: ByteArray?,
-            val inputStream: InputStream?,
-            val contentType: String,
-            val contentLength: Long,
-            val elapsedMs: Long,
-            val connection: HttpURLConnection?,
-            val errorDetail: String?,
-            val isTimeout: Boolean,
-            val isNoInternet: Boolean,
-            val isConnectionError: Boolean,
-            val friendlyError: String,
-            val locationHeader: String? = null
-        ) {
-            fun bodyText(): String = bodyBytes?.toString(Charsets.UTF_8) ?: ""
-        }
-
         fun hasInternetConnection(context: Context?): Boolean {
             if (context == null) return true
             return try {
@@ -382,25 +364,38 @@ class VideoDownloaderPlugin : Plugin() {
 
                 val code = conn.responseCode
                 val elapsed = System.currentTimeMillis() - startMs
-                val cType = conn.contentType ?: ""
+                val cType: String? = conn.contentType
                 val cLen = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                     conn.contentLengthLong
                 } else {
                     conn.contentLength.toLong()
                 }
-                val location = conn.getHeaderField("Location")
+                val respHeaders = LinkedHashMap<String, String>()
+                try {
+                    val rawHeaders = conn.headerFields
+                    if (rawHeaders != null) {
+                        for ((hk, hv) in rawHeaders) {
+                            if (hk != null && hv != null && hv.isNotEmpty()) {
+                                respHeaders[hk.lowercase(Locale.US)] = hv.joinToString(", ")
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {}
+                val location = conn.getHeaderField("Location") ?: respHeaders["location"]
 
                 if (code in 200..299) {
                     if (streamBody) {
                         logNetworkEvent(context, method, url, code, elapsed, null)
                         return HttpResponseData(
                             statusCode = code,
-                            bodyBytes = null,
-                            inputStream = conn.inputStream,
                             contentType = cType,
                             contentLength = cLen,
-                            elapsedMs = elapsed,
+                            headers = respHeaders,
+                            inputStream = conn.inputStream,
                             connection = conn,
+                            errorBody = null,
+                            elapsedMs = elapsed,
+                            bodyBytes = null,
                             errorDetail = null,
                             isTimeout = false,
                             isNoInternet = false,
@@ -413,12 +408,14 @@ class VideoDownloaderPlugin : Plugin() {
                         logNetworkEvent(context, method, url, code, elapsed, null)
                         return HttpResponseData(
                             statusCode = code,
-                            bodyBytes = bytes,
-                            inputStream = null,
                             contentType = cType,
                             contentLength = cLen,
-                            elapsedMs = elapsed,
+                            headers = respHeaders,
+                            inputStream = null,
                             connection = null,
+                            errorBody = null,
+                            elapsedMs = elapsed,
+                            bodyBytes = bytes,
                             errorDetail = null,
                             isTimeout = false,
                             isNoInternet = false,
@@ -443,12 +440,14 @@ class VideoDownloaderPlugin : Plugin() {
                     logNetworkEvent(context, method, url, code, elapsed, friendly)
                     return HttpResponseData(
                         statusCode = code,
-                        bodyBytes = errBytes,
-                        inputStream = null,
                         contentType = cType,
                         contentLength = cLen,
-                        elapsedMs = elapsed,
+                        headers = respHeaders,
+                        inputStream = null,
                         connection = null,
+                        errorBody = rawErrText.ifBlank { null },
+                        elapsedMs = elapsed,
+                        bodyBytes = errBytes,
                         errorDetail = detail.ifBlank { null },
                         isTimeout = false,
                         isNoInternet = false,
@@ -515,12 +514,14 @@ class VideoDownloaderPlugin : Plugin() {
                 logNetworkEvent(context, method, url, 0, elapsed, friendly)
                 return HttpResponseData(
                     statusCode = 0,
-                    bodyBytes = null,
-                    inputStream = null,
-                    contentType = "",
+                    contentType = null,
                     contentLength = -1L,
-                    elapsedMs = elapsed,
+                    headers = emptyMap(),
+                    inputStream = null,
                     connection = null,
+                    errorBody = t.message,
+                    elapsedMs = elapsed,
+                    bodyBytes = null,
                     errorDetail = t.message,
                     isTimeout = isTimeout,
                     isNoInternet = isNoInternet,
@@ -1785,7 +1786,7 @@ class VideoDownloaderPlugin : Plugin() {
                     control.connection = connection
                     val responseStream = activeResp.inputStream ?: throw IOException("Empty response stream from server")
 
-                    val contentType = activeResp.contentType
+                    val contentType = activeResp.contentType.orEmpty()
                     if (contentType.contains("application/zip", ignoreCase = true)) {
                         notifyProgressUpdate(35, "DOWNLOADING...")
                         val zis = ZipInputStream(responseStream)
@@ -1978,7 +1979,7 @@ class VideoDownloaderPlugin : Plugin() {
                     var lastNotifUpdateTime: Long = 0L
                     var firstBytesReported = false
 
-                    while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                    while (responseStream.read(buffer).also { bytesRead = it } != -1) {
                         if (control.cancelled.get()) throw InterruptedException("Cancelled")
                         outputStream.write(buffer, 0, bytesRead)
                         bytesCopied += bytesRead
@@ -3675,7 +3676,7 @@ class VideoDownloaderPlugin : Plugin() {
                             code == HttpURLConnection.HTTP_MOVED_TEMP ||
                             code == HttpURLConnection.HTTP_SEE_OTHER ||
                             code == 307 || code == 308) {
-                            val location = resp.locationHeader
+                            val location = resp.locationHeader ?: resp.headers["location"]
                             if (location.isNullOrBlank()) {
                                 throw IOException("Redirect with empty Location header")
                             }
@@ -3693,7 +3694,8 @@ class VideoDownloaderPlugin : Plugin() {
                     val serverContentLength = finalResp.contentLength
                     val totalBytes = if (expectedSize > 0) expectedSize else (if (serverContentLength > 0) serverContentLength else 0L)
 
-                    inputStream = finalResp.inputStream!!
+                    val dlStream = finalResp.inputStream ?: throw IOException("Empty response stream from update server")
+                    inputStream = dlStream
                     outputStream = java.io.FileOutputStream(apkFile)
 
                     val buffer = ByteArray(8192)
@@ -3701,7 +3703,7 @@ class VideoDownloaderPlugin : Plugin() {
                     var bytesRead: Int
                     var lastReportPercent = -1
 
-                    while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                    while (dlStream.read(buffer).also { bytesRead = it } != -1) {
                         outputStream.write(buffer, 0, bytesRead)
                         bytesDownloaded += bytesRead
 
@@ -3963,7 +3965,8 @@ class VideoDownloaderPlugin : Plugin() {
         val apiKey = prefs.getString("api_key", "") ?: ""
         val defaultQuality = prefs.getString("default_quality", "best") ?: "best"
 
-        val normUrl = normalizeUrl(targetUrl)
+        val safeTargetUrl = targetUrl ?: ""
+        val normUrl = normalizeUrl(safeTargetUrl)
         if (inFlightDownloads.putIfAbsent(normUrl, true) != null) {
             call.reject("Download already in progress for this link.")
             return
@@ -4774,11 +4777,15 @@ class VideoDownloaderPlugin : Plugin() {
                         return@Thread
                     }
 
-                    spInput = spResp.inputStream
+                    val spStream = spResp.inputStream ?: run {
+                        call.reject(spResp.friendlyError.ifBlank { "Speed test failed (HTTP ${spResp.statusCode})" })
+                        return@Thread
+                    }
+                    spInput = spStream
                     val buf = ByteArray(16384)
                     var totalBytesRead = 0L
                     var n: Int
-                    while (spInput.read(buf).also { n = it } != -1) {
+                    while (spStream.read(buf).also { n = it } != -1) {
                         totalBytesRead += n
                     }
                     val elapsedNs = (System.nanoTime() - dlStartNs).coerceAtLeast(1_000_000L)

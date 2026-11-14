@@ -2482,7 +2482,7 @@ class FloatingBubbleService : Service() {
                 }
 
                 val fallbackToBest = prefs?.getBoolean("fallback_to_best", true) ?: true
-                var activeResp: VideoDownloaderPlugin.HttpResponseData? = null
+                var activeResp: HttpResponseData? = null
                 var winningServer: VideoDownloaderPlugin.Companion.ServerEndpoint = candidates[0]
                 var thumbnail = ""
                 var uploader = "Creator"
@@ -2876,7 +2876,7 @@ class FloatingBubbleService : Service() {
                 conn = readyResp.connection
                 val respStream = readyResp.inputStream ?: throw java.io.IOException("Empty response stream from server")
 
-                val contentType = readyResp.contentType
+                val contentType = readyResp.contentType.orEmpty()
                 if (contentType.contains("application/zip", ignoreCase = true)) {
                     isWaitingForBytes = false
                     mainHandler.removeCallbacks(downloadWaitTimerRunnable)
@@ -3129,7 +3129,7 @@ class FloatingBubbleService : Service() {
                 var lastNotifUpdateTime = 0L
                 var bytesSinceLastSample: Long = 0
 
-                while (input.read(buffer).also { bytesRead = it } != -1) {
+                while (respStream.read(buffer).also { bytesRead = it } != -1) {
                     if (isDownloadCancelled || control.cancelled.get()) throw InterruptedException("Cancelled")
                     if (isWaitingForBytes) {
                         isWaitingForBytes = false
