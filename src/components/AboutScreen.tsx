@@ -28,14 +28,30 @@ import {
   Film,
   Camera,
   AlertTriangle,
+  RefreshCw,
 } from 'lucide-react';
 import { VideoDownloader } from '../plugins/videoDownloader';
-import { DownloadStatsData } from '../types';
+import { AppUpdateInfo, DownloadStatsData } from '../types';
+import { EmptyState } from './EmptyState';
+import { GITHUB_REPO } from '../services/updateService';
 
-type SubScreen = 'guide' | 'privacy' | 'developer' | 'info' | 'stats' | null;
+type SubScreen = 'whatsnew' | 'guide' | 'privacy' | 'developer' | 'info' | 'stats' | null;
 
-export const AboutScreen: React.FC = () => {
+interface AboutScreenProps {
+  latestRelease?: AppUpdateInfo | null;
+  hasUnreadWhatsNew?: boolean;
+  onMarkWhatsNewSeen?: (tagName: string) => void;
+  onRefreshRelease?: () => Promise<any>;
+}
+
+export const AboutScreen: React.FC<AboutScreenProps> = ({
+  latestRelease = null,
+  hasUnreadWhatsNew = false,
+  onMarkWhatsNewSeen,
+  onRefreshRelease,
+}) => {
   const [activeSubScreen, setActiveSubScreen] = useState<SubScreen>(null);
+  const [isRefreshingRelease, setIsRefreshingRelease] = useState(false);
   const [crashLog, setCrashLog] = useState<string>('');
   const [isCopied, setIsCopied] = useState(false);
   const [appVersion, setAppVersion] = useState<{ versionName: string; versionCode: number }>({
@@ -158,8 +174,10 @@ export const AboutScreen: React.FC = () => {
         .catch(() => setCrashLog(''));
     } else if (activeSubScreen === 'stats') {
       loadStats();
+    } else if (activeSubScreen === 'whatsnew' && latestRelease?.tagName && onMarkWhatsNewSeen) {
+      onMarkWhatsNewSeen(latestRelease.tagName);
     }
-  }, [activeSubScreen, loadStats]);
+  }, [activeSubScreen, loadStats, latestRelease?.tagName, onMarkWhatsNewSeen]);
 
   const handleResetStats = async () => {
     setIsResetting(true);
@@ -211,17 +229,29 @@ export const AboutScreen: React.FC = () => {
 
   const menuItems = [
     {
+      id: 'whatsnew' as SubScreen,
+      code: 'NEWS // 01',
+      title: "What's New",
+      subtitle: latestRelease?.tagName
+        ? `Release notes & changelog for ${latestRelease.tagName}`
+        : 'Latest release notes and GitHub changelog',
+      icon: Sparkles,
+      color: 'text-accent',
+      badge: latestRelease?.tagName || 'CHANGELOG',
+      unread: hasUnreadWhatsNew,
+    },
+    {
       id: 'guide' as SubScreen,
-      code: 'DOC // 01',
+      code: 'DOC // 02',
       title: 'User Guide',
       subtitle: 'Complete manual for downloads, gestures, edge tab & troubleshooting',
       icon: BookOpen,
-      color: 'text-cyan-400',
+      color: 'text-accent',
       badge: 'GUIDE',
     },
     {
       id: 'privacy' as SubScreen,
-      code: 'SEC // 02',
+      code: 'SEC // 03',
       title: 'Privacy Policy',
       subtitle: 'Zero ads, zero telemetry, local storage only & permissions audit',
       icon: ShieldCheck,
@@ -230,7 +260,7 @@ export const AboutScreen: React.FC = () => {
     },
     {
       id: 'developer' as SubScreen,
-      code: 'DEV // 03',
+      code: 'DEV // 04',
       title: 'About the Developer',
       subtitle: 'JTech • Independent creator based in Sierra Leone',
       icon: User,
@@ -239,7 +269,7 @@ export const AboutScreen: React.FC = () => {
     },
     {
       id: 'info' as SubScreen,
-      code: 'SYS // 04',
+      code: 'SYS // 05',
       title: 'App Specifications',
       subtitle: `v1.0.${appVersion.versionCode} (Build ${appVersion.versionCode}) • Hybrid runtime & open-source stack`,
       icon: Info,
@@ -248,30 +278,143 @@ export const AboutScreen: React.FC = () => {
     },
     {
       id: 'stats' as SubScreen,
-      code: 'METRICS // 05',
+      code: 'METRICS // 06',
       title: 'Download Statistics',
       subtitle: 'Volume, bandwidth saved, platform breakdown, 14-day history & efficiency',
       icon: BarChart3,
-      color: 'text-cyan-400',
+      color: 'text-accent',
       badge: 'STATS',
     },
   ];
+
+  // SUB-SCREEN 0: WHAT'S NEW (LATEST GITHUB RELEASE NOTES)
+  if (activeSubScreen === 'whatsnew') {
+    const publishedDate = latestRelease?.publishedAt
+      ? new Date(latestRelease.publishedAt).toLocaleDateString(undefined, {
+          year: 'numeric',
+          month: 'short',
+          day: 'numeric',
+        })
+      : '';
+
+    const handleFetchLatest = async () => {
+      if (!onRefreshRelease) return;
+      setIsRefreshingRelease(true);
+      try {
+        const res = await onRefreshRelease();
+        if (res?.updateInfo?.tagName && onMarkWhatsNewSeen) {
+          onMarkWhatsNewSeen(res.updateInfo.tagName);
+        }
+      } finally {
+        setIsRefreshingRelease(false);
+      }
+    };
+
+    return (
+      <div className="space-y-4 pb-28 animate-fade-in">
+        <div className="flex items-center gap-3 pb-2 border-b border-accent">
+          <button
+            onClick={() => setActiveSubScreen(null)}
+            className="machine-btn px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-mono text-accent-soft whitespace-nowrap"
+          >
+            <ArrowLeft className="w-3.5 h-3.5" />
+            <span>BACK // MENU</span>
+          </button>
+          <div className="text-right flex-1 min-w-0">
+            <span className="font-mono text-[11px] text-accent font-bold uppercase tracking-widest truncate">
+              NEWS // WHAT&apos;S NEW
+            </span>
+          </div>
+        </div>
+
+        {!latestRelease ? (
+          <div className="space-y-3">
+            <EmptyState
+              icon={Sparkles}
+              title="NO RELEASE NOTES LOADED"
+              message="Fetch the latest OmniDrop release notes directly from GitHub."
+            />
+            {onRefreshRelease && (
+              <button
+                onClick={handleFetchLatest}
+                disabled={isRefreshingRelease}
+                className="machine-btn-primary w-full py-2.5 rounded-lg font-mono text-xs uppercase flex items-center justify-center gap-2"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingRelease ? 'animate-spin' : ''}`} />
+                <span>{isRefreshingRelease ? 'CHECKING GITHUB...' : 'FETCH RELEASE NOTES'}</span>
+              </button>
+            )}
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="machine-surface rounded-xl p-4 space-y-3">
+              <div className="flex items-center justify-between gap-2 pb-2.5 border-b border-slate-800">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="w-2.5 h-2.5 rounded-full led-accent shrink-0" />
+                  <div className="min-w-0">
+                    <h3 className="font-mono text-sm font-bold text-white uppercase tracking-wide truncate">
+                      RELEASE {latestRelease.tagName || 'LATEST'}
+                    </h3>
+                    {publishedDate && (
+                      <p className="font-mono text-[10px] text-slate-400 tabular-nums whitespace-nowrap">
+                        PUBLISHED: {publishedDate.toUpperCase()}
+                      </p>
+                    )}
+                  </div>
+                </div>
+
+                {onRefreshRelease && (
+                  <button
+                    onClick={handleFetchLatest}
+                    disabled={isRefreshingRelease}
+                    className="machine-btn px-2.5 py-1.5 rounded-lg font-mono text-[11px] text-accent-soft flex items-center gap-1.5 shrink-0 whitespace-nowrap"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${isRefreshingRelease ? 'animate-spin' : ''}`} />
+                    <span>REFRESH</span>
+                  </button>
+                )}
+              </div>
+
+              <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 font-mono text-xs text-slate-200 whitespace-pre-wrap leading-relaxed select-text max-h-[55vh] overflow-y-auto">
+                {latestRelease.releaseNotes || 'No release notes provided for this build.'}
+              </div>
+
+              <div className="flex items-center justify-between gap-2 pt-1 text-[11px] font-mono">
+                <span className="text-slate-400 truncate">
+                  Installed: <strong className="text-white tabular-nums">v1.0.{appVersion.versionCode}</strong>
+                </span>
+                <a
+                  href={`https://github.com/${GITHUB_REPO}/releases/latest`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="machine-btn px-2.5 py-1 rounded-md text-accent-soft flex items-center gap-1.5 shrink-0 whitespace-nowrap"
+                >
+                  <ExternalLink className="w-3 h-3 text-accent" />
+                  <span>GITHUB</span>
+                </a>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   // SUB-SCREEN 1: USER GUIDE
   if (activeSubScreen === 'guide') {
     return (
       <div className="space-y-4 pb-28 animate-fade-in">
         {/* Sub-screen header */}
-        <div className="flex items-center gap-3 pb-2 border-b border-cyan-500/20">
+        <div className="flex items-center gap-3 pb-2 border-b border-accent">
           <button
             onClick={() => setActiveSubScreen(null)}
-            className="machine-btn px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-mono text-cyan-300"
+            className="machine-btn px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-mono text-accent-soft whitespace-nowrap"
           >
             <ArrowLeft className="w-3.5 h-3.5" />
             <span>BACK // MENU</span>
           </button>
           <div className="text-right flex-1">
-            <span className="font-mono text-[11px] text-cyan-400 font-bold uppercase tracking-widest">
+            <span className="font-mono text-[11px] text-accent font-bold uppercase tracking-widest">
               DOC // USER GUIDE
             </span>
           </div>
@@ -282,7 +425,7 @@ export const AboutScreen: React.FC = () => {
           {/* Step 1 */}
           <div className="machine-surface rounded-xl p-3.5 space-y-2">
             <div className="flex items-center gap-2">
-              <span className="font-mono text-xs px-2 py-0.5 rounded bg-cyan-950 border border-cyan-500/40 text-cyan-300 font-bold">
+              <span className="font-mono text-xs px-2 py-0.5 rounded bg-accent-soft border border-accent text-accent-soft font-bold">
                 STEP 01
               </span>
               <h3 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
@@ -291,7 +434,7 @@ export const AboutScreen: React.FC = () => {
             </div>
             <p className="text-xs text-slate-300 leading-relaxed">
               Open the <strong>Settings</strong> tab and enter your personal Render backend service URL (e.g.{' '}
-              <code className="text-cyan-300 bg-slate-950 px-1 py-0.5 rounded font-mono">
+              <code className="text-accent-soft bg-slate-950 px-1 py-0.5 rounded font-mono">
                 https://your-service.onrender.com
               </code>
               ). Tap <strong>Test Server Connection</strong> to verify connectivity before starting downloads.
@@ -301,7 +444,7 @@ export const AboutScreen: React.FC = () => {
           {/* Step 2 */}
           <div className="machine-surface rounded-xl p-3.5 space-y-2">
             <div className="flex items-center gap-2">
-              <span className="font-mono text-xs px-2 py-0.5 rounded bg-cyan-950 border border-cyan-500/40 text-cyan-300 font-bold">
+              <span className="font-mono text-xs px-2 py-0.5 rounded bg-accent-soft border border-accent text-accent-soft font-bold">
                 STEP 02
               </span>
               <h3 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
@@ -310,14 +453,14 @@ export const AboutScreen: React.FC = () => {
             </div>
             <p className="text-xs text-slate-300 leading-relaxed">
               Copy any public video link from TikTok, YouTube, Instagram, or Facebook. On the Download tab, tap the mechanical{' '}
-              <strong className="text-cyan-300">PASTE</strong> key. OmniDrop cleans tracking parameters automatically, fetches metadata, and displays your video preview.
+              <strong className="text-accent-soft">PASTE</strong> key. OmniDrop cleans tracking parameters automatically, fetches metadata, and displays your video preview.
             </p>
           </div>
 
           {/* Step 3 */}
           <div className="machine-surface rounded-xl p-3.5 space-y-2">
             <div className="flex items-center gap-2">
-              <span className="font-mono text-xs px-2 py-0.5 rounded bg-cyan-950 border border-cyan-500/40 text-cyan-300 font-bold">
+              <span className="font-mono text-xs px-2 py-0.5 rounded bg-accent-soft border border-accent text-accent-soft font-bold">
                 STEP 03
               </span>
               <h3 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
@@ -332,7 +475,7 @@ export const AboutScreen: React.FC = () => {
           {/* Step 4 */}
           <div className="machine-surface rounded-xl p-3.5 space-y-2">
             <div className="flex items-center gap-2">
-              <span className="font-mono text-xs px-2 py-0.5 rounded bg-cyan-950 border border-cyan-500/40 text-cyan-300 font-bold">
+              <span className="font-mono text-xs px-2 py-0.5 rounded bg-accent-soft border border-accent text-accent-soft font-bold">
                 STEP 04
               </span>
               <h3 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
@@ -347,7 +490,7 @@ export const AboutScreen: React.FC = () => {
           {/* Step 5 */}
           <div className="machine-surface rounded-xl p-3.5 space-y-2">
             <div className="flex items-center gap-2">
-              <span className="font-mono text-xs px-2 py-0.5 rounded bg-cyan-950 border border-cyan-500/40 text-cyan-300 font-bold">
+              <span className="font-mono text-xs px-2 py-0.5 rounded bg-accent-soft border border-accent text-accent-soft font-bold">
                 STEP 05
               </span>
               <h3 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
@@ -361,14 +504,14 @@ export const AboutScreen: React.FC = () => {
               <li><strong className="text-white">BEST:</strong> Highest available stream up to 4K / 60fps.</li>
               <li><strong className="text-white">1080P:</strong> Crisp High Definition.</li>
               <li><strong className="text-white">720P:</strong> Balanced quality and fast download size.</li>
-              <li><strong className="text-white">MP3:</strong> Audio-only extract saved to <code className="text-cyan-400">Music/OmniDrop</code>.</li>
+              <li><strong className="text-white">MP3:</strong> Audio-only extract saved to <code className="text-accent">Music/OmniDrop</code>.</li>
             </ul>
           </div>
 
           {/* Step 6 */}
           <div className="machine-surface rounded-xl p-3.5 space-y-2">
             <div className="flex items-center gap-2">
-              <span className="font-mono text-xs px-2 py-0.5 rounded bg-cyan-950 border border-cyan-500/40 text-cyan-300 font-bold">
+              <span className="font-mono text-xs px-2 py-0.5 rounded bg-accent-soft border border-accent text-accent-soft font-bold">
                 STEP 06
               </span>
               <h3 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
@@ -376,7 +519,7 @@ export const AboutScreen: React.FC = () => {
               </h3>
             </div>
             <p className="text-xs text-slate-300 leading-relaxed">
-              Downloaded videos appear in the <strong>Videos</strong> tab and in your phone gallery (<code className="text-cyan-300">Movies/OmniDrop</code>). Tap any card to launch the hardware-accelerated player:
+              Downloaded videos appear in the <strong>Videos</strong> tab and in your phone gallery (<code className="text-accent-soft">Movies/OmniDrop</code>). Tap any card to launch the hardware-accelerated player:
             </p>
             <ul className="text-xs text-slate-400 space-y-1 font-mono pl-3 list-disc">
               <li><strong className="text-white">Double-tap left/right:</strong> Skip backward or forward 10 seconds.</li>
@@ -414,10 +557,10 @@ export const AboutScreen: React.FC = () => {
   if (activeSubScreen === 'privacy') {
     return (
       <div className="space-y-4 pb-28 animate-fade-in">
-        <div className="flex items-center gap-3 pb-2 border-b border-cyan-500/20">
+        <div className="flex items-center gap-3 pb-2 border-b border-accent">
           <button
             onClick={() => setActiveSubScreen(null)}
-            className="machine-btn px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-mono text-cyan-300"
+            className="machine-btn px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-mono text-accent-soft whitespace-nowrap"
           >
             <ArrowLeft className="w-3.5 h-3.5" />
             <span>BACK // MENU</span>
@@ -460,7 +603,7 @@ export const AboutScreen: React.FC = () => {
               3. Local Device Storage Only
             </h4>
             <p>
-              All downloaded files are written directly to your phone's standard gallery folders: <code className="text-cyan-300">Movies/OmniDrop</code> for video content and <code className="text-cyan-300">Music/OmniDrop</code> for audio extracts. Your files remain on your hardware and are never uploaded or mirrored to any external cloud service.
+              All downloaded files are written directly to your phone's standard gallery folders: <code className="text-accent-soft">Movies/OmniDrop</code> for video content and <code className="text-accent-soft">Music/OmniDrop</code> for audio extracts. Your files remain on your hardware and are never uploaded or mirrored to any external cloud service.
             </p>
           </div>
 
@@ -479,19 +622,19 @@ export const AboutScreen: React.FC = () => {
             </h4>
             <div className="space-y-2 font-mono text-[11px]">
               <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800">
-                <div className="text-cyan-300 font-bold">android.permission.INTERNET</div>
+                <div className="text-accent-soft font-bold">android.permission.INTERNET</div>
                 <div className="text-slate-400 mt-0.5">Required to communicate with your Render backend server to download video and audio data.</div>
               </div>
               <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800">
-                <div className="text-cyan-300 font-bold">SYSTEM_ALERT_WINDOW (Display over other apps)</div>
+                <div className="text-accent-soft font-bold">SYSTEM_ALERT_WINDOW (Display over other apps)</div>
                 <div className="text-slate-400 mt-0.5">Used strictly to render the floating edge drawer for quick 1-tap background downloading while browsing social apps.</div>
               </div>
               <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800">
-                <div className="text-cyan-300 font-bold">POST_NOTIFICATIONS</div>
+                <div className="text-accent-soft font-bold">POST_NOTIFICATIONS</div>
                 <div className="text-slate-400 mt-0.5">Employed to deliver download progress percentages and finished notification alerts.</div>
               </div>
               <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800">
-                <div className="text-cyan-300 font-bold">READ_MEDIA_VIDEO / READ_EXTERNAL_STORAGE</div>
+                <div className="text-accent-soft font-bold">READ_MEDIA_VIDEO / READ_EXTERNAL_STORAGE</div>
                 <div className="text-slate-400 mt-0.5">Required to query <code className="text-white">Movies/OmniDrop</code> so the in-app library can rebuild itself and play videos offline.</div>
               </div>
             </div>
@@ -501,7 +644,7 @@ export const AboutScreen: React.FC = () => {
             <span>Direct Inquiries:</span>
             <a
               href="mailto:fatormajohn64@gmail.com"
-              className="font-mono text-cyan-300 hover:underline flex items-center gap-1"
+              className="font-mono text-accent-soft hover:underline flex items-center gap-1"
             >
               <Mail className="w-3 h-3" />
               fatormajohn64@gmail.com
@@ -516,10 +659,10 @@ export const AboutScreen: React.FC = () => {
   if (activeSubScreen === 'developer') {
     return (
       <div className="space-y-4 pb-28 animate-fade-in">
-        <div className="flex items-center gap-3 pb-2 border-b border-cyan-500/20">
+        <div className="flex items-center gap-3 pb-2 border-b border-accent">
           <button
             onClick={() => setActiveSubScreen(null)}
-            className="machine-btn px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-mono text-cyan-300"
+            className="machine-btn px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-mono text-accent-soft whitespace-nowrap"
           >
             <ArrowLeft className="w-3.5 h-3.5" />
             <span>BACK // MENU</span>
@@ -534,9 +677,9 @@ export const AboutScreen: React.FC = () => {
         {/* Creator Identity Hero */}
         <div className="machine-surface rounded-xl p-5 text-center space-y-4">
           <div className="relative inline-block mx-auto">
-            <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-cyan-500 via-indigo-600 to-purple-600 p-0.5 shadow-[0_0_20px_rgba(0,240,255,0.4)]">
+            <div className="w-20 h-20 rounded-2xl bg-slate-950 border-2 border-accent-strong glow-accent p-0.5 flex items-center justify-center">
               <div className="w-full h-full rounded-[14px] bg-slate-950 flex items-center justify-center">
-                <span className="font-mono font-black text-2xl tracking-wider text-cyan-300">
+                <span className="font-mono font-black text-2xl tracking-wider text-accent-soft">
                   JT
                 </span>
               </div>
@@ -548,7 +691,7 @@ export const AboutScreen: React.FC = () => {
             <h3 className="font-mono font-bold text-base text-white tracking-wide">
               JTech
             </h3>
-            <p className="font-mono text-xs text-cyan-400 mt-0.5">
+            <p className="font-mono text-xs text-accent mt-0.5">
               Independent Software Engineer • Sierra Leone 🇸🇱
             </p>
           </div>
@@ -558,7 +701,7 @@ export const AboutScreen: React.FC = () => {
           </div>
 
           <div className="flex items-center justify-center gap-2 text-xs font-mono text-slate-400">
-            <Terminal className="w-3.5 h-3.5 text-cyan-400" />
+            <Terminal className="w-3.5 h-3.5 text-accent" />
             <span>Mobile-First Engineering • Zero Compromise</span>
           </div>
         </div>
@@ -612,9 +755,9 @@ export const AboutScreen: React.FC = () => {
           </div>
           <a
             href="mailto:fatormajohn64@gmail.com"
-            className="machine-btn px-3 py-1.5 rounded-lg font-mono text-xs text-cyan-300 flex items-center gap-1.5"
+            className="machine-btn px-3 py-1.5 rounded-lg font-mono text-xs text-accent-soft flex items-center gap-1.5 whitespace-nowrap"
           >
-            <Mail className="w-3.5 h-3.5 text-cyan-400" />
+            <Mail className="w-3.5 h-3.5 text-accent" />
             <span>EMAIL</span>
           </a>
         </div>
@@ -626,10 +769,10 @@ export const AboutScreen: React.FC = () => {
   if (activeSubScreen === 'info') {
     return (
       <div className="space-y-4 pb-28 animate-fade-in">
-        <div className="flex items-center gap-3 pb-2 border-b border-cyan-500/20">
+        <div className="flex items-center gap-3 pb-2 border-b border-accent">
           <button
             onClick={() => setActiveSubScreen(null)}
-            className="machine-btn px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-mono text-cyan-300"
+            className="machine-btn px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-mono text-accent-soft whitespace-nowrap"
           >
             <ArrowLeft className="w-3.5 h-3.5" />
             <span>BACK // MENU</span>
@@ -645,9 +788,9 @@ export const AboutScreen: React.FC = () => {
           <div className="flex items-center justify-between pb-3 border-b border-slate-800">
             <div>
               <div className="font-mono font-bold text-white text-sm">OmniDrop Personal Downloader</div>
-              <div className="font-mono text-[11px] text-cyan-400">PRODUCTION BUILD {appVersion.versionCode}</div>
+              <div className="font-mono text-[11px] text-accent tabular-nums">PRODUCTION BUILD {appVersion.versionCode}</div>
             </div>
-            <span className="px-2.5 py-1 rounded-lg bg-cyan-950 border border-cyan-500/40 text-cyan-300 font-mono text-xs font-bold">
+            <span className="px-2.5 py-1 rounded-lg bg-accent-soft border border-accent text-accent-soft font-mono text-xs font-bold tabular-nums whitespace-nowrap">
               v1.0.{appVersion.versionCode}
             </span>
           </div>
@@ -701,7 +844,7 @@ export const AboutScreen: React.FC = () => {
               <div className="flex items-center gap-2">
                 <button
                   onClick={handleCopyCrash}
-                  className="px-2 py-1 rounded bg-slate-900 border border-slate-700 hover:border-cyan-400 font-mono text-[10px] text-cyan-300 flex items-center gap-1 active:scale-95"
+                  className="px-2 py-1 rounded bg-slate-900 border border-slate-700 hover:border-accent-strong font-mono text-[10px] text-accent-soft flex items-center gap-1 active:scale-95"
                   title="Copy crash details"
                 >
                   <Copy className="w-3 h-3" />
@@ -736,7 +879,7 @@ export const AboutScreen: React.FC = () => {
             <div className="w-2.5 h-2.5 rounded-full led-emerald" />
             <span className="text-slate-300">CORE STATUS: SYSTEM OPERATIONAL</span>
           </div>
-          <span className="text-cyan-400">100% ONLINE</span>
+          <span className="text-accent whitespace-nowrap">100% ONLINE</span>
         </div>
       </div>
     );
@@ -763,16 +906,16 @@ export const AboutScreen: React.FC = () => {
     return (
       <div className="space-y-4 pb-28 animate-fade-in font-mono text-xs">
         {/* Sub-screen header */}
-        <div className="flex items-center gap-3 pb-2 border-b border-cyan-500/20">
+        <div className="flex items-center gap-3 pb-2 border-b border-accent">
           <button
             onClick={() => setActiveSubScreen(null)}
-            className="machine-btn px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-mono text-cyan-300"
+            className="machine-btn px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-mono text-accent-soft whitespace-nowrap"
           >
             <ArrowLeft className="w-3.5 h-3.5" />
             <span>BACK // MENU</span>
           </button>
           <div className="text-right flex-1">
-            <span className="font-mono text-[11px] text-cyan-400 font-bold uppercase tracking-widest">
+            <span className="font-mono text-[11px] text-accent font-bold uppercase tracking-widest">
               METRICS // DOWNLOAD STATS
             </span>
           </div>
@@ -780,13 +923,15 @@ export const AboutScreen: React.FC = () => {
 
         {isLoadingStats && !stats ? (
           <div className="machine-surface p-8 text-center rounded-xl space-y-3">
-            <div className="w-8 h-8 mx-auto rounded-full border-2 border-cyan-400 border-t-transparent animate-spin" />
+            <div className="w-8 h-8 mx-auto rounded-full border-2 border-accent border-t-transparent animate-spin" />
             <p className="text-slate-400 font-mono text-xs">COMPUTING NATIVE TELEMETRY...</p>
           </div>
-        ) : !stats ? (
-          <div className="machine-surface p-6 text-center rounded-xl text-slate-400">
-            NO STATS RECORDED YET
-          </div>
+        ) : !stats || stats.totalDownloads === 0 ? (
+          <EmptyState
+            icon={BarChart3}
+            title="NO STATS RECORDED YET"
+            message="Completed downloads will automatically record volume, platform split, and daily activity."
+          />
         ) : (
           <>
             {/* Primary KPI Grid (4 Cards) */}
@@ -795,9 +940,9 @@ export const AboutScreen: React.FC = () => {
               <div className="machine-surface p-3 rounded-xl space-y-1">
                 <div className="flex items-center justify-between text-slate-400 text-[10px] uppercase">
                   <span>TOTAL DOWNLOADS</span>
-                  <HardDrive className="w-3.5 h-3.5 text-cyan-400" />
+                  <HardDrive className="w-3.5 h-3.5 text-accent" />
                 </div>
-                <div className="text-xl font-bold text-white tracking-wider">
+                <div className="text-xl font-bold text-white tracking-wider tabular-nums">
                   {stats.totalDownloads}
                 </div>
                 <div className="text-[10px] text-slate-500">Finished media jobs</div>
@@ -809,7 +954,7 @@ export const AboutScreen: React.FC = () => {
                   <span>DATA VOLUME</span>
                   <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
                 </div>
-                <div className="text-xl font-bold text-cyan-300 tracking-wider">
+                <div className="text-xl font-bold text-accent-soft tracking-wider tabular-nums">
                   {formatStatsBytes(stats.totalBytes)}
                 </div>
                 <div className="text-[10px] text-slate-500">Saved to storage</div>
@@ -820,11 +965,11 @@ export const AboutScreen: React.FC = () => {
                 <div className="flex items-center justify-between text-slate-400 text-[10px] uppercase">
                   <span>MEDIA SPLIT</span>
                   <div className="flex items-center gap-1">
-                    <Film className="w-3 h-3 text-cyan-400" />
+                    <Film className="w-3 h-3 text-accent" />
                     <Camera className="w-3 h-3 text-fuchsia-400" />
                   </div>
                 </div>
-                <div className="text-base font-bold text-white tracking-wider flex items-center gap-2">
+                <div className="text-base font-bold text-white tracking-wider flex items-center gap-2 tabular-nums">
                   <span>{stats.videoCount} <span className="text-[10px] text-slate-400 font-normal">VID</span></span>
                   <span className="text-slate-600">/</span>
                   <span>{stats.photoCount} <span className="text-[10px] text-slate-400 font-normal">PIC</span></span>
@@ -935,12 +1080,12 @@ export const AboutScreen: React.FC = () => {
             <div className="machine-surface rounded-xl p-4 space-y-3">
               <div className="flex items-center justify-between pb-1 border-b border-slate-800">
                 <div className="flex items-center gap-2">
-                  <BarChart3 className="w-3.5 h-3.5 text-cyan-400" />
+                  <BarChart3 className="w-3.5 h-3.5 text-accent" />
                   <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
                     14-DAY ACTIVITY TIMELINE
                   </h3>
                 </div>
-                <span className="text-[10px] text-slate-400">Peak: {maxDailyDownloads} items</span>
+                <span className="text-[10px] text-slate-400 tabular-nums">Peak: {maxDailyDownloads} items</span>
               </div>
 
               <div className="pt-2">
@@ -954,7 +1099,7 @@ export const AboutScreen: React.FC = () => {
                         className="flex-1 flex flex-col items-center h-full justify-end group relative"
                       >
                         {/* Tooltip on tap/hover */}
-                        <div className="opacity-0 group-hover:opacity-100 pointer-events-none absolute bottom-full mb-1 z-30 px-1.5 py-0.5 rounded bg-black border border-cyan-500 text-[9px] text-cyan-300 whitespace-nowrap transition-opacity">
+                        <div className="opacity-0 group-hover:opacity-100 pointer-events-none absolute bottom-full mb-1 z-30 px-1.5 py-0.5 rounded bg-black border border-accent text-[9px] text-accent-soft whitespace-nowrap transition-opacity tabular-nums">
                           {d.date.slice(5)}: {d.downloads} ({formatStatsBytes(d.bytes)})
                         </div>
 
@@ -965,8 +1110,8 @@ export const AboutScreen: React.FC = () => {
                             d.downloads === 0
                               ? 'bg-slate-800/40'
                               : isPeak
-                              ? 'bg-cyan-400 shadow-[0_0_10px_rgba(0,240,255,0.7)]'
-                              : 'bg-cyan-600/80 group-hover:bg-cyan-400'
+                              ? 'bg-accent glow-accent-sm'
+                              : 'bg-accent opacity-75 group-hover:opacity-100'
                           }`}
                         />
                       </div>
@@ -1031,47 +1176,57 @@ export const AboutScreen: React.FC = () => {
     );
   }
 
-  // MAIN ABOUT MENU (5 BIG TILES)
+  // MAIN ABOUT MENU
   return (
     <div className="space-y-4 pb-28">
       {/* Monospace Section Header */}
-      <div className="flex items-center justify-between pt-1">
-        <div>
-          <h2 className="text-xs font-mono font-bold text-cyan-400 uppercase tracking-widest flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full led-cyan" />
+      <div className="flex items-center justify-between pt-1 gap-2">
+        <div className="min-w-0">
+          <h2 className="text-xs font-mono font-bold text-accent uppercase tracking-widest flex items-center gap-2 whitespace-nowrap">
+            <span className="w-2 h-2 rounded-full led-accent shrink-0" />
             ABOUT // SYSTEM INTEL
           </h2>
-          <p className="text-xs text-slate-400 mt-0.5">Documentation, privacy audit & developer profile</p>
+          <p className="text-xs text-slate-400 mt-0.5 truncate">Release notes, documentation & diagnostics</p>
         </div>
-        <div className="font-mono text-[10px] px-2 py-0.5 rounded bg-cyan-950/60 border border-cyan-500/30 text-cyan-300 font-bold">
+        <div className="font-mono text-[10px] px-2 py-0.5 rounded bg-accent-soft border border-accent text-accent-soft font-bold tabular-nums whitespace-nowrap shrink-0">
           BUILD v1.0.{appVersion.versionCode}
         </div>
       </div>
 
-      {/* 5 Big Machine Tiles */}
+      {/* Machine Tiles */}
       <div className="grid grid-cols-1 gap-3">
-        {menuItems.map((item) => {
+        {menuItems.map((item, idx) => {
           const Icon = item.icon;
+          const isUnread = Boolean((item as any).unread);
           return (
             <button
               key={item.id}
               onClick={() => setActiveSubScreen(item.id)}
-              className="machine-btn w-full p-4 rounded-xl text-left flex items-center justify-between group transition-all"
+              style={{ '--stagger': idx } as React.CSSProperties}
+              className="stagger-card machine-btn w-full p-4 rounded-xl text-left flex items-center justify-between group transition-all"
             >
               <div className="flex items-start gap-3.5 min-w-0">
-                <div className="w-10 h-10 rounded-lg bg-slate-950 border border-cyan-500/30 flex items-center justify-center shrink-0 shadow-inner group-hover:border-cyan-400 transition">
+                <div className="relative w-10 h-10 rounded-lg bg-slate-950 border border-accent flex items-center justify-center shrink-0 shadow-inner group-hover:border-accent-strong transition">
                   <Icon className={`w-5 h-5 ${item.color}`} />
+                  {isUnread && (
+                    <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full led-accent animate-pulse" />
+                  )}
                 </div>
                 <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="font-mono text-[10px] text-cyan-400/80 font-semibold tracking-wider">
+                  <div className="flex items-center gap-2 whitespace-nowrap">
+                    <span className="font-mono text-[10px] text-accent font-semibold tracking-wider">
                       {item.code}
                     </span>
-                    <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-950 border border-slate-800 text-slate-300">
+                    <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-950 border border-slate-800 text-slate-300 tabular-nums">
                       {item.badge}
                     </span>
+                    {isUnread && (
+                      <span className="text-[9px] font-mono px-1.5 py-0.2 rounded bg-accent text-slate-950 font-bold glow-accent-sm">
+                        NEW
+                      </span>
+                    )}
                   </div>
-                  <h3 className="font-mono font-bold text-sm text-white mt-0.5 tracking-wide group-hover:text-cyan-300 transition">
+                  <h3 className="font-mono font-bold text-sm text-white mt-0.5 tracking-wide group-hover:text-accent-soft transition truncate">
                     {item.title}
                   </h3>
                   <p className="text-xs text-slate-400 mt-0.5 leading-snug line-clamp-1">
@@ -1081,7 +1236,7 @@ export const AboutScreen: React.FC = () => {
               </div>
 
               <div className="pl-2 shrink-0">
-                <div className="w-7 h-7 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-center text-slate-400 group-hover:text-cyan-400 group-hover:border-cyan-500/40 transition">
+                <div className="w-7 h-7 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-center text-slate-400 group-hover:text-accent group-hover:border-accent transition">
                   <ChevronRight className="w-4 h-4" />
                 </div>
               </div>
@@ -1091,12 +1246,12 @@ export const AboutScreen: React.FC = () => {
       </div>
 
       {/* Hardware Badge Bottom */}
-      <div className="machine-surface rounded-xl p-3 flex items-center justify-between text-xs font-mono text-slate-400">
-        <div className="flex items-center gap-2">
-          <Terminal className="w-4 h-4 text-cyan-400" />
+      <div className="machine-surface rounded-xl p-3 flex items-center justify-between text-xs font-mono text-slate-400 stagger-card" style={{ '--stagger': 6 } as React.CSSProperties}>
+        <div className="flex items-center gap-2 whitespace-nowrap">
+          <Terminal className="w-4 h-4 text-accent" />
           <span>OMNIDROP // HARDWARE HYBRID</span>
         </div>
-        <span className="text-slate-500">2026 EDITION</span>
+        <span className="text-slate-500 whitespace-nowrap">2026 EDITION</span>
       </div>
     </div>
   );

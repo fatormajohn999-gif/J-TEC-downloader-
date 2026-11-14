@@ -55,6 +55,8 @@ export interface DownloadHistoryItem {
   fileUri?: string;
 }
 
+export type AccentTheme = 'cyan' | 'purple' | 'green' | 'amber' | 'red';
+
 export interface AppSettings {
   backendUrl: string;
   apiKey: string;
@@ -72,6 +74,8 @@ export interface AppSettings {
   floatingHideInsideApp?: boolean;
   autoCheckUpdates?: boolean;
   skippedUpdateVersion?: number;
+  accentColor?: AccentTheme;
+  reduceAnimations?: boolean;
 }
 
 export interface AppUpdateInfo {

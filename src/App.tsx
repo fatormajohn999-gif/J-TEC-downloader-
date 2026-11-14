@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Header } from './components/Header';
 import { BottomNav, NavTab } from './components/BottomNav';
 import { HomeScreen } from './components/HomeScreen';
@@ -13,13 +13,21 @@ import { SettingsScreen } from './components/SettingsScreen';
 import { AboutScreen } from './components/AboutScreen';
 import { ServerWakingBanner } from './components/ServerWakingBanner';
 import { ClipboardPromptModal } from './components/ClipboardPromptModal';
-import { AppSettings, DownloadHistoryItem, PlatformType } from './types';
+import { BootSplash } from './components/BootSplash';
+import { AppSettings, AppUpdateInfo, DownloadHistoryItem, PlatformType } from './types';
 import { checkServerHealth, isSupportedUrl } from './services/api';
 import { VideoDownloader } from './plugins/videoDownloader';
-import { checkForAppUpdate } from './services/updateService';
+import {
+  checkForAppUpdate,
+  getCachedUpdateInfo,
+  getSeenWhatsNewTag,
+  markWhatsNewSeen,
+} from './services/updateService';
 
 const STORAGE_KEY_SETTINGS = 'omnidrop_settings_v1';
 const STORAGE_KEY_HISTORY = 'omnidrop_history_v1';
+
+const TAB_ORDER: NavTab[] = ['home', 'videos', 'photos', 'settings', 'about'];
 
 const DEFAULT_SETTINGS: AppSettings = {
   backendUrl: '',
@@ -37,18 +45,36 @@ const DEFAULT_SETTINGS: AppSettings = {
   floatingVibrate: true,
   floatingHideInsideApp: true,
   autoCheckUpdates: true,
+  accentColor: 'cyan',
+  reduceAnimations: false,
 };
 
+function applyAppearanceToDom(settings: AppSettings) {
+  if (typeof document === 'undefined') return;
+  const root = document.documentElement;
+  root.setAttribute('data-accent', settings.accentColor || 'cyan');
+  root.classList.toggle('reduce-motion', Boolean(settings.reduceAnimations));
+}
+
 export default function App() {
-  const [currentTab, setCurrentTab] = useState<NavTab>('home');
-  const [hasUpdateWaiting, setHasUpdateWaiting] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(() => {
+    let loaded = DEFAULT_SETTINGS;
     try {
       const saved = localStorage.getItem(STORAGE_KEY_SETTINGS);
-      if (saved) return { ...DEFAULT_SETTINGS, ...JSON.parse(saved) };
+      if (saved) loaded = { ...DEFAULT_SETTINGS, ...JSON.parse(saved) };
     } catch {}
-    return DEFAULT_SETTINGS;
+    applyAppearanceToDom(loaded);
+    return loaded;
   });
+
+  const [showBootSplash, setShowBootSplash] = useState<boolean>(() => !settings.reduceAnimations);
+  const [currentTab, setCurrentTab] = useState<NavTab>('home');
+  const prevTabIndexRef = useRef<number>(0);
+  const [tabDirection, setTabDirection] = useState<'left' | 'right' | 'none'>('none');
+
+  const [hasUpdateWaiting, setHasUpdateWaiting] = useState(false);
+  const [latestRelease, setLatestRelease] = useState<AppUpdateInfo | null>(() => getCachedUpdateInfo());
+  const [seenWhatsNewTag, setSeenWhatsNewTag] = useState<string>(() => getSeenWhatsNewTag());
 
   const [history, setHistory] = useState<DownloadHistoryItem[]>(() => {
     try {
@@ -66,9 +92,27 @@ export default function App() {
   const [pendingUrl, setPendingUrl] = useState<string>('');
   const [detectedClipboardUrl, setDetectedClipboardUrl] = useState<string>('');
 
+  // Keep DOM accent + reduce-motion attributes in sync with settings
+  useEffect(() => {
+    applyAppearanceToDom(settings);
+  }, [settings.accentColor, settings.reduceAnimations]);
+
+  // Tab switch with directional transition
+  const handleSelectTab = useCallback((nextTab: NavTab) => {
+    setCurrentTab((prev) => {
+      if (prev === nextTab) return prev;
+      const oldIdx = TAB_ORDER.indexOf(prev);
+      const newIdx = TAB_ORDER.indexOf(nextTab);
+      prevTabIndexRef.current = oldIdx;
+      setTabDirection(newIdx >= oldIdx ? 'right' : 'left');
+      return nextTab;
+    });
+  }, []);
+
   // Persist settings
   const handleUpdateSettings = (newSettings: AppSettings) => {
     setSettings(newSettings);
+    applyAppearanceToDom(newSettings);
     try {
       localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(newSettings));
       VideoDownloader.saveNativeSettings({
@@ -106,13 +150,18 @@ export default function App() {
       autoCheckUpdates: settings.autoCheckUpdates ?? true,
     }).catch(() => {});
 
-    // Check updates on app open (throttled to at most once per hour)
+    // Check updates & latest release notes on app open (throttled to at most once per hour)
     checkForAppUpdate(false)
       .then((res) => {
+        if (res.updateInfo) {
+          setLatestRelease(res.updateInfo);
+        }
         if (res.hasUpdate && !res.isSkipped) {
           setHasUpdateWaiting(true);
         }
       })
+      .catch(() => {});
+
     // Auto-start floating tab service on app open if toggle is ON, permission granted, and not running
     if (settings.floatingBubbleEnabled) {
       VideoDownloader.hasOverlayPermission()
@@ -135,7 +184,7 @@ export default function App() {
   useEffect(() => {
     let handle: any = null;
     VideoDownloader.addListener('openSettingsTab', () => {
-      setCurrentTab('settings');
+      handleSelectTab('settings');
     })
       .then((h) => {
         handle = h;
@@ -145,7 +194,7 @@ export default function App() {
     return () => {
       if (handle && handle.remove) handle.remove();
     };
-  }, []);
+  }, [handleSelectTab]);
 
   const mergeNativeItems = useCallback((nativeItems: DownloadHistoryItem[]) => {
     if (!nativeItems || nativeItems.length === 0) return;
@@ -185,12 +234,10 @@ export default function App() {
     } catch {}
   }, [mergeNativeItems]);
 
-  // Sync native history on mount
   useEffect(() => {
     syncNativeHistory();
   }, [syncNativeHistory]);
 
-  // Sync native history when coming to foreground
   useEffect(() => {
     const handleFocus = () => syncNativeHistory();
     const handleVisibility = () => {
@@ -204,7 +251,6 @@ export default function App() {
     };
   }, [syncNativeHistory]);
 
-  // Listen to nativeDownloadFinished event
   useEffect(() => {
     let handle: any = null;
     (async () => {
@@ -221,7 +267,6 @@ export default function App() {
     };
   }, [mergeNativeItems]);
 
-  // Persist history
   const handleDownloadCompleted = (item: {
     url: string;
     title: string;
@@ -274,10 +319,10 @@ export default function App() {
       const urlToUse = match ? match[1] : sharedText;
       if (isSupportedUrl(urlToUse)) {
         setPendingUrl(urlToUse);
-        setCurrentTab('home');
+        handleSelectTab('home');
       }
     }
-  }, []);
+  }, [handleSelectTab]);
 
   // Native Capacitor share / bridge intent listener
   useEffect(() => {
@@ -287,24 +332,22 @@ export default function App() {
         const last = await VideoDownloader.getLastSharedUrl();
         if (last && last.url && isSupportedUrl(last.url)) {
           setPendingUrl(last.url);
-          setCurrentTab('home');
+          handleSelectTab('home');
         }
 
         handle = await VideoDownloader.addListener('onUrlReceived', (data) => {
           if (data && data.url && isSupportedUrl(data.url)) {
             setPendingUrl(data.url);
-            setCurrentTab('home');
+            handleSelectTab('home');
           }
         });
-      } catch {
-        // Safe on web
-      }
+      } catch {}
     })();
 
     return () => {
       if (handle && handle.remove) handle.remove();
     };
-  }, []);
+  }, [handleSelectTab]);
 
   // Auto-detect link in clipboard on app open or window focus
   const checkClipboardForLink = useCallback(async () => {
@@ -320,9 +363,7 @@ export default function App() {
           }
         }
       }
-    } catch {
-      // Safe pass
-    }
+    } catch {}
   }, [settings.autoDetectClipboard, pendingUrl, detectedClipboardUrl]);
 
   useEffect(() => {
@@ -331,62 +372,100 @@ export default function App() {
     return () => window.removeEventListener('focus', checkClipboardForLink);
   }, [checkClipboardForLink]);
 
+  const handleMarkWhatsNewSeen = useCallback((tagName: string) => {
+    if (!tagName) return;
+    markWhatsNewSeen(tagName);
+    setSeenWhatsNewTag(tagName);
+  }, []);
+
+  const handleRefreshRelease = useCallback(async () => {
+    const res = await checkForAppUpdate(true);
+    if (res.updateInfo) {
+      setLatestRelease(res.updateInfo);
+    }
+    if (res.hasUpdate && !res.isSkipped) {
+      setHasUpdateWaiting(true);
+    }
+    return res;
+  }, []);
+
+  const hasUnreadWhatsNew = Boolean(
+    latestRelease?.tagName && latestRelease.tagName !== seenWhatsNewTag
+  );
+
+  const tabTransitionClass =
+    settings.reduceAnimations || tabDirection === 'none'
+      ? ''
+      : tabDirection === 'right'
+      ? 'tab-enter-right'
+      : 'tab-enter-left';
+
   return (
-    <div className="min-h-screen bg-[#080B10] bg-grid-machine text-slate-100 flex flex-col font-sans antialiased selection:bg-cyan-500/30 selection:text-cyan-200">
+    <div className="min-h-screen bg-[var(--od-bg-canvas)] bg-grid-machine text-slate-100 flex flex-col font-sans antialiased">
+      {/* 1.2s Boot Splash */}
+      {showBootSplash && (
+        <BootSplash
+          reduceAnimations={Boolean(settings.reduceAnimations)}
+          onFinish={() => setShowBootSplash(false)}
+        />
+      )}
+
       {/* Top Header */}
       <Header
         serverStatus={serverStatus}
         serverLatency={serverLatency}
         onRefreshHealth={refreshHealth}
-        onOpenSettings={() => setCurrentTab('settings')}
+        onOpenSettings={() => handleSelectTab('settings')}
       />
 
       {/* Main View Area */}
-      <main className="flex-1 w-full max-w-md mx-auto px-4 pt-3">
-        {/* Server Waking Indicator (for Render free tier spin-up) */}
+      <main className="flex-1 w-full max-w-md mx-auto px-4 pt-3 overflow-x-clip">
         <ServerWakingBanner isWaking={isWakingServer} attempt={wakingAttempt} />
 
-        {currentTab === 'home' && (
-          <HomeScreen
-            settings={settings}
-            onDownloadCompleted={handleDownloadCompleted}
-            pendingUrl={pendingUrl}
-            onClearPendingUrl={() => setPendingUrl('')}
-            onWakeServerStart={() => {
-              setIsWakingServer(true);
-              setWakingAttempt(1);
-            }}
-            onWakeServerEnd={() => {
-              setIsWakingServer(false);
-              refreshHealth();
-            }}
-            onOpenSettings={() => setCurrentTab('settings')}
-            recentDownloads={history}
-            serverStatus={serverStatus}
-            serverLatency={serverLatency}
-          />
-        )}
+        <div key={currentTab} className={tabTransitionClass}>
+          {currentTab === 'home' && (
+            <HomeScreen
+              settings={settings}
+              onDownloadCompleted={handleDownloadCompleted}
+              pendingUrl={pendingUrl}
+              onClearPendingUrl={() => setPendingUrl('')}
+              onWakeServerStart={() => {
+                setIsWakingServer(true);
+                setWakingAttempt(1);
+              }}
+              onWakeServerEnd={() => {
+                setIsWakingServer(false);
+                refreshHealth();
+              }}
+              onOpenSettings={() => handleSelectTab('settings')}
+              recentDownloads={history}
+              serverStatus={serverStatus}
+              serverLatency={serverLatency}
+            />
+          )}
 
-        {currentTab === 'videos' && (
-          <VideosScreen />
-        )}
+          {currentTab === 'videos' && <VideosScreen />}
 
-        {currentTab === 'photos' && (
-          <PhotosScreen />
-        )}
+          {currentTab === 'photos' && <PhotosScreen />}
 
-        {currentTab === 'settings' && (
-          <SettingsScreen
-            settings={settings}
-            onUpdateSettings={handleUpdateSettings}
-            onRefreshHealth={refreshHealth}
-            onUpdateAvailableChange={setHasUpdateWaiting}
-          />
-        )}
+          {currentTab === 'settings' && (
+            <SettingsScreen
+              settings={settings}
+              onUpdateSettings={handleUpdateSettings}
+              onRefreshHealth={refreshHealth}
+              onUpdateAvailableChange={setHasUpdateWaiting}
+            />
+          )}
 
-        {currentTab === 'about' && (
-          <AboutScreen />
-        )}
+          {currentTab === 'about' && (
+            <AboutScreen
+              latestRelease={latestRelease}
+              hasUnreadWhatsNew={hasUnreadWhatsNew}
+              onMarkWhatsNewSeen={handleMarkWhatsNewSeen}
+              onRefreshRelease={handleRefreshRelease}
+            />
+          )}
+        </div>
       </main>
 
       {/* Auto-detected clipboard link modal prompt */}
@@ -395,17 +474,18 @@ export default function App() {
         onConfirm={(url) => {
           setDetectedClipboardUrl('');
           setPendingUrl(url);
-          setCurrentTab('home');
+          handleSelectTab('home');
         }}
         onDismiss={() => setDetectedClipboardUrl('')}
       />
 
-      {/* Bottom Navigation with Update Notification Badge */}
+      {/* Bottom Navigation */}
       <BottomNav
         currentTab={currentTab}
-        onSelectTab={setCurrentTab}
+        onSelectTab={handleSelectTab}
         videoCount={history.length}
         hasUpdate={hasUpdateWaiting}
+        hasUnreadWhatsNew={hasUnreadWhatsNew}
       />
     </div>
   );

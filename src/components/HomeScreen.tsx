@@ -1,26 +1,27 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   Clipboard,
   Download,
   Loader2,
   AlertCircle,
-  Sparkles,
   CheckCircle2,
   Trash2,
   Play,
   RotateCcw,
   Check,
   Film,
-  Music,
-  ExternalLink,
   Images,
   Copy,
   X,
+  HardDrive,
+  Activity,
 } from 'lucide-react';
 import { Capacitor } from '@capacitor/core';
 import { VideoInfo, AppSettings, PlatformType, DownloadHistoryItem, FailedDownloadItem } from '../types';
 import { isSupportedUrl, fetchVideoInfo, downloadVideoFile, wakeUpServerUntilReady, normalizeUrl } from '../services/api';
 import { VideoDownloader } from '../plugins/videoDownloader';
+import { EmptyState } from './EmptyState';
+import { SpeedArcGauge } from './SpeedArcGauge';
 
 interface HomeScreenProps {
   settings: AppSettings;
@@ -51,6 +52,21 @@ const QUALITY_OPTIONS = [
   { id: 'audio', label: 'MP3' },
 ];
 
+function getLocalTodayKey(): string {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, '0');
+  const d = String(now.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function formatDataMb(bytes: number): string {
+  if (!bytes || bytes <= 0) return '0.0 MB';
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 1024) return `${(mb / 1024).toFixed(2)} GB`;
+  return `${mb.toFixed(1)} MB`;
+}
+
 export const HomeScreen: React.FC<HomeScreenProps> = ({
   settings,
   onDownloadCompleted,
@@ -72,8 +88,13 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const [isDownloading, setIsDownloading] = useState<boolean>(false);
   const [downloadProgress, setDownloadProgress] = useState<number>(0);
   const [downloadStatusText, setDownloadStatusText] = useState<string>('');
+  const [downloadSpeedMb, setDownloadSpeedMb] = useState<number>(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+
+  // Dashboard recorded today stats
+  const [todayDownloads, setTodayDownloads] = useState<number>(0);
+  const [todayBytes, setTodayBytes] = useState<number>(0);
 
   const [duplicateDialog, setDuplicateDialog] = useState<{
     open: boolean;
@@ -87,7 +108,26 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const [failedModalOpen, setFailedModalOpen] = useState<boolean>(false);
   const [copiedFailedId, setCopiedFailedId] = useState<string | null>(null);
 
-  const loadFailedLinks = React.useCallback(async () => {
+  const loadTodayStats = useCallback(async () => {
+    try {
+      const stats = await VideoDownloader.getDownloadStats();
+      if (stats && Array.isArray(stats.dailyStats)) {
+        const todayKey = getLocalTodayKey();
+        const entry = stats.dailyStats.find((d) => d.date === todayKey);
+        if (entry) {
+          setTodayDownloads(entry.downloads || 0);
+          setTodayBytes(entry.bytes || 0);
+          return;
+        }
+      }
+      setTodayDownloads(0);
+      setTodayBytes(0);
+    } catch {
+      // Leave zeros when unavailable
+    }
+  }, []);
+
+  const loadFailedLinks = useCallback(async () => {
     try {
       const res = await VideoDownloader.getFailedLinks();
       if (res && Array.isArray(res.failedLinks)) {
@@ -99,19 +139,31 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   }, []);
 
   useEffect(() => {
+    loadTodayStats();
     loadFailedLinks();
-    let handle: any = null;
+
+    let hFailed: any = null;
+    let hFinished: any = null;
     (async () => {
       try {
-        handle = await VideoDownloader.addListener('onFailedLinksChanged', () => {
+        hFailed = await VideoDownloader.addListener('onFailedLinksChanged', () => {
           loadFailedLinks();
+        });
+        hFinished = await VideoDownloader.addListener('nativeDownloadFinished', () => {
+          loadTodayStats();
         });
       } catch {}
     })();
+
+    const onFocus = () => loadTodayStats();
+    window.addEventListener('focus', onFocus);
+
     return () => {
-      if (handle && handle.remove) handle.remove();
+      window.removeEventListener('focus', onFocus);
+      if (hFailed && hFailed.remove) hFailed.remove();
+      if (hFinished && hFinished.remove) hFinished.remove();
     };
-  }, [loadFailedLinks]);
+  }, [loadFailedLinks, loadTodayStats]);
 
   // Sync if pendingUrl was passed from Share Target or Clipboard detector
   useEffect(() => {
@@ -217,7 +269,6 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       return;
     }
 
-    // Check duplicate before starting download
     if (!force && isNative) {
       try {
         const dup = await VideoDownloader.checkDuplicate({ url: targetUrl });
@@ -238,6 +289,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     setIsDownloading(true);
     setDownloadProgress(10);
     setDownloadStatusText('Connecting to downloader...');
+    setDownloadSpeedMb(0);
     setErrorMessage(null);
     setSuccessMessage(null);
     setDuplicateDialog(null);
@@ -254,9 +306,12 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         selectedQuality,
         titleToUse,
         settings,
-        (pct, text) => {
+        (pct, text, speedMb) => {
           setDownloadProgress(pct);
           setDownloadStatusText(text);
+          if (typeof speedMb === 'number' && speedMb >= 0) {
+            setDownloadSpeedMb(speedMb);
+          }
         }
       );
 
@@ -279,44 +334,55 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       });
 
       setSuccessMessage(`SAVED: ${fileName}`);
+      loadTodayStats();
     } catch (err: any) {
       setErrorMessage(err.message || 'Download failed. Please check network/backend.');
     } finally {
       setIsDownloading(false);
+      setDownloadSpeedMb(0);
     }
   };
 
   const handlePlayExisting = async (uri: string, title: string) => {
     try {
-      await VideoDownloader.playVideo({ uri, title });
+      const res = await VideoDownloader.playVideo({ uri, title });
+      if (!res?.started) {
+        setErrorMessage('Native video playback is available in the Android build.');
+      }
     } catch (e: any) {
-      alert(`Play notice: ${e?.message || 'Player available in Android build.'}`);
+      setErrorMessage(e?.message || 'Unable to launch video player.');
     }
   };
 
-  // Render 16 segmented progress blocks
-  const renderSegmentedProgress = () => {
+  // Segmented 16-block progress + Live Speed Arc Gauge
+  const renderDownloadingVisuals = () => {
     const totalBlocks = 16;
     const filledBlocks = Math.round((downloadProgress / 100) * totalBlocks);
 
     return (
-      <div className="space-y-1.5 pt-1">
-        <div className="flex items-center justify-between font-mono text-[11px]">
-          <span className="text-cyan-400 font-bold">{downloadProgress}%</span>
-          <span className="text-slate-400 truncate max-w-[200px]">{downloadStatusText}</span>
+      <div className="flex items-center gap-3 pt-1">
+        <div className="flex-1 min-w-0 space-y-1.5">
+          <div className="flex items-center justify-between gap-2 font-mono text-[11px]">
+            <span className="text-accent font-bold tabular-nums w-10 whitespace-nowrap">
+              {downloadProgress}%
+            </span>
+            <span className="text-slate-400 truncate text-right">{downloadStatusText}</span>
+          </div>
+          <div className="grid grid-cols-16 gap-1 p-1 bg-slate-950 rounded-md border border-accent">
+            {Array.from({ length: totalBlocks }).map((_, i) => (
+              <div
+                key={i}
+                className={`h-2.5 rounded-xs transition-colors duration-150 ${
+                  i < filledBlocks
+                    ? 'bg-accent glow-accent-sm'
+                    : 'bg-slate-900 border border-slate-800'
+                }`}
+              />
+            ))}
+          </div>
         </div>
-        <div className="grid grid-cols-16 gap-1 p-1 bg-slate-950 rounded-md border border-cyan-500/30">
-          {Array.from({ length: totalBlocks }).map((_, i) => (
-            <div
-              key={i}
-              className={`h-2.5 rounded-xs transition-colors duration-150 ${
-                i < filledBlocks
-                  ? 'bg-cyan-400 led-cyan shadow-[0_0_6px_rgba(0,240,255,0.8)]'
-                  : 'bg-slate-900 border border-slate-800'
-              }`}
-            />
-          ))}
-        </div>
+
+        <SpeedArcGauge speedMb={downloadSpeedMb} isActive={isDownloading} />
       </div>
     );
   };
@@ -381,14 +447,69 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     return `${days}d ago`;
   };
 
+  const serverLedClass =
+    serverStatus === 'connected'
+      ? serverLatency && serverLatency > 3000
+        ? 'led-amber'
+        : 'led-emerald'
+      : serverStatus === 'checking'
+      ? 'led-amber animate-pulse'
+      : 'led-rose';
+
+  const serverStateText =
+    serverStatus === 'connected'
+      ? serverLatency && serverLatency > 3000
+        ? 'SLEEP'
+        : 'ONLINE'
+      : serverStatus === 'checking'
+      ? 'PING...'
+      : 'OFFLINE';
+
   return (
     <div className="space-y-4 pb-28">
+      {/* DASHBOARD STRIP: TODAY / DATA / SERVER */}
+      <div
+        className="grid grid-cols-3 gap-2 stagger-card"
+        style={{ '--stagger': 0 } as React.CSSProperties}
+      >
+        <div className="machine-surface rounded-xl px-2.5 py-2.5 flex flex-col justify-between min-w-0">
+          <div className="flex items-center justify-between gap-1 text-[10px] font-mono text-slate-400 uppercase whitespace-nowrap">
+            <span>TODAY</span>
+            <Download className="w-3 h-3 text-accent shrink-0" />
+          </div>
+          <div className="font-mono text-sm font-bold text-white tabular-nums whitespace-nowrap mt-1">
+            {todayDownloads} <span className="text-[10px] text-slate-400 font-normal">DLS</span>
+          </div>
+        </div>
+
+        <div className="machine-surface rounded-xl px-2.5 py-2.5 flex flex-col justify-between min-w-0">
+          <div className="flex items-center justify-between gap-1 text-[10px] font-mono text-slate-400 uppercase whitespace-nowrap">
+            <span>DATA</span>
+            <HardDrive className="w-3 h-3 text-accent shrink-0" />
+          </div>
+          <div className="font-mono text-sm font-bold text-accent-soft tabular-nums whitespace-nowrap mt-1">
+            {formatDataMb(todayBytes)}
+          </div>
+        </div>
+
+        <div className="machine-surface rounded-xl px-2.5 py-2.5 flex flex-col justify-between min-w-0">
+          <div className="flex items-center justify-between gap-1 text-[10px] font-mono text-slate-400 uppercase whitespace-nowrap">
+            <span>SERVER</span>
+            <Activity className="w-3 h-3 text-accent shrink-0" />
+          </div>
+          <div className="flex items-center gap-1.5 font-mono text-xs font-bold text-white whitespace-nowrap mt-1">
+            <span className={`w-2 h-2 rounded-full shrink-0 ${serverLedClass}`} />
+            <span className="truncate">{serverStateText}</span>
+          </div>
+        </div>
+      </div>
+
       {/* Backend Required Warning if unconfigured */}
       {isBackendMissingOnNative && (
-        <div className="machine-surface p-3.5 rounded-xl border border-amber-500/60 text-amber-200 space-y-2">
+        <div className="machine-surface p-3.5 rounded-xl border border-amber-500/60 text-amber-200 space-y-2 stagger-card" style={{ '--stagger': 1 } as React.CSSProperties}>
           <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full led-amber" />
-            <h4 className="text-xs font-mono font-bold uppercase tracking-wider text-white">
+            <span className="w-2 h-2 rounded-full led-amber shrink-0" />
+            <h4 className="text-xs font-mono font-bold uppercase tracking-wider text-white truncate">
               CONFIGURATION REQUIRED // RENDER BACKEND
             </h4>
           </div>
@@ -398,7 +519,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           {onOpenSettings && (
             <button
               onClick={onOpenSettings}
-              className="machine-btn px-3 py-1 rounded-lg text-xs font-mono font-bold text-cyan-300"
+              className="machine-btn px-3 py-1 rounded-lg text-xs font-mono font-bold text-accent-soft whitespace-nowrap"
             >
               GOTO // SETTINGS
             </button>
@@ -408,30 +529,30 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 
       {/* Duplicate Alert Dialog */}
       {duplicateDialog && duplicateDialog.open && (
-        <div className="machine-surface p-4 rounded-xl border border-cyan-400/80 space-y-3 animate-fade-in shadow-[0_0_20px_rgba(0,240,255,0.25)]">
+        <div className="machine-surface p-4 rounded-xl border-accent-strong glow-accent space-y-3 animate-fade-in">
           <div className="flex items-center gap-2">
-            <span className="w-2.5 h-2.5 rounded-full led-cyan" />
-            <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-white">
+            <span className="w-2.5 h-2.5 rounded-full led-accent shrink-0" />
+            <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-white truncate">
               ALREADY DOWNLOADED // FILE EXISTS
             </h3>
           </div>
           <p className="text-xs text-slate-300 font-sans">
             This video was already downloaded and is stored in your gallery:
           </p>
-          <div className="font-mono text-[11px] text-cyan-300 p-2 rounded bg-slate-950 border border-slate-800 truncate">
+          <div className="font-mono text-[11px] text-accent-soft p-2 rounded bg-slate-950 border border-slate-800 truncate">
             {duplicateDialog.fileName || duplicateDialog.title}
           </div>
           <div className="flex items-center gap-2 pt-1">
             <button
               onClick={() => handlePlayExisting(duplicateDialog.uri, duplicateDialog.title)}
-              className="machine-btn-primary flex-1 py-2 rounded-lg font-mono text-xs uppercase flex items-center justify-center gap-1.5"
+              className="machine-btn-primary flex-1 py-2 rounded-lg font-mono text-xs uppercase flex items-center justify-center gap-1.5 whitespace-nowrap"
             >
               <Play className="w-3.5 h-3.5 fill-current" />
               <span>PLAY NOW</span>
             </button>
             <button
               onClick={() => handleStartDownload(true)}
-              className="machine-btn flex-1 py-2 rounded-lg font-mono text-xs text-slate-300 uppercase flex items-center justify-center gap-1.5"
+              className="machine-btn flex-1 py-2 rounded-lg font-mono text-xs text-slate-300 uppercase flex items-center justify-center gap-1.5 whitespace-nowrap"
             >
               <RotateCcw className="w-3.5 h-3.5" />
               <span>DOWNLOAD AGAIN</span>
@@ -441,62 +562,66 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       )}
 
       {/* HERO CARD: PASTE LINK // INGESTION UNIT */}
-      <div className="machine-surface rounded-xl p-4 space-y-3.5">
-        <div className="flex items-center justify-between pb-2 border-b border-cyan-500/20">
-          <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full led-cyan" />
-            <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-white">
-              PASTE LINK // INGESTION UNIT
+      <div
+        className="machine-surface rounded-xl p-4 space-y-3.5 stagger-card"
+        style={{ '--stagger': 1 } as React.CSSProperties}
+      >
+        <div className="flex items-center justify-between gap-2 pb-2 border-b border-accent">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="w-2 h-2 rounded-full led-accent shrink-0" />
+            <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-white truncate">
+              PASTE LINK // INGESTION
             </h3>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 shrink-0">
             {failedLinks.length > 0 && (
               <button
                 onClick={() => setFailedModalOpen(true)}
-                className="px-2 py-0.5 rounded-full font-mono text-[10px] font-bold bg-red-950 text-red-400 border border-red-500/80 shadow-[0_0_8px_rgba(239,68,68,0.4)] hover:bg-red-900 transition-all flex items-center gap-1.5 animate-pulse"
+                className="px-2 py-0.5 rounded-full font-mono text-[10px] font-bold bg-red-950 text-red-400 border border-red-500/80 shadow-[0_0_8px_rgba(239,68,68,0.4)] hover:bg-red-900 transition-all flex items-center gap-1 animate-pulse whitespace-nowrap tabular-nums"
                 title="View failed downloads"
               >
                 <AlertCircle className="w-3 h-3 text-red-400" />
                 <span>FAILED {failedLinks.length}</span>
               </button>
             )}
-            <span className="font-mono text-[10px] text-slate-400 uppercase">TIKTOK • YT • IG • FB</span>
+            <span className="font-mono text-[10px] text-slate-400 uppercase whitespace-nowrap">
+              TT • YT • IG • FB
+            </span>
           </div>
         </div>
 
         {/* Input & Paste Key */}
         <div className="space-y-2.5">
           <div className="flex items-center gap-2">
-            <div className="relative flex-1">
+            <div className="relative flex-1 min-w-0">
               <input
                 type="text"
                 value={inputUrl}
                 onChange={(e) => setInputUrl(e.target.value)}
                 placeholder="https://tiktok.com/@... or youtu.be/..."
-                className="w-full rounded-lg bg-slate-950 border border-slate-800 focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400 px-3 py-2.5 text-xs font-mono text-slate-200 placeholder:text-slate-600 outline-none transition"
+                className="machine-input w-full rounded-lg px-3 py-2.5 pr-14 text-xs font-mono text-slate-200 placeholder:text-slate-600"
               />
               {inputUrl && (
                 <button
                   onClick={handleClear}
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 font-mono text-xs"
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 font-mono text-[10px] whitespace-nowrap"
                 >
                   CLEAR
                 </button>
               )}
             </div>
 
-            {/* Big Mechanical Paste Key */}
             <button
               onClick={handlePaste}
-              className="machine-btn px-3.5 py-2.5 rounded-lg flex items-center gap-1.5 text-xs font-mono font-bold text-cyan-300 shrink-0"
+              className="machine-btn px-3.5 py-2.5 rounded-lg flex items-center gap-1.5 text-xs font-mono font-bold text-accent-soft shrink-0 whitespace-nowrap"
               title="Paste link from clipboard"
             >
-              <Clipboard className="w-3.5 h-3.5 text-cyan-400" />
+              <Clipboard className="w-3.5 h-3.5 text-accent" />
               <span>PASTE</span>
             </button>
           </div>
 
-          {/* Quality Selector Segmented Switch - Hidden for photo posts */}
+          {/* Quality Selector Segmented Switch */}
           {(!videoInfo || videoInfo.type !== 'photo') && (
             <div>
               <div className="text-[10px] font-mono text-slate-400 mb-1 uppercase tracking-wider">
@@ -509,9 +634,9 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                     <button
                       key={q.id}
                       onClick={() => setSelectedQuality(q.id)}
-                      className={`py-1.5 rounded text-center font-mono text-xs font-bold transition-all ${
+                      className={`py-1.5 rounded text-center font-mono text-xs font-bold transition-all whitespace-nowrap ${
                         isSelected
-                          ? 'machine-btn-primary text-slate-950 shadow-[0_0_10px_rgba(0,240,255,0.5)]'
+                          ? 'machine-btn-primary text-slate-950 glow-accent-sm'
                           : 'text-slate-400 hover:text-slate-200'
                       }`}
                     >
@@ -533,7 +658,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
               }
             }}
             disabled={isLoadingInfo || isDownloading}
-            className="machine-btn-primary w-full py-3 rounded-lg flex items-center justify-center gap-2 text-xs uppercase tracking-wider font-mono disabled:opacity-50"
+            className="machine-btn-primary w-full py-3 rounded-lg flex items-center justify-center gap-2 text-xs uppercase tracking-wider font-mono disabled:opacity-50 whitespace-nowrap"
           >
             {isLoadingInfo ? (
               <>
@@ -550,7 +675,9 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                 {videoInfo?.type === 'photo' ? <Images className="w-4 h-4" /> : <Download className="w-4 h-4" />}
                 <span>
                   {videoInfo
-                    ? (videoInfo.type === 'photo' ? 'SAVE PHOTOS' : 'DOWNLOAD VIDEO FILE')
+                    ? videoInfo.type === 'photo'
+                      ? 'SAVE PHOTOS'
+                      : 'DOWNLOAD VIDEO FILE'
                     : 'INSPECT & DOWNLOAD'}
                 </span>
               </>
@@ -574,35 +701,41 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         )}
       </div>
 
-      {/* POST-FETCH MEDIA CARD (VIDEO OR PHOTO POST) */}
-      {videoInfo && (
-        <div className="machine-surface rounded-xl p-4 space-y-3 animate-fade-in">
-          <div className="flex items-center justify-between pb-2 border-b border-cyan-500/20">
-            <div className="flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full led-emerald" />
-              <h4 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
-                {videoInfo.type === 'photo' ? 'TIKTOK PHOTO POST LOCATED' : 'VIDEO TARGET LOCATED'}
+      {/* POST-FETCH MEDIA CARD (OR ACTIVE DOWNLOAD VISUAL HUD) */}
+      {(videoInfo || isDownloading) && (
+        <div
+          className="machine-surface rounded-xl p-4 space-y-3 animate-fade-in stagger-card"
+          style={{ '--stagger': 2 } as React.CSSProperties}
+        >
+          <div className="flex items-center justify-between gap-2 pb-2 border-b border-accent">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className={`w-2 h-2 rounded-full shrink-0 ${isDownloading ? 'led-accent animate-pulse' : 'led-emerald'}`} />
+              <h4 className="font-mono text-xs font-bold text-white uppercase tracking-wider truncate">
+                {videoInfo
+                  ? videoInfo.type === 'photo'
+                    ? 'TIKTOK PHOTO POST LOCATED'
+                    : 'VIDEO TARGET LOCATED'
+                  : 'ACTIVE STREAM // TRANSFER'}
               </h4>
             </div>
 
-            {/* BADGE: "N PHOTOS" FOR PHOTO POST OR "NO WATERMARK" FOR VIDEO */}
-            {videoInfo.type === 'photo' ? (
-              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-purple-950/80 border border-purple-500/50 font-mono text-[10px] text-purple-300 font-bold shadow-[0_0_8px_rgba(168,85,247,0.3)]">
+            {videoInfo && (videoInfo.type === 'photo' ? (
+              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-purple-950/80 border border-purple-500/50 font-mono text-[10px] text-purple-300 font-bold shrink-0 whitespace-nowrap">
                 <Images className="w-3 h-3 text-purple-400" />
                 <span>{videoInfo.imageCount ? `${videoInfo.imageCount} PHOTOS` : 'PHOTOS SLIDESHOW'}</span>
               </div>
             ) : (
-              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-emerald-950/80 border border-emerald-500/40 font-mono text-[10px] text-emerald-300 font-bold">
+              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-emerald-950/80 border border-emerald-500/40 font-mono text-[10px] text-emerald-300 font-bold shrink-0 whitespace-nowrap">
                 <span className="w-1.5 h-1.5 rounded-full led-emerald" />
                 <span>NO WATERMARK</span>
               </div>
-            )}
+            ))}
           </div>
 
-          <div className="flex gap-3">
-            {/* Thumbnail */}
+          <div className="flex gap-3 items-center">
+            {/* Thumbnail with animated vertical scan line while downloading */}
             <div className="relative w-24 h-24 rounded-lg overflow-hidden bg-slate-950 border border-slate-800 shrink-0">
-              {videoInfo.thumbnail ? (
+              {videoInfo?.thumbnail ? (
                 <img
                   src={videoInfo.thumbnail}
                   alt={videoInfo.title}
@@ -610,16 +743,19 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                 />
               ) : (
                 <div className="w-full h-full flex items-center justify-center text-slate-600">
-                  {videoInfo.type === 'photo' ? <Images className="w-8 h-8" /> : <Film className="w-8 h-8" />}
+                  {videoInfo?.type === 'photo' ? <Images className="w-8 h-8" /> : <Film className="w-8 h-8 text-accent" />}
                 </div>
               )}
-              {videoInfo.duration > 0 && (
-                <span className="absolute bottom-1 right-1 px-1 py-0.2 rounded bg-black/80 font-mono text-[9px] text-white">
+
+              {isDownloading && <div className="scan-line" />}
+
+              {videoInfo && videoInfo.duration > 0 && (
+                <span className="absolute bottom-1 right-1 px-1 py-0.2 rounded bg-black/80 font-mono text-[9px] text-white tabular-nums">
                   {formatDuration(videoInfo.duration)}
                 </span>
               )}
-              {videoInfo.type === 'photo' && videoInfo.imageCount && (
-                <span className="absolute bottom-1 right-1 px-1.5 py-0.5 rounded bg-black/90 font-mono text-[9px] text-purple-300 font-bold border border-purple-500/40">
+              {videoInfo?.type === 'photo' && videoInfo.imageCount && (
+                <span className="absolute bottom-1 right-1 px-1.5 py-0.5 rounded bg-black/90 font-mono text-[9px] text-purple-300 font-bold border border-purple-500/40 tabular-nums">
                   {videoInfo.imageCount}P
                 </span>
               )}
@@ -628,16 +764,16 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             {/* Info details */}
             <div className="flex-1 min-w-0 space-y-1">
               <h5 className="font-mono font-bold text-xs text-white line-clamp-2 leading-snug">
-                {videoInfo.title}
+                {videoInfo?.title || 'Processing remote stream...'}
               </h5>
-              <p className="font-mono text-[11px] text-cyan-400 truncate">
-                @{videoInfo.uploader || 'Creator'}
+              <p className="font-mono text-[11px] text-accent truncate">
+                @{videoInfo?.uploader || 'OmniDrop'}
               </p>
-              <div className="flex items-center gap-2 pt-1 font-mono text-[10px] text-slate-400">
+              <div className="flex items-center gap-2 pt-1 font-mono text-[10px] text-slate-400 whitespace-nowrap">
                 <span className="uppercase px-1.5 py-0.2 rounded bg-slate-950 border border-slate-800 text-slate-300">
-                  {videoInfo.platform}
+                  {videoInfo?.platform || 'STREAM'}
                 </span>
-                {videoInfo.type === 'photo' ? (
+                {videoInfo?.type === 'photo' ? (
                   <span className="text-purple-300 uppercase">PHOTOS ARCHIVE</span>
                 ) : (
                   <span>{selectedQuality.toUpperCase()}</span>
@@ -646,21 +782,33 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             </div>
           </div>
 
-          {/* Segmented Progress Blocks when downloading */}
-          {isDownloading && renderSegmentedProgress()}
+          {/* Segmented Progress + Live Speed Arc Gauge */}
+          {isDownloading && renderDownloadingVisuals()}
         </div>
       )}
 
-      {/* RECENT DOWNLOADS (LAST 3) WITH PLAY BUTTONS */}
-      {recentDownloads && recentDownloads.length > 0 && (
-        <div className="machine-surface rounded-xl p-3.5 space-y-2.5">
-          <div className="flex items-center justify-between pb-1 border-b border-slate-800">
-            <span className="font-mono text-xs font-bold text-slate-300 uppercase tracking-wider">
-              RECENT DOWNLOADS // QUICK PLAY
-            </span>
-            <span className="font-mono text-[10px] text-slate-500">LAST 3</span>
-          </div>
+      {/* RECENT DOWNLOADS (LAST 3) OR UNIFIED EMPTY STATE */}
+      <div
+        className="machine-surface rounded-xl p-3.5 space-y-2.5 stagger-card"
+        style={{ '--stagger': 3 } as React.CSSProperties}
+      >
+        <div className="flex items-center justify-between pb-1 border-b border-slate-800">
+          <span className="font-mono text-xs font-bold text-slate-300 uppercase tracking-wider truncate">
+            RECENT DOWNLOADS // QUICK PLAY
+          </span>
+          <span className="font-mono text-[10px] text-slate-500 whitespace-nowrap tabular-nums">
+            {recentDownloads.length > 0 ? `LAST ${Math.min(3, recentDownloads.length)}` : '0 ITEMS'}
+          </span>
+        </div>
 
+        {recentDownloads.length === 0 ? (
+          <EmptyState
+            compact
+            icon={Film}
+            title="NO RECENT DOWNLOADS"
+            message="Paste a TikTok, YouTube, Instagram, or Facebook link above to get started."
+          />
+        ) : (
           <div className="space-y-2">
             {recentDownloads.slice(0, 3).map((item) => (
               <div
@@ -681,8 +829,8 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                     <h6 className="font-mono text-xs text-white truncate max-w-[200px]">
                       {item.title}
                     </h6>
-                    <div className="font-mono text-[10px] text-slate-400 flex items-center gap-2">
-                      <span className="text-cyan-400 uppercase">{item.platform}</span>
+                    <div className="font-mono text-[10px] text-slate-400 flex items-center gap-2 whitespace-nowrap">
+                      <span className="text-accent uppercase">{item.platform}</span>
                       <span>•</span>
                       <span>{item.quality.toUpperCase()}</span>
                     </div>
@@ -691,100 +839,69 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 
                 <button
                   onClick={() => handlePlayExisting(item.fileUri || item.url, item.title)}
-                  className="machine-btn px-2.5 py-1.5 rounded-md font-mono text-[11px] text-cyan-300 flex items-center gap-1 shrink-0"
+                  className="machine-btn px-2.5 py-1.5 rounded-md font-mono text-[11px] text-accent-soft flex items-center gap-1 shrink-0 whitespace-nowrap"
                 >
-                  <Play className="w-3 h-3 fill-current text-cyan-400" />
+                  <Play className="w-3 h-3 fill-current text-accent" />
                   <span>PLAY</span>
                 </button>
               </div>
             ))}
           </div>
-        </div>
-      )}
-
-      {/* BOTTOM STATUS STRIP: SERVER LED & NET MS */}
-      <div className="machine-surface rounded-lg px-3 py-2 flex items-center justify-between text-xs font-mono">
-        <div className="flex items-center gap-2">
-          <span
-            className={`w-2 h-2 rounded-full ${
-              serverStatus === 'connected'
-                ? serverLatency && serverLatency > 3000
-                  ? 'led-amber'
-                  : 'led-emerald'
-                : serverStatus === 'checking'
-                ? 'led-amber'
-                : 'led-rose'
-            }`}
-          />
-          <span className="text-slate-300">
-            SERVER:{' '}
-            {serverStatus === 'connected'
-              ? serverLatency && serverLatency > 3000
-                ? 'SLEEPING'
-                : 'ONLINE'
-              : serverStatus === 'checking'
-              ? 'PINGING'
-              : 'OFFLINE'}
-          </span>
-        </div>
-
-        <div className="text-slate-400">
-          NET:{' '}
-          <span className="text-cyan-400 font-bold">
-            {serverLatency !== null ? `${serverLatency}ms` : '--'}
-          </span>
-        </div>
+        )}
       </div>
 
       {/* FAILED DOWNLOADS MODAL */}
       {failedModalOpen && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-fade-in">
           <div className="w-full max-w-lg max-h-[85vh] bg-slate-950 border border-red-500/40 rounded-t-2xl sm:rounded-2xl flex flex-col overflow-hidden shadow-[0_0_30px_rgba(239,68,68,0.25)]">
-            {/* Modal Header */}
             <div className="p-4 border-b border-red-500/20 flex items-center justify-between bg-gradient-to-r from-red-950/40 to-slate-950">
-              <div className="flex items-center gap-2">
-                <span className="w-2.5 h-2.5 rounded-full bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.9)]" />
-                <div>
-                  <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-white">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="w-2.5 h-2.5 rounded-full bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.9)] shrink-0" />
+                <div className="min-w-0">
+                  <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-white truncate">
                     FAILED DOWNLOADS // RECOVERY
                   </h3>
-                  <p className="text-[10px] font-mono text-red-400">
+                  <p className="text-[10px] font-mono text-red-400 tabular-nums whitespace-nowrap">
                     {failedLinks.length} failed link{failedLinks.length === 1 ? '' : 's'} recorded
                   </p>
                 </div>
               </div>
               <button
                 onClick={() => setFailedModalOpen(false)}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition"
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition shrink-0"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            {/* Modal Bulk Actions */}
-            <div className="p-3 border-b border-slate-800/80 bg-slate-900/60 flex items-center justify-between gap-2">
-              <button
-                onClick={handleRetryAllFailed}
-                className="machine-btn-primary flex-1 py-1.5 rounded-lg text-xs font-mono font-bold flex items-center justify-center gap-1.5"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                <span>RETRY ALL ({failedLinks.length})</span>
-              </button>
-              <button
-                onClick={handleClearAllFailed}
-                className="machine-btn px-3 py-1.5 rounded-lg text-xs font-mono text-red-400 hover:text-red-300 flex items-center gap-1.5"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                <span>CLEAR ALL</span>
-              </button>
-            </div>
+            {failedLinks.length > 0 && (
+              <div className="p-3 border-b border-slate-800/80 bg-slate-900/60 flex items-center justify-between gap-2">
+                <button
+                  onClick={handleRetryAllFailed}
+                  className="machine-btn-primary flex-1 py-1.5 rounded-lg text-xs font-mono font-bold flex items-center justify-center gap-1.5 whitespace-nowrap tabular-nums"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>RETRY ALL ({failedLinks.length})</span>
+                </button>
+                <button
+                  onClick={handleClearAllFailed}
+                  className="machine-btn px-3 py-1.5 rounded-lg text-xs font-mono text-red-400 hover:text-red-300 flex items-center gap-1.5 whitespace-nowrap"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>CLEAR ALL</span>
+                </button>
+              </div>
+            )}
 
-            {/* Failed Items List */}
             <div className="p-3 overflow-y-auto space-y-2.5 flex-1 max-h-[55vh]">
               {failedLinks.length === 0 ? (
-                <div className="p-8 text-center text-xs font-mono text-slate-500">
-                  NO FAILED LINKS
-                </div>
+                <EmptyState
+                  compact
+                  tone="emerald"
+                  icon={CheckCircle2}
+                  title="NO FAILED LINKS"
+                  message="All queued downloads completed without errors."
+                />
               ) : (
                 failedLinks.map((item) => (
                   <div
@@ -793,12 +910,13 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                   >
                     <div className="flex items-start justify-between gap-2">
                       <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-1.5 mb-1">
+                        <div className="flex items-center gap-1.5 mb-1 whitespace-nowrap">
                           <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-slate-800 text-slate-300 border border-slate-700 uppercase">
                             {item.platform || 'OTHER'}
                           </span>
-                          <span className="text-[10px] font-mono text-slate-500">
-                            {item.attempts > 1 ? `${item.attempts} attempts • ` : ''}{formatFailedTime(item.failedAt)}
+                          <span className="text-[10px] font-mono text-slate-500 tabular-nums">
+                            {item.attempts > 1 ? `${item.attempts} attempts • ` : ''}
+                            {formatFailedTime(item.failedAt)}
                           </span>
                         </div>
                         <h4 className="font-mono text-xs font-bold text-white truncate" title={item.title}>
@@ -810,30 +928,28 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                       </div>
                     </div>
 
-                    {/* Reason in plain words */}
                     <div className="px-2.5 py-1.5 rounded bg-red-950/40 border border-red-500/30 text-red-300 text-[11px] font-mono flex items-center gap-1.5">
                       <AlertCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />
                       <span className="truncate">{item.reason || 'Download failed'}</span>
                     </div>
 
-                    {/* Action Keys: RETRY, COPY LINK and DELETE */}
                     <div className="flex items-center gap-2 pt-1">
                       <button
                         onClick={() => handleRetryFailedItem(item)}
-                        className="machine-btn-primary flex-1 py-1 rounded-md text-xs font-mono font-bold flex items-center justify-center gap-1.5"
+                        className="machine-btn-primary flex-1 py-1 rounded-md text-xs font-mono font-bold flex items-center justify-center gap-1.5 whitespace-nowrap"
                       >
                         <RotateCcw className="w-3 h-3" />
                         <span>RETRY</span>
                       </button>
                       <button
                         onClick={() => handleCopyFailed(item)}
-                        className="machine-btn px-2.5 py-1 rounded-md text-xs font-mono text-slate-300 hover:text-white flex items-center gap-1"
+                        className="machine-btn px-2.5 py-1 rounded-md text-xs font-mono text-slate-300 hover:text-white flex items-center gap-1 whitespace-nowrap"
                         title="Copy link"
                       >
                         {copiedFailedId === item.id ? (
                           <>
-                            <Check className="w-3 h-3 text-cyan-400" />
-                            <span className="text-cyan-400">COPIED</span>
+                            <Check className="w-3 h-3 text-accent" />
+                            <span className="text-accent">COPIED</span>
                           </>
                         ) : (
                           <>
@@ -844,7 +960,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                       </button>
                       <button
                         onClick={() => handleDeleteFailed(item.id)}
-                        className="machine-btn p-1.5 rounded-md text-slate-400 hover:text-red-400"
+                        className="machine-btn p-1.5 rounded-md text-slate-400 hover:text-red-400 shrink-0"
                         title="Delete entry"
                       >
                         <Trash2 className="w-3.5 h-3.5" />

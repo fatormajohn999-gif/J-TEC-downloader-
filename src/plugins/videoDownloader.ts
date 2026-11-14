@@ -108,7 +108,7 @@ export interface VideoDownloaderPlugin {
   ): Promise<PluginListenerHandle>;
   addListener(
     eventName: 'onDownloadProgress',
-    listenerFunc: (data: { percent: number; statusText: string }) => void
+    listenerFunc: (data: { percent: number; statusText: string; speedMb?: number }) => void
   ): Promise<PluginListenerHandle>;
   addListener(
     eventName: 'nativeDownloadFinished',

@@ -1915,26 +1915,31 @@ class VideoDownloaderPlugin : Plugin() {
                 inputStream = connection.inputStream
                 val totalBytes = connection.contentLengthLong
                 var bytesCopied: Long = 0
+                var lastSampleBytes: Long = 0
                 val buffer = ByteArray(8192)
                 var bytesRead: Int
-                var lastProgressReportTime: Long = 0
+                var lastProgressReportTime: Long = System.currentTimeMillis()
 
-                reportProgress(40, "Saving directly to gallery...")
+                reportProgress(40, "Saving directly to gallery...", 0.0)
 
                 while (inputStream.read(buffer).also { bytesRead = it } != -1) {
                     outputStream.write(buffer, 0, bytesRead)
                     bytesCopied += bytesRead
 
                     val now = System.currentTimeMillis()
-                    if (now - lastProgressReportTime > 300) {
+                    val elapsedMs = now - lastProgressReportTime
+                    if (elapsedMs > 300) {
+                        val deltaBytes = bytesCopied - lastSampleBytes
+                        val speedMb = (deltaBytes.toDouble() / (1024.0 * 1024.0)) / (elapsedMs.toDouble() / 1000.0)
                         lastProgressReportTime = now
+                        lastSampleBytes = bytesCopied
                         val pct = if (totalBytes > 0) {
                             (40 + (bytesCopied.toDouble() / totalBytes * 55)).toInt().coerceIn(40, 95)
                         } else {
                             75
                         }
                         val mb = String.format(Locale.US, "%.1f", bytesCopied / (1024.0 * 1024.0))
-                        reportProgress(pct, "Saving to gallery: $mb MB...")
+                        reportProgress(pct, "Saving to gallery: $mb MB...", speedMb)
                     }
                 }
                 outputStream.flush()
@@ -2011,10 +2016,11 @@ class VideoDownloaderPlugin : Plugin() {
         }.start()
     }
 
-    private fun reportProgress(percent: Int, statusText: String) {
+    private fun reportProgress(percent: Int, statusText: String, speedMb: Double = 0.0) {
         val progressObj = JSObject().apply {
             this.put("percent", percent)
             this.put("statusText", statusText)
+            this.put("speedMb", speedMb)
         }
         notifyListeners("onDownloadProgress", progressObj, true)
     }

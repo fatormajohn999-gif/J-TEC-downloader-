@@ -28,28 +28,32 @@ export const ClipboardPromptModal: React.FC<ClipboardPromptModalProps> = ({
       : 'Video';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4 bg-black/75 backdrop-blur-sm animate-fade-in">
-      <div className="w-full max-w-sm rounded-2xl bg-slate-900 border border-slate-800 p-5 shadow-2xl space-y-4">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="p-2 rounded-xl bg-indigo-500/20 text-indigo-400">
-              <Clipboard className="w-5 h-5" />
+    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
+      <div className="machine-surface w-full max-w-sm rounded-xl p-5 shadow-2xl space-y-4">
+        <div className="flex items-center justify-between pb-2 border-b border-accent">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="p-2 rounded-lg bg-accent-soft border border-accent text-accent shrink-0">
+              <Clipboard className="w-4 h-4" />
             </div>
-            <div>
-              <h3 className="text-sm font-semibold text-white">Link Detected in Clipboard</h3>
-              <p className="text-[11px] text-slate-400">Found {platformName} URL</p>
+            <div className="min-w-0">
+              <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider truncate">
+                CLIPBOARD LINK DETECTED
+              </h3>
+              <p className="text-[11px] font-mono text-accent-soft truncate">
+                SOURCE: {platformName.toUpperCase()} URL
+              </p>
             </div>
           </div>
           <button
             onClick={onDismiss}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition"
+            className="p-1.5 rounded-lg text-slate-400 hover:text-white transition shrink-0"
           >
             <X className="w-4 h-4" />
           </button>
         </div>
 
-        <div className="p-3 rounded-xl bg-slate-950/80 border border-slate-800/80 flex items-center gap-2 overflow-hidden">
-          <LinkIcon className="w-4 h-4 text-indigo-400 shrink-0" />
+        <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 flex items-center gap-2 overflow-hidden">
+          <LinkIcon className="w-4 h-4 text-accent shrink-0" />
           <span className="text-xs font-mono text-slate-300 truncate">
             {detectedUrl}
           </span>
@@ -58,16 +62,16 @@ export const ClipboardPromptModal: React.FC<ClipboardPromptModalProps> = ({
         <div className="flex gap-2 pt-1">
           <button
             onClick={onDismiss}
-            className="flex-1 py-2.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition"
+            className="machine-btn flex-1 py-2.5 px-3 rounded-lg text-slate-300 text-xs font-mono uppercase whitespace-nowrap"
           >
-            Ignore
+            IGNORE
           </button>
           <button
             onClick={() => onConfirm(detectedUrl)}
-            className="flex-1 py-2.5 px-3 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white text-xs font-medium flex items-center justify-center gap-1.5 shadow-lg shadow-indigo-600/30 transition"
+            className="machine-btn-primary flex-1 py-2.5 px-3 rounded-lg text-xs font-mono uppercase flex items-center justify-center gap-1.5 whitespace-nowrap"
           >
             <Download className="w-3.5 h-3.5" />
-            Download this link?
+            <span>INGEST LINK</span>
           </button>
         </div>
       </div>

@@ -233,7 +233,7 @@ export async function downloadVideoFile(
   quality: string,
   title: string,
   settings: AppSettings,
-  onProgress?: (percent: number, statusText: string) => void
+  onProgress?: (percent: number, statusText: string, speedMb?: number) => void
 ): Promise<string> {
   const isNative = Capacitor.isNativePlatform();
   const normalized = normalizeUrl(url);
@@ -250,7 +250,7 @@ export async function downloadVideoFile(
     try {
       if (onProgress) {
         progressHandle = await VideoDownloader.addListener('onDownloadProgress', (data) => {
-          onProgress(data.percent, data.statusText);
+          onProgress(data.percent, data.statusText, data.speedMb);
         });
       }
 
@@ -327,6 +327,9 @@ export async function downloadVideoFile(
     if (res.body && totalBytes > 0 && typeof ReadableStream !== 'undefined') {
       const reader = res.body.getReader();
       let receivedBytes = 0;
+      let lastSampleTime = performance.now();
+      let lastSampleBytes = 0;
+      let currentSpeedMb = 0;
       const chunks: Uint8Array[] = [];
 
       while (true) {
@@ -335,8 +338,22 @@ export async function downloadVideoFile(
         if (value) {
           chunks.push(value);
           receivedBytes += value.length;
+          const now = performance.now();
+          const dtSec = (now - lastSampleTime) / 1000;
+          if (dtSec >= 0.25) {
+            const deltaBytes = receivedBytes - lastSampleBytes;
+            currentSpeedMb = deltaBytes / (1024 * 1024) / dtSec;
+            lastSampleTime = now;
+            lastSampleBytes = receivedBytes;
+          }
           const pct = Math.min(95, Math.round(50 + (receivedBytes / totalBytes) * 45));
-          if (onProgress) onProgress(pct, `Transferring: ${(receivedBytes / (1024 * 1024)).toFixed(1)} MB...`);
+          if (onProgress) {
+            onProgress(
+              pct,
+              `Transferring: ${(receivedBytes / (1024 * 1024)).toFixed(1)} MB...`,
+              currentSpeedMb
+            );
+          }
         }
       }
       blob = new Blob(chunks as BlobPart[], {

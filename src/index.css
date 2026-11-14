@@ -1,32 +1,288 @@
 @import "tailwindcss";
 
+:root,
+html[data-accent="cyan"] {
+  --od-bg-canvas: #080b10;
+  --od-bg-surface-top: #0d121c;
+  --od-bg-surface-bot: #080b11;
+  --od-bg-subtle-top: #090e17;
+  --od-bg-subtle-bot: #05080f;
+  --od-bg-btn-top: #172133;
+  --od-bg-btn-bot: #0d1421;
+  --od-bg-input: #020617;
+
+  --od-accent: #00f0ff;
+  --od-accent-soft: #67e8f9;
+  --od-accent-strong: #0099bb;
+  --od-accent-dark: #005063;
+  --od-accent-rgb: 0, 240, 255;
+
+  --od-radius-sm: 0.375rem;
+  --od-radius-md: 0.5rem;
+  --od-radius-lg: 0.75rem;
+  --od-radius-xl: 1rem;
+
+  --od-space-1: 0.25rem;
+  --od-space-2: 0.5rem;
+  --od-space-3: 0.75rem;
+  --od-space-4: 1rem;
+  --od-space-5: 1.25rem;
+
+  --od-border-subtle: rgba(var(--od-accent-rgb), 0.14);
+  --od-border-accent: rgba(var(--od-accent-rgb), 0.24);
+  --od-border-accent-strong: rgba(var(--od-accent-rgb), 0.52);
+
+  --od-glow-accent: 0 0 14px rgba(var(--od-accent-rgb), 0.45);
+  --od-glow-accent-sm: 0 0 8px rgba(var(--od-accent-rgb), 0.55);
+  --od-glow-surface: 0 4px 20px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+html[data-accent="purple"] {
+  --od-accent: #a855f7;
+  --od-accent-soft: #d8b4fe;
+  --od-accent-strong: #7e22ce;
+  --od-accent-dark: #4c1d95;
+  --od-accent-rgb: 168, 85, 247;
+}
+
+html[data-accent="green"] {
+  --od-accent: #10b981;
+  --od-accent-soft: #6ee7b7;
+  --od-accent-strong: #059669;
+  --od-accent-dark: #064e3b;
+  --od-accent-rgb: 16, 185, 129;
+}
+
+html[data-accent="amber"] {
+  --od-accent: #f59e0b;
+  --od-accent-soft: #fcd34d;
+  --od-accent-strong: #d97706;
+  --od-accent-dark: #78350f;
+  --od-accent-rgb: 245, 158, 11;
+}
+
+html[data-accent="red"] {
+  --od-accent: #f43f5e;
+  --od-accent-soft: #fda4af;
+  --od-accent-strong: #be123c;
+  --od-accent-dark: #6b0f27;
+  --od-accent-rgb: 244, 63, 94;
+}
+
+html,
+body {
+  background-color: var(--od-bg-canvas);
+  color: #f1f5f9;
+  overscroll-behavior-y: contain;
+}
+
+/* Global tactile button depression */
+button:not(:disabled):active {
+  transform: translateY(1.5px) scale(0.985);
+}
+
+/* Keyframes */
+@keyframes odFadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes odTabSlideRight {
+  from {
+    opacity: 0;
+    transform: translateX(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes odTabSlideLeft {
+  from {
+    opacity: 0;
+    transform: translateX(-14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes odCardStagger {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes odScanSweep {
+  0% {
+    top: -12%;
+    opacity: 0;
+  }
+  15% {
+    opacity: 0.95;
+  }
+  85% {
+    opacity: 0.95;
+  }
+  100% {
+    top: 108%;
+    opacity: 0;
+  }
+}
+
+/* Reduced motion mode (app setting or OS preference) */
+html.reduce-motion *,
+html.reduce-motion *::before,
+html.reduce-motion *::after {
+  animation-duration: 0.001ms !important;
+  animation-delay: 0ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+}
+
+html.reduce-motion button:not(:disabled):active {
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
 @layer utilities {
+  .animate-fade-in {
+    animation: odFadeIn 180ms ease-out both;
+  }
+
+  .tab-enter-right {
+    animation: odTabSlideRight 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .tab-enter-left {
+    animation: odTabSlideLeft 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .stagger-card {
+    animation: odCardStagger 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    animation-delay: calc(var(--stagger, 0) * 45ms);
+  }
+
+  .scan-line {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      rgba(var(--od-accent-rgb), 0.9) 50%,
+      transparent 100%
+    );
+    box-shadow: 0 0 12px rgba(var(--od-accent-rgb), 0.95), 0 0 4px #ffffff;
+    animation: odScanSweep 1.35s linear infinite;
+    pointer-events: none;
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  /* Accent semantic helpers */
+  .text-accent {
+    color: var(--od-accent);
+  }
+  .text-accent-soft {
+    color: var(--od-accent-soft);
+  }
+  .bg-accent {
+    background-color: var(--od-accent);
+  }
+  .bg-accent-soft {
+    background-color: rgba(var(--od-accent-rgb), 0.16);
+  }
+  .bg-accent-subtle {
+    background-color: rgba(var(--od-accent-rgb), 0.08);
+  }
+  .border-accent {
+    border-color: var(--od-border-accent);
+  }
+  .border-accent-strong {
+    border-color: var(--od-border-accent-strong);
+  }
+  .glow-accent {
+    box-shadow: var(--od-glow-accent);
+  }
+  .glow-accent-sm {
+    box-shadow: var(--od-glow-accent-sm);
+  }
+
   /* Subtle robotic machine grid background */
   .bg-grid-machine {
+    background-color: var(--od-bg-canvas);
     background-size: 24px 24px;
-    background-image: 
-      linear-gradient(to right, rgba(0, 240, 255, 0.04) 1px, transparent 1px),
-      linear-gradient(to bottom, rgba(0, 240, 255, 0.04) 1px, transparent 1px);
+    background-image:
+      linear-gradient(to right, rgba(var(--od-accent-rgb), 0.045) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(var(--od-accent-rgb), 0.045) 1px, transparent 1px);
   }
 
   /* Robotic machine panels */
   .machine-surface {
-    background: linear-gradient(180deg, #0d121c 0%, #080b11 100%);
-    border: 1px solid rgba(0, 240, 255, 0.18);
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    background: linear-gradient(180deg, var(--od-bg-surface-top) 0%, var(--od-bg-surface-bot) 100%);
+    border: 1px solid var(--od-border-accent);
+    box-shadow: var(--od-glow-surface);
   }
 
   .machine-surface-subtle {
-    background: linear-gradient(180deg, #090e17 0%, #05080f 100%);
-    border: 1px solid rgba(0, 240, 255, 0.12);
+    background: linear-gradient(180deg, var(--od-bg-subtle-top) 0%, var(--od-bg-subtle-bot) 100%);
+    border: 1px solid var(--od-border-subtle);
+  }
+
+  .machine-card {
+    background: linear-gradient(180deg, var(--od-bg-surface-top) 0%, var(--od-bg-surface-bot) 100%);
+    border: 1px solid var(--od-border-subtle);
+    box-shadow: var(--od-glow-surface);
+    transition: border-color 150ms ease, transform 120ms ease, box-shadow 150ms ease;
+  }
+
+  .machine-input {
+    background-color: var(--od-bg-input);
+    border: 1px solid #1e293b;
+    color: #f1f5f9;
+    outline: none;
+    transition: border-color 150ms ease, box-shadow 150ms ease;
+  }
+  .machine-input:focus {
+    border-color: var(--od-accent);
+    box-shadow: 0 0 0 1px rgba(var(--od-accent-rgb), 0.45);
   }
 
   /* Bevelled mechanical buttons with pressed tactile animation */
   .machine-btn {
-    background: linear-gradient(180deg, #172133 0%, #0d1421 100%);
-    border: 1px solid rgba(0, 240, 255, 0.28);
+    background: linear-gradient(180deg, var(--od-bg-btn-top) 0%, var(--od-bg-btn-bot) 100%);
+    border: 1px solid rgba(var(--od-accent-rgb), 0.28);
     box-shadow: 0 3px 0 #05080f, 0 5px 12px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.12);
-    transition: all 0.08s ease-in-out;
+    transition: transform 80ms ease-in-out, box-shadow 80ms ease-in-out, border-color 140ms ease, color 140ms ease;
     cursor: pointer;
     user-select: none;
   }
@@ -36,16 +292,16 @@
   }
 
   .machine-btn-primary {
-    background: linear-gradient(180deg, #00e5ff 0%, #0099bb 100%);
-    border: 1px solid #00f0ff;
-    box-shadow: 0 3px 0 #005063, 0 0 14px rgba(0, 240, 255, 0.45);
+    background: linear-gradient(180deg, var(--od-accent) 0%, var(--od-accent-strong) 100%);
+    border: 1px solid var(--od-accent);
+    box-shadow: 0 3px 0 var(--od-accent-dark), 0 0 14px rgba(var(--od-accent-rgb), 0.42);
     color: #030810;
     font-weight: 700;
-    transition: all 0.08s ease-in-out;
+    transition: transform 80ms ease-in-out, box-shadow 80ms ease-in-out, filter 140ms ease;
   }
   .machine-btn-primary:active {
     transform: translateY(2px);
-    box-shadow: 0 1px 0 #005063, 0 0 6px rgba(0, 240, 255, 0.5);
+    box-shadow: 0 1px 0 var(--od-accent-dark), 0 0 6px rgba(var(--od-accent-rgb), 0.5);
   }
 
   .machine-btn-danger {
@@ -53,6 +309,7 @@
     border: 1px solid rgba(244, 63, 94, 0.4);
     box-shadow: 0 3px 0 #120406, 0 4px 10px rgba(0, 0, 0, 0.5);
     color: #fca5a5;
+    transition: transform 80ms ease-in-out, box-shadow 80ms ease-in-out;
   }
   .machine-btn-danger:active {
     transform: translateY(2px);
@@ -60,9 +317,10 @@
   }
 
   /* LED Glows */
+  .led-accent,
   .led-cyan {
-    background-color: #00f0ff;
-    box-shadow: 0 0 8px #00f0ff, 0 0 2px #00f0ff;
+    background-color: var(--od-accent);
+    box-shadow: 0 0 8px var(--od-accent), 0 0 2px var(--od-accent);
   }
   .led-emerald {
     background-color: #10b981;
@@ -72,7 +330,8 @@
     background-color: #f59e0b;
     box-shadow: 0 0 8px #f59e0b, 0 0 2px #f59e0b;
   }
-  .led-rose {
+  .led-rose,
+  .led-red {
     background-color: #f43f5e;
     box-shadow: 0 0 8px #f43f5e, 0 0 2px #f43f5e;
   }

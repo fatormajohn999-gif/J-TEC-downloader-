@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react';
 import {
-  Settings,
   Server,
   Sliders,
   CheckCircle2,
@@ -9,25 +8,22 @@ import {
   Layers,
   HardDrive,
   Trash2,
-  Shield,
   RefreshCw,
-  ExternalLink,
   Cpu,
   ArrowDownToLine,
-  PackageCheck,
   AlertTriangle,
   X,
   Sparkles,
   Activity,
+  Palette,
 } from 'lucide-react';
-import { AppSettings, AppUpdateInfo, UpdateProgressEvent } from '../types';
+import { AccentTheme, AppSettings, AppUpdateInfo, UpdateProgressEvent } from '../types';
 import { checkServerHealth } from '../services/api';
 import { VideoDownloader } from '../plugins/videoDownloader';
 import {
   checkForAppUpdate,
   getLastUpdateCheckTime,
   setSkippedUpdateVersion,
-  getSkippedUpdateVersion,
   getCachedUpdateInfo,
 } from '../services/updateService';
 import { Capacitor } from '@capacitor/core';
@@ -39,6 +35,14 @@ interface SettingsScreenProps {
   onUpdateAvailableChange?: (available: boolean) => void;
 }
 
+const ACCENT_OPTIONS: Array<{ id: AccentTheme; label: string; dotColor: string; dotGlow: string }> = [
+  { id: 'cyan', label: 'CYAN', dotColor: '#00f0ff', dotGlow: '0 0 8px #00f0ff' },
+  { id: 'purple', label: 'PURPLE', dotColor: '#a855f7', dotGlow: '0 0 8px #a855f7' },
+  { id: 'green', label: 'GREEN', dotColor: '#10b981', dotGlow: '0 0 8px #10b981' },
+  { id: 'amber', label: 'AMBER', dotColor: '#f59e0b', dotGlow: '0 0 8px #f59e0b' },
+  { id: 'red', label: 'RED', dotColor: '#f43f5e', dotGlow: '0 0 8px #f43f5e' },
+];
+
 export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   settings,
   onUpdateSettings,
@@ -46,6 +50,10 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   onUpdateAvailableChange,
 }) => {
   const isNative = Capacitor.isNativePlatform();
+
+  // Appearance state
+  const [accentColor, setAccentColor] = useState<AccentTheme>(settings.accentColor || 'cyan');
+  const [reduceAnimations, setReduceAnimations] = useState<boolean>(Boolean(settings.reduceAnimations));
 
   // Settings state
   const [backendUrl, setBackendUrl] = useState(settings.backendUrl || '');
@@ -63,7 +71,6 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   const [floatingAutoClear, setFloatingAutoClear] = useState(settings.floatingAutoClear ?? true);
   const [floatingVibrate, setFloatingVibrate] = useState(settings.floatingVibrate ?? true);
   const [floatingHideInsideApp, setFloatingHideInsideApp] = useState(settings.floatingHideInsideApp ?? true);
-  const [hasOverlayPerm, setHasOverlayPerm] = useState<boolean>(false);
   const [tabServiceStatus, setTabServiceStatus] = useState<'RUNNING' | 'STOPPED' | 'NO PERMISSION'>('STOPPED');
   const [isTestingTab, setIsTestingTab] = useState<boolean>(false);
   const [isAddingTile, setIsAddingTile] = useState<boolean>(false);
@@ -106,7 +113,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     formattedMb: '0 MB',
   });
 
-  // Dark robotic modal state (replaces window.alert / confirm)
+  // Dark robotic modal state
   const [modalState, setModalState] = useState<{
     isOpen: boolean;
     title: string;
@@ -142,11 +149,9 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     } catch {}
   };
 
-  // Check overlay permission & tab service running status
   const refreshTabServiceStatus = async () => {
     try {
       const perm = await VideoDownloader.hasOverlayPermission();
-      setHasOverlayPerm(perm.granted);
       if (!perm.granted) {
         setTabServiceStatus('NO PERMISSION');
         return;
@@ -160,11 +165,6 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     }
   };
 
-  const checkOverlayPermission = async () => {
-    await refreshTabServiceStatus();
-  };
-
-  // Check storage size
   const loadStorageStats = async () => {
     try {
       const res = await VideoDownloader.getVideoLibrary();
@@ -176,9 +176,8 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     } catch {}
   };
 
-  // Load app version and perform initial update check, and sync with native tile on resume
   useEffect(() => {
-    checkOverlayPermission();
+    refreshTabServiceStatus();
     loadStorageStats();
     refreshKeepAliveStatus();
 
@@ -190,7 +189,6 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       })
       .catch(() => {});
 
-    // Initial check (cached/throttled to 1 hour unless forced)
     performUpdateCheck(false);
 
     const handleResume = () => {
@@ -326,6 +324,8 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       floatingVibrate,
       floatingHideInsideApp,
       autoCheckUpdates,
+      accentColor,
+      reduceAnimations,
       ...overrides,
     };
     onUpdateSettings(updated);
@@ -345,6 +345,17 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       floatingHideInsideApp: overrides?.floatingHideInsideApp ?? floatingHideInsideApp,
       autoCheckUpdates: overrides?.autoCheckUpdates ?? autoCheckUpdates,
     }).catch(() => {});
+  };
+
+  const handleAccentChange = (theme: AccentTheme) => {
+    setAccentColor(theme);
+    persistSettings({ accentColor: theme });
+  };
+
+  const handleReduceAnimationsToggle = () => {
+    const next = !reduceAnimations;
+    setReduceAnimations(next);
+    persistSettings({ reduceAnimations: next });
   };
 
   const handleSave = () => {
@@ -388,12 +399,13 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         setModalState({
           isOpen: true,
           title: 'ADD TO QUICK SETTINGS',
-          message: 'To add the OmniDrop Tab tile manually on your device:\n\n1. Pull down your notification bar twice to expand full Quick Settings.\n2. Tap the edit button (the pencil ✎ icon or the three-dot ⋮ menu).\n3. Find "OmniDrop Tab" in the available tile list.\n4. Drag "OmniDrop Tab" up into your active quick tile grid.',
+          message:
+            'To add the OmniDrop Tab tile manually on your device:\n\n1. Pull down your notification bar twice to expand full Quick Settings.\n2. Tap the edit button (the pencil ✎ icon or the three-dot ⋮ menu).\n3. Find "OmniDrop Tab" in the available tile list.\n4. Drag "OmniDrop Tab" up into your active quick tile grid.',
           actionLabel: 'GOT IT',
           onAction: () => setModalState((prev) => ({ ...prev, isOpen: false })),
         });
       }
-    } catch (e: any) {
+    } catch {
       setModalState({
         isOpen: true,
         title: 'MANUAL SETUP',
@@ -417,7 +429,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     const res = await checkServerHealth(tempSettings);
     if (res.ok) {
       setTestStatus('success');
-      setTestResult(`ONLINE • Response time: ${res.latencyMs}ms`);
+      setTestResult(`ONLINE • ${res.latencyMs}ms`);
     } else {
       setTestStatus('error');
       setTestResult(`FAILED • ${res.error || 'Server unreachable'}`);
@@ -456,11 +468,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
           }
           setIsBubbleActive(true);
           setTabServiceStatus('RUNNING');
-          const updated = {
-            ...settings,
-            floatingBubbleEnabled: true,
-          };
-          onUpdateSettings(updated);
+          onUpdateSettings({ ...settings, floatingBubbleEnabled: true });
 
           setModalState({
             isOpen: true,
@@ -483,11 +491,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         await VideoDownloader.stopBubble();
         setIsBubbleActive(false);
         setTabServiceStatus('STOPPED');
-        const updated = {
-          ...settings,
-          floatingBubbleEnabled: false,
-        };
-        onUpdateSettings(updated);
+        onUpdateSettings({ ...settings, floatingBubbleEnabled: false });
       }
       refreshKeepAliveStatus();
     } catch (e: any) {
@@ -569,7 +573,6 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     return new Date(timeMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
   };
 
-  // Reusable mechanical toggle switch with LED
   const renderMechanicalToggle = (
     label: string,
     sublabel: string,
@@ -586,13 +589,13 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         <button
           onClick={onChange}
           className={`machine-btn relative w-12 h-6.5 rounded-full p-0.5 flex items-center transition-all duration-200 shrink-0 ${
-            checked ? 'border-cyan-400 bg-cyan-950/60' : 'border-slate-700 bg-slate-950'
+            checked ? 'border-accent-strong bg-accent-soft' : 'border-slate-700 bg-slate-950'
           }`}
         >
           <div
             className={`w-5 h-5 rounded-full flex items-center justify-center transition-all duration-200 transform ${
               checked
-                ? 'translate-x-5.5 bg-cyan-400 led-cyan text-slate-950 shadow-[0_0_8px_rgba(0,240,255,0.8)]'
+                ? 'translate-x-5.5 bg-accent led-accent text-slate-950'
                 : 'translate-x-0 bg-slate-700 text-slate-400'
             }`}
           >
@@ -606,42 +609,101 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   return (
     <div className="space-y-4 pb-28">
       {/* Top Header & Mechanical Save Key */}
-      <div className="flex items-center justify-between pt-1">
-        <div>
-          <h2 className="text-xs font-mono font-bold text-cyan-400 uppercase tracking-widest flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full led-cyan" />
+      <div className="flex items-center justify-between pt-1 gap-2">
+        <div className="min-w-0">
+          <h2 className="text-xs font-mono font-bold text-accent uppercase tracking-widest flex items-center gap-2 whitespace-nowrap">
+            <span className="w-2 h-2 rounded-full led-accent shrink-0" />
             SETTINGS // CONTROL
           </h2>
-          <p className="text-xs text-slate-400 mt-0.5">Hardware preferences & firmware configuration</p>
+          <p className="text-xs text-slate-400 mt-0.5 truncate">Hardware preferences & firmware configuration</p>
         </div>
 
-        {/* Mechanical Bevelled Save Key */}
         <button
           onClick={handleSave}
-          className={`machine-btn px-4 py-1.5 rounded-lg font-mono text-xs font-bold uppercase tracking-wider transition-all duration-200 ${
+          className={`machine-btn px-4 py-1.5 rounded-lg font-mono text-xs font-bold uppercase tracking-wider transition-all duration-200 shrink-0 whitespace-nowrap ${
             isSaved
-              ? 'machine-btn-primary bg-emerald-500 border-emerald-400 text-slate-950 shadow-[0_0_12px_rgba(16,185,129,0.8)]'
-              : 'text-cyan-300'
+              ? 'bg-emerald-500 border-emerald-400 text-slate-950 shadow-[0_0_12px_rgba(16,185,129,0.8)]'
+              : 'text-accent-soft'
           }`}
         >
           {isSaved ? 'SAVED' : 'SAVE'}
         </button>
       </div>
 
-      {/* 0. APP UPDATE // FIRMWARE (TOP PANEL) */}
-      <div className="machine-surface rounded-xl p-4 space-y-3.5 border border-cyan-500/30">
-        <div className="flex items-center justify-between pb-2 border-b border-cyan-500/20">
+      {/* 0. APPEARANCE // THEME & MOTION */}
+      <div
+        className="machine-surface rounded-xl p-4 space-y-3 stagger-card"
+        style={{ '--stagger': 0 } as React.CSSProperties}
+      >
+        <div className="flex items-center justify-between pb-2 border-b border-accent">
           <div className="flex items-center gap-2">
-            <Cpu className="w-4 h-4 text-cyan-400" />
+            <Palette className="w-4 h-4 text-accent" />
             <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
+              APPEARANCE // DISPLAY
+            </h3>
+          </div>
+          <span className="font-mono text-[10px] text-accent-soft uppercase whitespace-nowrap">
+            {accentColor.toUpperCase()}
+          </span>
+        </div>
+
+        <div className="space-y-3">
+          <div>
+            <div className="text-[10px] font-mono text-slate-400 uppercase tracking-wider mb-1.5">
+              ACCENT COLOR
+            </div>
+            <div className="grid grid-cols-5 gap-1.5">
+              {ACCENT_OPTIONS.map((opt) => {
+                const isSelected = accentColor === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    onClick={() => handleAccentChange(opt.id)}
+                    className={`py-2 px-1 rounded-lg flex flex-col items-center justify-center gap-1.5 font-mono text-[10px] font-bold transition-all whitespace-nowrap ${
+                      isSelected
+                        ? 'bg-slate-950 border-accent-strong border glow-accent-sm text-white'
+                        : 'machine-btn text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <span
+                      className="w-3 h-3 rounded-full shrink-0"
+                      style={{
+                        backgroundColor: opt.dotColor,
+                        boxShadow: isSelected ? opt.dotGlow : 'none',
+                      }}
+                    />
+                    <span>{opt.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {renderMechanicalToggle(
+            'REDUCE ANIMATIONS',
+            'Disable boot splash, page slides, stagger effects, and scan sweep',
+            reduceAnimations,
+            handleReduceAnimationsToggle
+          )}
+        </div>
+      </div>
+
+      {/* 1. APP UPDATE // FIRMWARE */}
+      <div
+        className="machine-surface rounded-xl p-4 space-y-3.5 border border-accent stagger-card"
+        style={{ '--stagger': 1 } as React.CSSProperties}
+      >
+        <div className="flex items-center justify-between gap-2 pb-2 border-b border-accent">
+          <div className="flex items-center gap-2 min-w-0">
+            <Cpu className="w-4 h-4 text-accent shrink-0" />
+            <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider truncate">
               APP UPDATE // FIRMWARE
             </h3>
           </div>
-          {/* Status Indicator LED & Label */}
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 shrink-0 whitespace-nowrap">
             {updateStatus === 'checking' && (
-              <div className="flex items-center gap-1.5 font-mono text-[11px] text-cyan-300">
-                <span className="w-2 h-2 rounded-full led-cyan animate-pulse" />
+              <div className="flex items-center gap-1.5 font-mono text-[11px] text-accent-soft">
+                <span className="w-2 h-2 rounded-full led-accent animate-pulse" />
                 <span>CHECKING...</span>
               </div>
             )}
@@ -659,21 +721,21 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             )}
             {updateStatus === 'error' && (
               <div className="flex items-center gap-1.5 font-mono text-[11px] text-rose-300">
-                <span className="w-2 h-2 rounded-full led-red" />
+                <span className="w-2 h-2 rounded-full led-rose" />
                 <span>ERROR</span>
               </div>
             )}
           </div>
         </div>
 
-        {/* Current Firmware Status & Check Key */}
         <div className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-lg bg-slate-950 border border-slate-800 font-mono text-xs">
-          <div>
+          <div className="min-w-0">
             <div className="text-slate-400 text-[10px] uppercase tracking-wider">INSTALLED FIRMWARE</div>
-            <div className="text-white font-bold text-sm tracking-wide mt-0.5">
-              v1.0.{installedVersion.versionCode} <span className="text-slate-500 text-xs">({installedVersion.versionName})</span>
+            <div className="text-white font-bold text-sm tracking-wide mt-0.5 tabular-nums whitespace-nowrap">
+              v1.0.{installedVersion.versionCode}{' '}
+              <span className="text-slate-500 text-xs">({installedVersion.versionName})</span>
             </div>
-            <div className="text-[10px] text-slate-500 mt-0.5">
+            <div className="text-[10px] text-slate-500 mt-0.5 whitespace-nowrap">
               Last checked: <span className="text-slate-300">{formatLastChecked(lastCheckedTime)}</span>
             </div>
           </div>
@@ -681,18 +743,17 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
           <button
             onClick={() => performUpdateCheck(true)}
             disabled={updateStatus === 'checking' || isDownloadingUpdate}
-            className="machine-btn px-3 py-1.5 rounded-lg text-xs font-mono text-cyan-300 flex items-center gap-1.5 shrink-0 hover:border-cyan-400 active:scale-95 transition-all"
+            className="machine-btn px-3 py-1.5 rounded-lg text-xs font-mono text-accent-soft flex items-center gap-1.5 shrink-0 hover:border-accent whitespace-nowrap"
           >
             {updateStatus === 'checking' ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin text-cyan-400" />
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-accent" />
             ) : (
-              <RefreshCw className="w-3.5 h-3.5 text-cyan-400" />
+              <RefreshCw className="w-3.5 h-3.5 text-accent" />
             )}
             <span>CHECK FOR UPDATES</span>
           </button>
         </div>
 
-        {/* Error message box if check failed */}
         {updateStatus === 'error' && updateErrorMessage && (
           <div className="p-2.5 rounded-lg bg-rose-950/40 border border-rose-500/40 text-rose-300 font-mono text-xs flex items-start gap-2">
             <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
@@ -700,22 +761,20 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
           </div>
         )}
 
-        {/* Update Available Box */}
-        {updateInfo && updateInfo.versionCode > installedVersion.versionCode && (
+        {updateInfo && updateInfo.versionCode > installedVersion.versionCode && Boolean(updateInfo.downloadUrl) && (
           <div className="p-3.5 rounded-xl bg-slate-900/90 border border-amber-500/40 space-y-3 shadow-[0_0_15px_rgba(245,158,11,0.15)]">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className="w-2.5 h-2.5 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(245,158,11,0.9)] animate-pulse" />
-                <span className="font-mono text-xs font-bold text-white uppercase tracking-wider">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="w-2.5 h-2.5 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(245,158,11,0.9)] animate-pulse shrink-0" />
+                <span className="font-mono text-xs font-bold text-white uppercase tracking-wider truncate">
                   NEW VERSION: <span className="text-amber-300">{updateInfo.tagName}</span>
                 </span>
               </div>
-              <span className="font-mono text-[11px] px-2 py-0.5 rounded bg-slate-950 border border-slate-700 text-cyan-300 font-bold">
+              <span className="font-mono text-[11px] px-2 py-0.5 rounded bg-slate-950 border border-slate-700 text-accent-soft font-bold tabular-nums whitespace-nowrap shrink-0">
                 {updateInfo.sizeBytes > 0 ? `${(updateInfo.sizeBytes / (1024 * 1024)).toFixed(1)} MB` : 'APK'}
               </span>
             </div>
 
-            {/* Release notes scrollbox */}
             <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 max-h-36 overflow-y-auto font-mono text-[11px] text-slate-300 whitespace-pre-wrap leading-relaxed select-text">
               <div className="text-[10px] text-slate-500 mb-1 tracking-wider uppercase font-bold flex items-center gap-1.5">
                 <Sparkles className="w-3 h-3 text-amber-400" />
@@ -724,29 +783,25 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               {updateInfo.releaseNotes}
             </div>
 
-            {/* Downloading segmented progress indicator */}
             {isDownloadingUpdate && (
               <div className="space-y-1.5 pt-1">
                 <div className="flex items-center justify-between font-mono text-[11px]">
-                  <span className="text-cyan-300 font-bold flex items-center gap-1.5">
-                    <Loader2 className="w-3 h-3 animate-spin text-cyan-400" />
+                  <span className="text-accent-soft font-bold flex items-center gap-1.5 whitespace-nowrap">
+                    <Loader2 className="w-3 h-3 animate-spin text-accent" />
                     <span>DOWNLOADING FIRMWARE...</span>
                   </span>
-                  <span className="text-cyan-400 font-bold">
+                  <span className="text-accent font-bold tabular-nums whitespace-nowrap">
                     {downloadProgress.percent}% <span className="text-slate-400">({downloadProgress.formattedMb})</span>
                   </span>
                 </div>
-                {/* 20 segmented blocks */}
-                <div className="grid grid-cols-20 gap-1 h-3.5 bg-slate-950 p-0.5 rounded border border-cyan-500/30">
+                <div className="grid grid-cols-20 gap-1 h-3.5 bg-slate-950 p-0.5 rounded border border-accent">
                   {Array.from({ length: 20 }).map((_, idx) => {
                     const active = (idx / 20) * 100 < downloadProgress.percent;
                     return (
                       <div
                         key={idx}
                         className={`h-full rounded-sm transition-all duration-100 ${
-                          active
-                            ? 'bg-cyan-400 shadow-[0_0_6px_rgba(0,240,255,0.8)]'
-                            : 'bg-slate-900 border border-slate-800/80'
+                          active ? 'bg-accent glow-accent-sm' : 'bg-slate-900 border border-slate-800/80'
                         }`}
                       />
                     );
@@ -755,12 +810,11 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               </div>
             )}
 
-            {/* Action buttons */}
             <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
               <button
                 onClick={handleStartDownloadUpdate}
                 disabled={isDownloadingUpdate}
-                className="machine-btn-primary px-4 py-2 rounded-lg font-mono text-xs font-bold text-slate-950 flex items-center justify-center gap-2 flex-1 hover:brightness-110 active:scale-95 transition-all shadow-[0_0_12px_rgba(0,240,255,0.5)]"
+                className="machine-btn-primary px-4 py-2 rounded-lg font-mono text-xs font-bold text-slate-950 flex items-center justify-center gap-2 flex-1 hover:brightness-110 whitespace-nowrap"
               >
                 {isDownloadingUpdate ? (
                   <Loader2 className="w-4 h-4 animate-spin text-slate-950" />
@@ -773,7 +827,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               {!isDownloadingUpdate && !isSkipped && (
                 <button
                   onClick={handleSkipVersion}
-                  className="px-3 py-1.5 font-mono text-[11px] text-slate-400 hover:text-amber-400 underline underline-offset-2 transition-colors"
+                  className="px-3 py-1.5 font-mono text-[11px] text-slate-400 hover:text-amber-400 underline underline-offset-2 transition-colors whitespace-nowrap"
                 >
                   Skip this version
                 </button>
@@ -788,7 +842,6 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
           </div>
         )}
 
-        {/* Auto check toggle */}
         <div className="pt-1">
           {renderMechanicalToggle(
             'CHECK FOR UPDATES AUTOMATICALLY',
@@ -797,32 +850,19 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             () => {
               const next = !autoCheckUpdates;
               setAutoCheckUpdates(next);
-              const updated = { ...settings, autoCheckUpdates: next };
-              onUpdateSettings(updated);
-              VideoDownloader.saveNativeSettings({
-                backendUrl: backendUrl.trim(),
-                apiKey: apiKey.trim(),
-                defaultQuality,
-                autoDownload: true,
-                autoDownloadOnPaste,
-                autoPlayNext,
-                repeatMode,
-                floatingSide,
-                floatingShowMs,
-                floatingAutoClear,
-                floatingVibrate,
-                floatingHideInsideApp,
-                autoCheckUpdates: next,
-              }).catch(() => {});
+              persistSettings({ autoCheckUpdates: next });
             }
           )}
         </div>
       </div>
 
-      {/* 1. SERVER // CONFIG */}
-      <div className="machine-surface rounded-xl p-4 space-y-3">
-        <div className="flex items-center gap-2 pb-2 border-b border-cyan-500/20">
-          <Server className="w-4 h-4 text-cyan-400" />
+      {/* 2. SERVER // CONFIG */}
+      <div
+        className="machine-surface rounded-xl p-4 space-y-3 stagger-card"
+        style={{ '--stagger': 2 } as React.CSSProperties}
+      >
+        <div className="flex items-center gap-2 pb-2 border-b border-accent">
+          <Server className="w-4 h-4 text-accent" />
           <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
             SERVER // CONFIG
           </h3>
@@ -861,11 +901,11 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             </p>
           </div>
 
-          <div className="flex items-center justify-between pt-1">
+          <div className="flex items-center justify-between pt-1 gap-2">
             <button
               onClick={handleTestConnection}
               disabled={testStatus === 'testing'}
-              className="machine-btn px-3 py-1.5 rounded-lg text-xs font-mono text-cyan-300 flex items-center gap-1.5"
+              className="machine-btn px-3 py-1.5 rounded-lg text-xs font-mono text-accent-soft flex items-center gap-1.5 whitespace-nowrap shrink-0"
             >
               {testStatus === 'testing' ? (
                 <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -876,15 +916,15 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             </button>
 
             {testStatus === 'success' && (
-              <span className="font-mono text-xs text-emerald-400 flex items-center gap-1">
-                <CheckCircle2 className="w-3.5 h-3.5" />
+              <span className="font-mono text-xs text-emerald-400 flex items-center gap-1 tabular-nums whitespace-nowrap">
+                <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
                 {testResult}
               </span>
             )}
 
             {testStatus === 'error' && (
-              <span className="font-mono text-xs text-rose-400 flex items-center gap-1">
-                <AlertCircle className="w-3.5 h-3.5" />
+              <span className="font-mono text-xs text-rose-400 flex items-center gap-1 truncate">
+                <AlertCircle className="w-3.5 h-3.5 shrink-0" />
                 {testResult}
               </span>
             )}
@@ -892,10 +932,13 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         </div>
       </div>
 
-      {/* 2. MEDIA // PREFERENCES */}
-      <div className="machine-surface rounded-xl p-4 space-y-3">
-        <div className="flex items-center gap-2 pb-2 border-b border-cyan-500/20">
-          <Sliders className="w-4 h-4 text-cyan-400" />
+      {/* 3. MEDIA // PREFERENCES */}
+      <div
+        className="machine-surface rounded-xl p-4 space-y-3 stagger-card"
+        style={{ '--stagger': 3 } as React.CSSProperties}
+      >
+        <div className="flex items-center gap-2 pb-2 border-b border-accent">
+          <Sliders className="w-4 h-4 text-accent" />
           <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
             MEDIA // PREFERENCES
           </h3>
@@ -957,10 +1000,13 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         </div>
       </div>
 
-      {/* 3. FLOATING EDGE TAB // DRAWER */}
-      <div className="machine-surface rounded-xl p-4 space-y-3">
-        <div className="flex items-center gap-2 pb-2 border-b border-cyan-500/20">
-          <Layers className="w-4 h-4 text-cyan-400" />
+      {/* 4. FLOATING EDGE TAB // DRAWER */}
+      <div
+        className="machine-surface rounded-xl p-4 space-y-3 stagger-card"
+        style={{ '--stagger': 4 } as React.CSSProperties}
+      >
+        <div className="flex items-center gap-2 pb-2 border-b border-accent">
+          <Layers className="w-4 h-4 text-accent" />
           <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
             FLOATING EDGE TAB // DRAWER
           </h3>
@@ -1009,10 +1055,9 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             () => setFloatingHideInsideApp(!floatingHideInsideApp)
           )}
 
-          {/* Service Status LED & Test Tab Key */}
-          <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-between">
+          <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-between gap-2">
             <div className="min-w-0 pr-2">
-              <div className="font-mono text-xs text-white uppercase font-bold flex items-center gap-2">
+              <div className="font-mono text-xs text-white uppercase font-bold flex items-center gap-2 whitespace-nowrap">
                 <span
                   className={`w-2.5 h-2.5 rounded-full shrink-0 ${
                     tabServiceStatus === 'RUNNING'
@@ -1037,7 +1082,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               {tabServiceStatus === 'NO PERMISSION' ? (
                 <button
                   onClick={handleGrantOverlay}
-                  className="machine-btn px-2.5 py-1 rounded text-[11px] font-mono text-cyan-300 font-bold"
+                  className="machine-btn px-2.5 py-1 rounded text-[11px] font-mono text-accent-soft font-bold whitespace-nowrap"
                 >
                   GRANT ACCESS
                 </button>
@@ -1045,11 +1090,11 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                 <button
                   onClick={handleTestTabNow}
                   disabled={isTestingTab || tabServiceStatus !== 'RUNNING'}
-                  className={`machine-btn px-3 py-1.5 rounded-lg text-xs font-mono font-bold transition-all duration-200 ${
+                  className={`machine-btn px-3 py-1.5 rounded-lg text-xs font-mono font-bold transition-all duration-200 whitespace-nowrap ${
                     isTestingTab
-                      ? 'machine-btn-primary bg-cyan-500 border-cyan-400 text-slate-950 shadow-[0_0_12px_rgba(0,240,255,0.8)]'
+                      ? 'machine-btn-primary text-slate-950 glow-accent'
                       : tabServiceStatus === 'RUNNING'
-                      ? 'text-cyan-300 border-cyan-500/40 hover:border-cyan-400'
+                      ? 'text-accent-soft border-accent hover:border-accent-strong'
                       : 'text-slate-600 border-slate-800 cursor-not-allowed opacity-50'
                   }`}
                 >
@@ -1059,11 +1104,10 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             </div>
           </div>
 
-          {/* Quick Settings Tile Action */}
-          <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-between">
+          <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-between gap-2">
             <div className="min-w-0 pr-2">
-              <div className="font-mono text-xs text-white uppercase font-bold flex items-center gap-2">
-                <Sliders className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+              <div className="font-mono text-xs text-white uppercase font-bold flex items-center gap-2 whitespace-nowrap">
+                <Sliders className="w-3.5 h-3.5 text-accent shrink-0" />
                 <span>QUICK SETTINGS TILE</span>
               </div>
               <div className="text-[11px] text-slate-400 mt-0.5">
@@ -1074,7 +1118,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             <button
               onClick={handleAddToQuickSettings}
               disabled={isAddingTile}
-              className="machine-btn px-3 py-1.5 rounded-lg text-xs font-mono font-bold text-cyan-300 border-cyan-500/40 hover:border-cyan-400 shrink-0"
+              className="machine-btn px-3 py-1.5 rounded-lg text-xs font-mono font-bold text-accent-soft border-accent hover:border-accent-strong shrink-0 whitespace-nowrap"
             >
               {isAddingTile ? 'ADDING...' : 'ADD TO QUICK SETTINGS'}
             </button>
@@ -1082,12 +1126,15 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         </div>
       </div>
 
-      {/* 3B. SERVER KEEP-ALIVE (READ-ONLY CARD TIED TO FLOATING TAB) */}
-      <div className="machine-surface rounded-xl p-4 space-y-3">
-        <div className="flex items-center justify-between gap-2 pb-2 border-b border-cyan-500/20">
+      {/* 4B. SERVER KEEP-ALIVE (READ-ONLY CARD TIED TO FLOATING TAB) */}
+      <div
+        className="machine-surface rounded-xl p-4 space-y-3 stagger-card"
+        style={{ '--stagger': 5 } as React.CSSProperties}
+      >
+        <div className="flex items-center justify-between gap-2 pb-2 border-b border-accent">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <Activity className="w-4 h-4 text-cyan-400 shrink-0" />
+              <Activity className="w-4 h-4 text-accent shrink-0" />
               <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider truncate">
                 SERVER KEEP-ALIVE
               </h3>
@@ -1097,7 +1144,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             </p>
           </div>
 
-          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-slate-950 border border-slate-800 font-mono text-[11px] font-bold shrink-0">
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-slate-950 border border-slate-800 font-mono text-[11px] font-bold shrink-0 whitespace-nowrap">
             <span
               className={`w-2 h-2 rounded-full ${
                 keepAliveStatus.isRunning ? 'led-emerald animate-pulse' : 'bg-slate-600'
@@ -1112,7 +1159,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         <div className="grid grid-cols-2 gap-2 font-mono text-xs">
           <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800">
             <div className="text-[10px] text-slate-500 uppercase">LAST PING</div>
-            <div className="text-white font-bold mt-0.5 truncate">
+            <div className="text-white font-bold mt-0.5 truncate tabular-nums">
               {keepAliveStatus.lastPingStatus === 'WAKING'
                 ? 'Waking...'
                 : keepAliveStatus.lastPingTime > 0
@@ -1131,7 +1178,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
 
           <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800">
             <div className="text-[10px] text-slate-500 uppercase">NEXT PING</div>
-            <div className="text-cyan-300 font-bold mt-0.5 truncate">
+            <div className="text-accent-soft font-bold mt-0.5 truncate tabular-nums">
               {keepAliveStatus.isRunning && keepAliveStatus.nextPingTime > 0
                 ? formatKeepAliveClock(keepAliveStatus.nextPingTime)
                 : '—'}
@@ -1140,12 +1187,12 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
 
           <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800">
             <div className="text-[10px] text-slate-500 uppercase">PINGS TODAY</div>
-            <div className="text-white font-bold mt-0.5">{keepAliveStatus.pingsToday}</div>
+            <div className="text-white font-bold mt-0.5 tabular-nums">{keepAliveStatus.pingsToday}</div>
           </div>
 
           <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800">
             <div className="text-[10px] text-slate-500 uppercase">EST. RENDER HOURS</div>
-            <div className="text-emerald-300 font-bold mt-0.5">
+            <div className="text-emerald-300 font-bold mt-0.5 tabular-nums whitespace-nowrap">
               {keepAliveStatus.estimatedHoursThisMonth.toFixed(1)}h{' '}
               <span className="text-[10px] text-slate-500 font-normal">this month</span>
             </div>
@@ -1153,19 +1200,22 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         </div>
       </div>
 
-      {/* 4. STORAGE // CACHE CONTROL */}
-      <div className="machine-surface rounded-xl p-4 space-y-3">
-        <div className="flex items-center gap-2 pb-2 border-b border-cyan-500/20">
-          <HardDrive className="w-4 h-4 text-cyan-400" />
+      {/* 5. STORAGE // CACHE CONTROL */}
+      <div
+        className="machine-surface rounded-xl p-4 space-y-3 stagger-card"
+        style={{ '--stagger': 6 } as React.CSSProperties}
+      >
+        <div className="flex items-center gap-2 pb-2 border-b border-accent">
+          <HardDrive className="w-4 h-4 text-accent" />
           <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
             STORAGE // CACHE CONTROL
           </h3>
         </div>
 
         <div className="space-y-3">
-          <div className="flex items-center justify-between p-3 rounded-lg bg-slate-950 border border-slate-800 font-mono text-xs">
-            <span className="text-slate-400">TOTAL GALLERY USAGE:</span>
-            <span className="text-cyan-300 font-bold">
+          <div className="flex items-center justify-between gap-2 p-3 rounded-lg bg-slate-950 border border-slate-800 font-mono text-xs">
+            <span className="text-slate-400 truncate">TOTAL GALLERY USAGE:</span>
+            <span className="text-accent-soft font-bold tabular-nums whitespace-nowrap shrink-0">
               {librarySizeMb > 1024
                 ? `${(librarySizeMb / 1024).toFixed(2)} GB`
                 : `${librarySizeMb} MB`}{' '}
@@ -1173,7 +1223,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             </span>
           </div>
 
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between gap-2">
             <div className="min-w-0 pr-2">
               <div className="font-mono text-xs text-white uppercase font-bold">
                 METADATA & THUMBNAILS
@@ -1186,7 +1236,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             <button
               onClick={handleClearMetadataCache}
               disabled={isClearingCache}
-              className="machine-btn px-3 py-1.5 rounded-lg text-xs font-mono text-rose-300 flex items-center gap-1.5 shrink-0"
+              className="machine-btn px-3 py-1.5 rounded-lg text-xs font-mono text-rose-300 flex items-center gap-1.5 shrink-0 whitespace-nowrap"
             >
               {isClearingCache ? (
                 <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -1205,30 +1255,26 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         </div>
       </div>
 
-      {/* Styled Dark Cybernetic Modal (never window.alert / confirm) */}
+      {/* Styled Dark Cybernetic Modal */}
       {modalState.isOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fade-in">
-          <div className="w-full max-w-sm rounded-2xl bg-[#090D15] border border-cyan-500/40 p-5 shadow-[0_0_30px_rgba(0,240,255,0.2)] space-y-4">
-            <div className="flex items-center justify-between pb-2 border-b border-cyan-500/20">
-              <div className="flex items-center gap-2">
-                <span
-                  className={`w-2 h-2 rounded-full ${
-                    modalState.isError ? 'led-red' : 'led-cyan'
-                  }`}
-                />
-                <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
+          <div className="w-full max-w-sm rounded-2xl bg-[#090D15] border border-accent-strong p-5 glow-accent space-y-4">
+            <div className="flex items-center justify-between pb-2 border-b border-accent">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className={`w-2 h-2 rounded-full shrink-0 ${modalState.isError ? 'led-rose' : 'led-accent'}`} />
+                <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider truncate">
                   {modalState.title}
                 </h3>
               </div>
               <button
                 onClick={() => setModalState((prev) => ({ ...prev, isOpen: false }))}
-                className="p-1 text-slate-400 hover:text-white"
+                className="p-1 text-slate-400 hover:text-white shrink-0"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            <p className="font-mono text-xs text-slate-300 leading-relaxed select-text">
+            <p className="font-mono text-xs text-slate-300 leading-relaxed select-text whitespace-pre-line">
               {modalState.message}
             </p>
 
@@ -1239,7 +1285,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                     if (modalState.onCancel) modalState.onCancel();
                     else setModalState((prev) => ({ ...prev, isOpen: false }));
                   }}
-                  className="px-3.5 py-1.5 rounded-lg font-mono text-xs text-slate-400 hover:text-white border border-slate-700 bg-slate-900 active:scale-95"
+                  className="px-3.5 py-1.5 rounded-lg font-mono text-xs text-slate-400 hover:text-white border border-slate-700 bg-slate-900"
                 >
                   {modalState.cancelLabel}
                 </button>
@@ -1249,10 +1295,10 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                   if (modalState.onAction) modalState.onAction();
                   else setModalState((prev) => ({ ...prev, isOpen: false }));
                 }}
-                className={`px-4 py-1.5 rounded-lg font-mono text-xs font-bold active:scale-95 transition-all ${
+                className={`px-4 py-1.5 rounded-lg font-mono text-xs font-bold transition-all ${
                   modalState.isError
                     ? 'bg-rose-600 text-white shadow-[0_0_8px_rgba(239,68,68,0.6)]'
-                    : 'machine-btn-primary text-slate-950 shadow-[0_0_8px_rgba(0,240,255,0.6)]'
+                    : 'machine-btn-primary text-slate-950 glow-accent-sm'
                 }`}
               >
                 {modalState.actionLabel || 'OK'}

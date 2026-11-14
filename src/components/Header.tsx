@@ -1,5 +1,5 @@
 import React from 'react';
-import { DownloadCloud, Smartphone, Share2, RefreshCw } from 'lucide-react';
+import { DownloadCloud, Smartphone, Share2 } from 'lucide-react';
 import { usePWAInstall } from '../hooks/usePWAInstall';
 
 interface HeaderProps {
@@ -13,13 +13,10 @@ export const Header: React.FC<HeaderProps> = ({
   serverStatus,
   serverLatency,
   onRefreshHealth,
-  onOpenSettings,
 }) => {
   const { isInstallable, isInstalled, isIOS, install } = usePWAInstall();
   const [showIOSModal, setShowIOSModal] = React.useState(false);
 
-  // Compute machine latency chip state
-  // Green under 400ms, Yellow under 1500ms, Red above or unreachable, "SLEEPING" when over 3 seconds
   let chipClass = 'border-rose-500/40 text-rose-300 bg-rose-950/40';
   let ledClass = 'led-rose';
   let label = 'OFFLINE';
@@ -49,37 +46,38 @@ export const Header: React.FC<HeaderProps> = ({
   }
 
   return (
-    <header className="sticky top-0 z-40 bg-[#080B10]/95 backdrop-blur-md border-b border-cyan-500/20 px-4 py-2.5">
-      <div className="max-w-md mx-auto flex items-center justify-between">
+    <header className="sticky top-0 z-40 bg-[var(--od-bg-canvas)]/95 backdrop-blur-md border-b border-accent px-4 py-2.5">
+      <div className="max-w-md mx-auto flex items-center justify-between gap-2">
         {/* Brand in Robotic Style */}
-        <div className="flex items-center gap-2.5">
-          <div className="relative flex items-center justify-center w-9 h-9 rounded-lg bg-slate-950 border border-cyan-400/40 shadow-[0_0_12px_rgba(0,240,255,0.25)]">
-            <DownloadCloud className="w-4 h-4 text-cyan-400" />
-            <div className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 rounded-full led-cyan" />
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div className="relative flex items-center justify-center w-9 h-9 rounded-lg bg-slate-950 border border-accent-strong glow-accent-sm shrink-0">
+            <DownloadCloud className="w-4 h-4 text-accent" />
+            <div className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 rounded-full led-accent" />
           </div>
-          <div>
+          <div className="min-w-0">
             <div className="flex items-center gap-1.5">
-              <span className="font-mono font-black text-sm tracking-widest text-white uppercase">
+              <span className="font-mono font-black text-sm tracking-widest text-white uppercase whitespace-nowrap">
                 OMNIDROP
               </span>
-              <span className="font-mono text-[9px] font-bold px-1.5 py-0.2 rounded bg-cyan-950 text-cyan-300 border border-cyan-500/30">
+              <span className="font-mono text-[9px] font-bold px-1.5 py-0.2 rounded bg-accent-soft text-accent-soft border border-accent whitespace-nowrap">
                 PRO
               </span>
             </div>
-            <p className="font-mono text-[10px] text-slate-400 tracking-tight">INGESTION UNIT</p>
+            <p className="font-mono text-[10px] text-slate-400 tracking-tight whitespace-nowrap truncate">
+              INGESTION UNIT
+            </p>
           </div>
         </div>
 
         {/* Status Chip & Actions */}
-        <div className="flex items-center gap-2">
-          {/* PWA Install Button */}
+        <div className="flex items-center gap-2 shrink-0">
           {isInstallable && !isInstalled && (
             <button
               onClick={install}
-              className="machine-btn flex items-center gap-1 text-[11px] font-mono px-2 py-1 rounded-md text-cyan-300"
+              className="machine-btn flex items-center gap-1 text-[11px] font-mono px-2 py-1 rounded-md text-accent-soft whitespace-nowrap"
               title="Install app to home screen"
             >
-              <Smartphone className="w-3 h-3 text-cyan-400" />
+              <Smartphone className="w-3 h-3 text-accent" />
               <span>INSTALL</span>
             </button>
           )}
@@ -87,21 +85,21 @@ export const Header: React.FC<HeaderProps> = ({
           {isIOS && !isInstalled && (
             <button
               onClick={() => setShowIOSModal(true)}
-              className="machine-btn flex items-center gap-1 text-[11px] font-mono px-2 py-1 rounded-md text-cyan-300"
+              className="machine-btn flex items-center gap-1 text-[11px] font-mono px-2 py-1 rounded-md text-accent-soft whitespace-nowrap"
               title="Add to iOS Home Screen"
             >
-              <Share2 className="w-3 h-3 text-cyan-400" />
+              <Share2 className="w-3 h-3 text-accent" />
               <span>INSTALL</span>
             </button>
           )}
 
-          {/* Machine Latency Chip */}
+          {/* Machine Latency Chip with fixed width slot */}
           <button
             onClick={onRefreshHealth}
-            className={`machine-btn flex items-center gap-1.5 text-xs font-mono px-2.5 py-1 rounded-lg border transition ${chipClass}`}
+            className={`machine-btn flex items-center justify-center gap-1.5 min-w-[84px] text-xs font-mono px-2.5 py-1 rounded-lg border transition whitespace-nowrap tabular-nums ${chipClass}`}
             title="Click to ping backend server"
           >
-            <span className={`w-1.5 h-1.5 rounded-full ${ledClass}`} />
+            <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${ledClass}`} />
             <span className="font-bold tracking-wider">{label}</span>
           </button>
         </div>
@@ -112,7 +110,7 @@ export const Header: React.FC<HeaderProps> = ({
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm animate-fade-in">
           <div className="machine-surface w-full max-w-sm rounded-xl p-5 shadow-2xl space-y-4">
             <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-cyan-950 border border-cyan-500/40 text-cyan-400">
+              <div className="p-2 rounded-lg bg-accent-soft border border-accent text-accent">
                 <Share2 className="w-5 h-5" />
               </div>
               <h3 className="font-mono text-sm font-bold text-white uppercase tracking-wider">
@@ -121,7 +119,7 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
             <ol className="text-xs text-slate-300 space-y-2 list-decimal list-inside bg-slate-950 p-3 rounded-lg border border-slate-800 font-mono">
               <li>Tap the <strong className="text-white">Share</strong> button in Safari.</li>
-              <li>Select <strong className="text-cyan-400">Add to Home Screen</strong>.</li>
+              <li>Select <strong className="text-accent">Add to Home Screen</strong>.</li>
               <li>Tap <strong className="text-white">Add</strong> in top right.</li>
             </ol>
             <button

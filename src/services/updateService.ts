@@ -5,6 +5,7 @@ export const GITHUB_REPO = 'fatormajohn999-gif/J-TEC-downloader-';
 const STORAGE_LAST_CHECK = 'omnidrop_last_update_check';
 const STORAGE_SKIPPED_VERSION = 'omnidrop_skipped_update_version';
 const STORAGE_CACHED_UPDATE = 'omnidrop_cached_update_info';
+const STORAGE_SEEN_WHATS_NEW = 'omnidrop_seen_whats_new_tag';
 const ONE_HOUR_MS = 60 * 60 * 1000;
 
 export interface CheckUpdateResult {
@@ -43,6 +44,21 @@ export function setSkippedUpdateVersion(versionCode: number): void {
   } catch {}
 }
 
+export function getSeenWhatsNewTag(): string {
+  try {
+    return localStorage.getItem(STORAGE_SEEN_WHATS_NEW) || '';
+  } catch {
+    return '';
+  }
+}
+
+export function markWhatsNewSeen(tagName: string): void {
+  if (!tagName) return;
+  try {
+    localStorage.setItem(STORAGE_SEEN_WHATS_NEW, tagName);
+  } catch {}
+}
+
 export function getLastUpdateCheckTime(): number {
   try {
     const val = localStorage.getItem(STORAGE_LAST_CHECK);
@@ -62,7 +78,7 @@ export function getCachedUpdateInfo(): AppUpdateInfo | null {
 }
 
 /**
- * Checks GitHub Releases for new APK update
+ * Checks GitHub Releases for new APK update & What's New release notes
  */
 export async function checkForAppUpdate(force = false): Promise<CheckUpdateResult> {
   let installedVersionName = '1.0.0';
@@ -85,7 +101,7 @@ export async function checkForAppUpdate(force = false): Promise<CheckUpdateResul
   if (!force && lastCheck > 0 && now - lastCheck < ONE_HOUR_MS) {
     const cached = getCachedUpdateInfo();
     const skippedCode = getSkippedUpdateVersion();
-    const hasUpdate = cached ? cached.versionCode > installedVersionCode : false;
+    const hasUpdate = cached ? Boolean(cached.downloadUrl) && cached.versionCode > installedVersionCode : false;
     return {
       hasUpdate,
       installedVersionName,
@@ -116,12 +132,8 @@ export async function checkForAppUpdate(force = false): Promise<CheckUpdateResul
     const assets: any[] = Array.isArray(release.assets) ? release.assets : [];
     const apkAsset = assets.find((a: any) => typeof a.name === 'string' && a.name.toLowerCase().endsWith('.apk'));
 
-    if (!apkAsset) {
-      throw new Error('No .apk release asset found in latest GitHub release');
-    }
-
-    const downloadUrl = apkAsset.browser_download_url;
-    const sizeBytes = apkAsset.size || 0;
+    const downloadUrl = apkAsset?.browser_download_url || '';
+    const sizeBytes = apkAsset?.size || 0;
 
     const updateInfo: AppUpdateInfo = {
       versionName: tagName,
@@ -138,7 +150,7 @@ export async function checkForAppUpdate(force = false): Promise<CheckUpdateResul
       localStorage.setItem(STORAGE_CACHED_UPDATE, JSON.stringify(updateInfo));
     } catch {}
 
-    const hasUpdate = remoteVersionCode > installedVersionCode;
+    const hasUpdate = Boolean(downloadUrl) && remoteVersionCode > installedVersionCode;
     const skippedCode = getSkippedUpdateVersion();
 
     return {
