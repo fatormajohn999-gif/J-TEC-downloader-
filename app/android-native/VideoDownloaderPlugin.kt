@@ -212,13 +212,15 @@ class VideoDownloaderPlugin : Plugin() {
             primaryKeyOverride: String? = null,
             backupOverride: String? = null,
             backupKeyOverride: String? = null,
+            backupApiKeyOverride: String? = null,
             autoSwitchOverride: Boolean? = null
         ): List<ServerEndpoint> {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             val rawPrimary = if (primaryOverride != null) primaryOverride else (prefs.getString("backend_url", "") ?: "")
             val rawPrimaryKey = if (primaryKeyOverride != null) primaryKeyOverride else (prefs.getString("api_key", "") ?: "")
             val rawBackup = if (backupOverride != null) backupOverride else (prefs.getString(PREF_BACKUP_URL, "") ?: "")
-            val rawBackupKey = if (backupKeyOverride != null) backupKeyOverride else (prefs.getString(PREF_BACKUP_API_KEY, "") ?: "")
+            val effectiveBackupKeyOverride = backupApiKeyOverride ?: backupKeyOverride
+            val rawBackupKey = if (effectiveBackupKeyOverride != null) effectiveBackupKeyOverride else (prefs.getString(PREF_BACKUP_API_KEY, "") ?: "")
             val autoSwitch = autoSwitchOverride ?: prefs.getBoolean(PREF_AUTO_SWITCH_BACKUP, true)
 
             val primaryNorm = normalizeBaseServerUrl(rawPrimary)
@@ -2530,8 +2532,8 @@ class VideoDownloaderPlugin : Plugin() {
 
     @PluginMethod
     fun checkDuplicate(call: PluginCall) {
-        val rawUrl = call.getString("url")
-        if (rawUrl.isNullOrBlank()) {
+        val rawUrl = call.getString("url") ?: ""
+        if (rawUrl.isBlank()) {
             val ret = JSObject().apply { this.put("exists", false) }
             call.resolve(ret)
             return
@@ -2987,7 +2989,7 @@ class VideoDownloaderPlugin : Plugin() {
             primaryOverride = backendUrl,
             primaryKeyOverride = apiKey,
             backupOverride = backupBackendUrl,
-            backupKeyOverride = backupApiKey,
+            backupApiKeyOverride = backupApiKey,
             autoSwitchOverride = autoSwitchToBackup
         )
 
@@ -3291,11 +3293,11 @@ class VideoDownloaderPlugin : Plugin() {
 
     @PluginMethod
     fun renameVideo(call: PluginCall) {
-        val uriStr = call.getString("uri")
+        val uriStr = call.getString("uri") ?: ""
         val newTitle = call.getString("newTitle")?.trim() ?: ""
         val newPlatform = call.getString("newPlatform")?.trim() ?: "Other"
 
-        if (uriStr.isNullOrBlank() || newTitle.isBlank()) {
+        if (uriStr.isBlank() || newTitle.isBlank()) {
             call.reject("Missing required parameters: uri or newTitle")
             return
         }
@@ -3621,10 +3623,10 @@ class VideoDownloaderPlugin : Plugin() {
 
     @PluginMethod
     fun downloadAndInstallUpdate(call: PluginCall) {
-        val downloadUrl = call.getString("url")
+        val downloadUrl = call.getString("url") ?: ""
         val expectedSize = call.getLong("size") ?: (call.getInt("size")?.toLong() ?: 0L)
 
-        if (downloadUrl.isNullOrBlank()) {
+        if (downloadUrl.isBlank()) {
             call.reject("Missing required parameter: url")
             return
         }
@@ -3650,7 +3652,7 @@ class VideoDownloaderPlugin : Plugin() {
                         apkFile.delete()
                     }
 
-                    var currentUrl = downloadUrl
+                    var currentUrl: String = downloadUrl
                     var redirectCount = 0
                     val maxRedirects = 6
                     var okResp: HttpResponseData? = null
@@ -3676,8 +3678,8 @@ class VideoDownloaderPlugin : Plugin() {
                             code == HttpURLConnection.HTTP_MOVED_TEMP ||
                             code == HttpURLConnection.HTTP_SEE_OTHER ||
                             code == 307 || code == 308) {
-                            val location = resp.locationHeader ?: resp.headers["location"]
-                            if (location.isNullOrBlank()) {
+                            val location = resp.locationHeader ?: resp.headers["location"] ?: ""
+                            if (location.isBlank()) {
                                 throw IOException("Redirect with empty Location header")
                             }
                             currentUrl = if (location.startsWith("http")) location else URL(URL(currentUrl), location).toString()
