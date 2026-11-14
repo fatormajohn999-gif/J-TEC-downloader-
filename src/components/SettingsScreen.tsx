@@ -21,6 +21,7 @@ import {
   Film,
   Download,
   Compass,
+  Gauge,
 } from 'lucide-react';
 import {
   AccentTheme,
@@ -30,9 +31,19 @@ import {
   FloatingOpacity,
   FloatingSize,
   MobileDataPromptMb,
+  ServerHealthProbe,
+  SpeedTestResult,
   UpdateProgressEvent,
 } from '../types';
-import { checkServerHealth } from '../services/api';
+import {
+  checkServerHealth,
+  getSpeedTestHistory,
+  getStickyActiveServer,
+  getStickyActiveServerRemainingMs,
+  performServerSpeedTest,
+  setStickyActiveServer,
+  testBothServers,
+} from '../services/api';
 import { VideoDownloader, SystemChecksResult, StorageUsageResult } from '../plugins/videoDownloader';
 import {
   checkForAppUpdate,
@@ -130,6 +141,12 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   // Server state
   const [backendUrl, setBackendUrl] = useState(settings.backendUrl || '');
   const [apiKey, setApiKey] = useState(settings.apiKey || '');
+  const [backupBackendUrl, setBackupBackendUrl] = useState(settings.backupBackendUrl || '');
+  const [backupApiKey, setBackupApiKey] = useState(settings.backupApiKey || '');
+  const [autoSwitchToBackup, setAutoSwitchToBackup] = useState<boolean>(settings.autoSwitchToBackup ?? true);
+  const [keepBackupAwake, setKeepBackupAwake] = useState<boolean>(settings.keepBackupAwake ?? false);
+  const [activeServerRole, setActiveServerRole] = useState<'primary' | 'backup'>('primary');
+  const [activeRemainingMs, setActiveRemainingMs] = useState<number>(0);
 
   // Downloads state
   const [defaultQuality, setDefaultQuality] = useState(settings.defaultQuality || 'best');
@@ -222,10 +239,25 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     message: '',
   });
 
-  // Connection test state
+  // Connection test & dual server test state
   const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
   const [testResult, setTestResult] = useState<string>('');
+  const [serverProbes, setServerProbes] = useState<{
+    primary: ServerHealthProbe;
+    backup: ServerHealthProbe | null;
+    activeServer: 'primary' | 'backup';
+  } | null>(null);
   const [isSaved, setIsSaved] = useState(false);
+
+  // Server Speed Test state
+  const [speedTestRunning, setSpeedTestRunning] = useState(false);
+  const [speedTestError, setSpeedTestError] = useState<string | null>(null);
+  const [speedTestUnsupportedMsg, setSpeedTestUnsupportedMsg] = useState<string | null>(null);
+  const [speedTestHistory, setSpeedTestHistory] = useState<SpeedTestResult[]>(() => getSpeedTestHistory());
+  const [latestSpeedTest, setLatestSpeedTest] = useState<SpeedTestResult | null>(() => {
+    const hist = getSpeedTestHistory();
+    return hist.length > 0 ? hist[0] : null;
+  });
 
   // Storage usage breakdown state
   const [storageUsage, setStorageUsage] = useState<StorageUsageResult>({
@@ -281,12 +313,28 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
 
   const refreshKeepAliveStatus = useCallback(async () => {
     try {
-      const res = await VideoDownloader.getKeepAliveStatus();
-      if (res) {
-        setKeepAliveStatus(res);
+      const [kaRes, activeRes] = await Promise.all([
+        VideoDownloader.getKeepAliveStatus().catch(() => null),
+        Capacitor.isNativePlatform() ? VideoDownloader.getActiveServerStatus().catch(() => null) : Promise.resolve(null),
+      ]);
+      if (kaRes) {
+        setKeepAliveStatus(kaRes);
+      }
+      if (activeRes && (activeRes.activeServer === 'primary' || activeRes.activeServer === 'backup')) {
+        setActiveServerRole(activeRes.activeServer);
+        setActiveRemainingMs((activeRes.remainingSeconds || 0) * 1000);
+      } else {
+        const tempSettings: AppSettings = {
+          ...settings,
+          backendUrl: backendUrl.trim(),
+          backupBackendUrl: backupBackendUrl.trim(),
+          autoSwitchToBackup,
+        };
+        setActiveServerRole(getStickyActiveServer(tempSettings));
+        setActiveRemainingMs(getStickyActiveServerRemainingMs(tempSettings));
       }
     } catch {}
-  }, []);
+  }, [settings, backendUrl, backupBackendUrl, autoSwitchToBackup]);
 
   const refreshTabServiceStatus = useCallback(async () => {
     try {
@@ -449,6 +497,10 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       ...settings,
       backendUrl: backendUrl.trim(),
       apiKey: apiKey.trim(),
+      backupBackendUrl: backupBackendUrl.trim(),
+      backupApiKey: backupApiKey.trim(),
+      autoSwitchToBackup,
+      keepBackupAwake,
       defaultQuality,
       dataSaver,
       mobileDataPromptMb,
@@ -563,18 +615,96 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       ...settings,
       backendUrl: backendUrl.trim(),
       apiKey: apiKey.trim(),
+      backupBackendUrl: backupBackendUrl.trim(),
+      backupApiKey: backupApiKey.trim(),
+      autoSwitchToBackup,
+      keepBackupAwake,
     };
-    const res = await checkServerHealth(tempSettings);
-    if (res.ok) {
-      setTestStatus('success');
-      setTestResult(`ONLINE • ${res.latencyMs}ms`);
-      setServerReachable('online');
-      setServerPingMs(res.latencyMs);
-    } else {
-      setTestStatus('error');
-      setTestResult(`FAILED • ${res.error || 'Server unreachable'}`);
-      setServerReachable('offline');
-      setServerPingMs(null);
+
+    try {
+      const both = await testBothServers(tempSettings);
+      setServerProbes(both);
+      setActiveServerRole(both.activeServer);
+      if (!tempSettings.autoSwitchToBackup || !tempSettings.backupBackendUrl) {
+        setActiveRemainingMs(0);
+      }
+      const primaryOk = both.primary.ok;
+      const backupOk = Boolean(both.backup?.ok);
+
+      if (primaryOk || backupOk) {
+        setTestStatus('success');
+        const parts: string[] = [];
+        if (both.primary.configured) {
+          parts.push(`PRIMARY ${both.primary.ok ? `${both.primary.latencyMs}ms` : 'ERR'}`);
+        }
+        if (both.backup && both.backup.configured) {
+          parts.push(`BACKUP ${both.backup.ok ? `${both.backup.latencyMs}ms` : 'ERR'}`);
+        }
+        setTestResult(parts.join(' • '));
+        const activeProbe = both.activeServer === 'backup' && both.backup ? both.backup : both.primary;
+        setServerReachable(activeProbe.ok ? 'online' : 'offline');
+        setServerPingMs(activeProbe.ok ? activeProbe.latencyMs : null);
+
+        // Update sticky server state cleanly based on explicit probe
+        if (both.primary.ok) {
+          setStickyActiveServer('primary');
+          setActiveServerRole('primary');
+          setActiveRemainingMs(0);
+        } else if (both.backup?.ok && tempSettings.autoSwitchToBackup) {
+          setStickyActiveServer('backup');
+          setActiveServerRole('backup');
+          setActiveRemainingMs(10 * 60 * 1000);
+        }
+      } else {
+        setTestStatus('error');
+        setTestResult(`FAILED • ${both.primary.error || both.backup?.error || 'Servers unreachable'}`);
+        setServerReachable('offline');
+        setServerPingMs(null);
+      }
+    } catch (err: any) {
+      const res = await checkServerHealth(tempSettings);
+      if (res.ok) {
+        setTestStatus('success');
+        setTestResult(`ONLINE • ${res.latencyMs}ms`);
+        setServerReachable('online');
+        setServerPingMs(res.latencyMs);
+      } else {
+        setTestStatus('error');
+        setTestResult(`FAILED • ${err?.message || res.error || 'Server unreachable'}`);
+        setServerReachable('offline');
+        setServerPingMs(null);
+      }
+    }
+  };
+
+  const handleRunSpeedTest = async () => {
+    setSpeedTestRunning(true);
+    setSpeedTestError(null);
+    setSpeedTestUnsupportedMsg(null);
+    persistSettings();
+
+    const tempSettings: AppSettings = {
+      ...settings,
+      backendUrl: backendUrl.trim(),
+      apiKey: apiKey.trim(),
+      backupBackendUrl: backupBackendUrl.trim(),
+      backupApiKey: backupApiKey.trim(),
+      autoSwitchToBackup,
+      keepBackupAwake,
+    };
+
+    try {
+      const res = await performServerSpeedTest(tempSettings);
+      if (!res.supported) {
+        setSpeedTestUnsupportedMsg(res.error || 'Update your server to use the speed test');
+      } else {
+        setLatestSpeedTest(res);
+        setSpeedTestHistory(getSpeedTestHistory());
+      }
+    } catch (err: any) {
+      setSpeedTestError(err?.message || 'Speed test failed');
+    } finally {
+      setSpeedTestRunning(false);
     }
   };
 
@@ -1879,11 +2009,32 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         className="machine-surface rounded-xl p-4 space-y-3 stagger-card"
         style={{ '--stagger': 9 } as React.CSSProperties}
       >
-        <div className="flex items-center gap-2 pb-2 border-b border-accent">
-          <Server className="w-4 h-4 text-accent" />
-          <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider">
-            SERVER // CONFIG
-          </h3>
+        <div className="flex items-center justify-between gap-2 pb-2 border-b border-accent">
+          <div className="flex items-center gap-2 min-w-0">
+            <Server className="w-4 h-4 text-accent shrink-0" />
+            <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider truncate">
+              SERVER // CONFIG
+            </h3>
+          </div>
+          <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-slate-950 border border-slate-800 shrink-0">
+            <span
+              className={`w-2 h-2 rounded-full ${
+                activeServerRole === 'backup'
+                  ? 'led-amber'
+                  : serverReachable === 'online'
+                    ? 'led-emerald'
+                    : serverReachable === 'offline'
+                      ? 'led-rose'
+                      : 'led-accent'
+              }`}
+            />
+            <span className="font-mono text-[10px] font-bold text-slate-200 uppercase whitespace-nowrap">
+              ACTIVE SERVER: {activeServerRole.toUpperCase()}
+              {activeServerRole === 'backup' && activeRemainingMs > 0
+                ? ` (${Math.ceil(activeRemainingMs / 60000)}m)`
+                : ''}
+            </span>
+          </div>
         </div>
 
         <div className="space-y-3">
@@ -1895,11 +2046,12 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               type="url"
               value={backendUrl}
               onChange={(e) => setBackendUrl(e.target.value)}
+              onBlur={() => persistSettings()}
               placeholder="https://your-omni-server.onrender.com"
               className="machine-input w-full px-3 py-2 rounded-lg font-mono text-xs"
             />
             <p className="text-[11px] text-slate-400 mt-1">
-              FastAPI download backend address. Leave blank for default local host.
+              Primary FastAPI download server address.
             </p>
           </div>
 
@@ -1911,12 +2063,77 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               type="password"
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
+              onBlur={() => persistSettings()}
               placeholder="••••••••••••••••"
               className="machine-input w-full px-3 py-2 rounded-lg font-mono text-xs"
             />
             <p className="text-[11px] text-slate-400 mt-1">
-              Required only if you configured a private key on your server.
+              Sent only to the primary server URL above.
             </p>
+          </div>
+
+          <div className="pt-2 border-t border-slate-800/70 space-y-3">
+            <div>
+              <label className="block font-mono text-xs text-slate-300 uppercase mb-1">
+                BACKUP SERVER URL (OPTIONAL)
+              </label>
+              <input
+                type="url"
+                value={backupBackendUrl}
+                onChange={(e) => setBackupBackendUrl(e.target.value)}
+                onBlur={() => persistSettings()}
+                placeholder="https://your-backup-server.onrender.com"
+                className="machine-input w-full px-3 py-2 rounded-lg font-mono text-xs"
+              />
+              <p className="text-[11px] text-slate-400 mt-1">
+                Used automatically if primary is unreachable or times out after wake retries (sticky for 10 min).
+              </p>
+            </div>
+
+            <div>
+              <label className="block font-mono text-xs text-slate-300 uppercase mb-1">
+                BACKUP API SECURITY KEY (OPTIONAL)
+              </label>
+              <input
+                type="password"
+                value={backupApiKey}
+                onChange={(e) => setBackupApiKey(e.target.value)}
+                onBlur={() => persistSettings()}
+                placeholder="••••••••••••••••"
+                className="machine-input w-full px-3 py-2 rounded-lg font-mono text-xs"
+              />
+              <p className="text-[11px] text-slate-400 mt-1">
+                Isolated to backup server only. Never sent to primary.
+              </p>
+            </div>
+
+            <div>
+              {renderMechanicalToggle(
+                'Switch to backup automatically',
+                'Fail over to backup on DNS/connection errors or after wake-up timeout',
+                autoSwitchToBackup,
+                () => {
+                  const next = !autoSwitchToBackup;
+                  setAutoSwitchToBackup(next);
+                  if (!next) {
+                    setActiveServerRole('primary');
+                    setActiveRemainingMs(0);
+                    setStickyActiveServer('primary');
+                  }
+                  persistSettings({ autoSwitchToBackup: next });
+                }
+              )}
+              {renderMechanicalToggle(
+                'Keep backup awake too',
+                'Also ping backup /health every 10 minutes while floating tab is ON',
+                keepBackupAwake,
+                () => {
+                  const next = !keepBackupAwake;
+                  setKeepBackupAwake(next);
+                  persistSettings({ keepBackupAwake: next });
+                }
+              )}
+            </div>
           </div>
 
           <div className="flex items-center justify-between pt-1 gap-2">
@@ -1930,24 +2147,273 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               ) : (
                 <RefreshCw className="w-3.5 h-3.5" />
               )}
-              <span>TEST LINK</span>
+              <span>TEST SERVERS</span>
             </button>
 
             {testStatus === 'success' && (
-              <span className="font-mono text-xs text-emerald-400 flex items-center gap-1 tabular-nums whitespace-nowrap">
+              <span className="font-mono text-[11px] text-emerald-400 flex items-center gap-1 tabular-nums truncate">
                 <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
                 {testResult}
               </span>
             )}
 
             {testStatus === 'error' && (
-              <span className="font-mono text-xs text-rose-400 flex items-center gap-1 truncate">
+              <span className="font-mono text-[11px] text-rose-400 flex items-center gap-1 truncate">
                 <AlertCircle className="w-3.5 h-3.5 shrink-0" />
                 {testResult}
               </span>
             )}
           </div>
+
+          {serverProbes && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+              {[
+                { role: 'primary' as const, url: backendUrl.trim(), probe: serverProbes.primary },
+                serverProbes.backup
+                  ? { role: 'backup' as const, url: backupBackendUrl.trim(), probe: serverProbes.backup }
+                  : null,
+              ]
+                .filter(Boolean)
+                .map((entry) => {
+                  if (!entry) return null;
+                  const { role, url, probe } = entry;
+                  if (role === 'backup' && !probe.configured && !url) return null;
+                  const isActive = role === serverProbes.activeServer;
+                  return (
+                    <div
+                      key={role}
+                      className={`p-2.5 rounded-lg bg-slate-950 border ${
+                        isActive ? 'border-accent-strong' : 'border-slate-800'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span
+                            className={`w-2 h-2 rounded-full shrink-0 ${
+                              probe.ok ? 'led-emerald' : 'led-rose'
+                            }`}
+                          />
+                          <span className="font-mono text-[11px] font-bold text-white uppercase">
+                            {role}
+                          </span>
+                        </div>
+                        {isActive && (
+                          <span className="font-mono text-[9px] font-bold text-accent uppercase tracking-wider">
+                            ACTIVE
+                          </span>
+                        )}
+                      </div>
+                      <div className="font-mono text-[10px] text-slate-400 truncate mt-1">
+                        {url || 'Default host'}
+                      </div>
+                      <div
+                        className={`font-mono text-[11px] font-bold mt-1 tabular-nums ${
+                          probe.ok ? 'text-emerald-400' : 'text-rose-400'
+                        }`}
+                      >
+                        {probe.ok ? `ONLINE · ${probe.latencyMs}ms` : probe.error || 'UNREACHABLE'}
+                      </div>
+                    </div>
+                  );
+                })}
+            </div>
+          )}
         </div>
+      </div>
+
+      {/* 10. SERVER SPEED */}
+      <div
+        className="machine-surface rounded-xl p-4 space-y-3 stagger-card"
+        style={{ '--stagger': 10 } as React.CSSProperties}
+      >
+        <div className="flex items-center justify-between gap-2 pb-2 border-b border-accent">
+          <div className="flex items-center gap-2 min-w-0">
+            <Gauge className="w-4 h-4 text-accent shrink-0" />
+            <h3 className="font-mono text-xs font-bold text-white uppercase tracking-wider truncate">
+              SERVER SPEED
+            </h3>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="font-mono text-[10px] text-slate-400 uppercase">
+              TARGET: {activeServerRole.toUpperCase()}
+            </span>
+            <button
+              onClick={handleRunSpeedTest}
+              disabled={speedTestRunning}
+              className="machine-btn-primary px-3 py-1 rounded-lg font-mono text-[11px] font-bold text-slate-950 flex items-center gap-1.5 whitespace-nowrap disabled:opacity-60"
+            >
+              {speedTestRunning ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : (
+                <Activity className="w-3 h-3" />
+              )}
+              <span>{speedTestRunning ? 'TESTING...' : 'TEST'}</span>
+            </button>
+          </div>
+        </div>
+
+        {speedTestUnsupportedMsg && (
+          <div className="p-2.5 rounded-lg bg-amber-950/30 border border-amber-500/40 flex items-start gap-2">
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div className="font-mono text-[11px] text-amber-200 leading-relaxed">
+              {speedTestUnsupportedMsg}
+            </div>
+          </div>
+        )}
+
+        {speedTestError && (
+          <div className="p-2.5 rounded-lg bg-rose-950/30 border border-rose-500/40 flex items-start gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+            <div className="font-mono text-[11px] text-rose-200 leading-relaxed">
+              {speedTestError}
+            </div>
+          </div>
+        )}
+
+        {(() => {
+          const current = latestSpeedTest;
+          const mbpsVal = current ? current.mbps : 0;
+          const normalizedPct = Math.min(1, Math.max(0, mbpsVal / 25));
+          const arcLength = 125.66;
+          const dashOffset = arcLength * (1 - normalizedPct);
+          const strokeColor =
+            !current
+              ? 'var(--accent)'
+              : current.verdict === 'GOOD'
+                ? '#10B981'
+                : current.verdict === 'SLOW'
+                  ? '#F59E0B'
+                  : '#F43F5E';
+
+          return (
+            <div className="space-y-3">
+              <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 flex flex-col sm:flex-row items-center gap-4">
+                <div className="relative w-36 h-22 flex flex-col items-center justify-end shrink-0">
+                  <svg viewBox="0 0 100 60" className="w-36 h-20 overflow-visible">
+                    <path
+                      d="M 10 50 A 40 40 0 0 1 90 50"
+                      fill="none"
+                      stroke="#1E293B"
+                      strokeWidth="8"
+                      strokeLinecap="round"
+                    />
+                    <path
+                      d="M 10 50 A 40 40 0 0 1 90 50"
+                      fill="none"
+                      stroke={strokeColor}
+                      strokeWidth="8"
+                      strokeLinecap="round"
+                      strokeDasharray={arcLength}
+                      strokeDashoffset={speedTestRunning ? arcLength * 0.65 : dashOffset}
+                      style={{ transition: 'stroke-dashoffset 0.45s ease, stroke 0.3s ease' }}
+                    />
+                  </svg>
+                  <div className="absolute bottom-0.5 text-center">
+                    <div className="font-mono text-lg font-bold text-white tabular-nums leading-none">
+                      {speedTestRunning ? '--' : current ? current.mbps.toFixed(2) : '0.00'}
+                    </div>
+                    <div className="font-mono text-[9px] text-slate-400 uppercase mt-0.5">
+                      MBPS DOWN
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex-1 w-full space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-mono text-[10px] text-slate-400 uppercase">VERDICT</span>
+                    {current ? (
+                      <span
+                        className={`font-mono text-[11px] font-bold px-2 py-0.5 rounded border uppercase ${
+                          current.verdict === 'GOOD'
+                            ? 'text-emerald-300 bg-emerald-950/50 border-emerald-500/40'
+                            : current.verdict === 'SLOW'
+                              ? 'text-amber-300 bg-amber-950/50 border-amber-500/40'
+                              : 'text-rose-300 bg-rose-950/50 border-rose-500/40'
+                        }`}
+                      >
+                        {current.verdict}
+                      </span>
+                    ) : (
+                      <span className="font-mono text-[11px] text-slate-500 uppercase">
+                        NOT TESTED
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-1.5">
+                    <div className="p-1.5 rounded bg-slate-900/90 border border-slate-800 text-center">
+                      <div className="font-mono text-[9px] text-slate-500 uppercase">AVG PING</div>
+                      <div className="font-mono text-xs font-bold text-white tabular-nums">
+                        {current ? `${current.avgLatencyMs}ms` : '—'}
+                      </div>
+                    </div>
+                    <div className="p-1.5 rounded bg-slate-900/90 border border-slate-800 text-center">
+                      <div className="font-mono text-[9px] text-slate-500 uppercase">MIN PING</div>
+                      <div className="font-mono text-xs font-bold text-emerald-400 tabular-nums">
+                        {current ? `${current.minLatencyMs}ms` : '—'}
+                      </div>
+                    </div>
+                    <div className="p-1.5 rounded bg-slate-900/90 border border-slate-800 text-center">
+                      <div className="font-mono text-[9px] text-slate-500 uppercase">MAX PING</div>
+                      <div className="font-mono text-xs font-bold text-amber-400 tabular-nums">
+                        {current ? `${current.maxLatencyMs}ms` : '—'}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {current?.verdict === 'VERY SLOW' && (
+                <div className="p-2.5 rounded-lg bg-rose-950/30 border border-rose-500/40 font-mono text-[11px] text-rose-200">
+                  Try again later, or add a closer backup server
+                </div>
+              )}
+
+              {speedTestHistory.length > 0 && (
+                <div className="space-y-1.5 pt-1">
+                  <div className="font-mono text-[10px] text-slate-400 uppercase tracking-wider">
+                    LAST {speedTestHistory.length} SPEED TESTS
+                  </div>
+                  <div className="space-y-1">
+                    {speedTestHistory.slice(0, 5).map((item, idx) => (
+                      <div
+                        key={`${item.testedAt}_${idx}`}
+                        className="px-2.5 py-1.5 rounded bg-slate-950 border border-slate-800/80 flex items-center justify-between gap-2 font-mono text-[10px] tabular-nums"
+                      >
+                        <span className="text-slate-400 shrink-0">
+                          {new Date(item.testedAt).toLocaleTimeString([], {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })}
+                        </span>
+                        <span className="text-slate-300 uppercase shrink-0">
+                          {item.serverRole}
+                        </span>
+                        <span className="text-white font-bold">
+                          {item.mbps.toFixed(2)} Mbps
+                        </span>
+                        <span className="text-slate-400">
+                          {item.avgLatencyMs}ms
+                        </span>
+                        <span
+                          className={`font-bold ${
+                            item.verdict === 'GOOD'
+                              ? 'text-emerald-400'
+                              : item.verdict === 'SLOW'
+                                ? 'text-amber-400'
+                                : 'text-rose-400'
+                          }`}
+                        >
+                          {item.verdict}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })()}
       </div>
 
       {/* Styled Dark Cybernetic Modal */}

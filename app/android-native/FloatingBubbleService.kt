@@ -80,6 +80,10 @@ class FloatingBubbleService : Service() {
         private const val PREF_AUTO_DOWNLOAD = "auto_download"
         private const val PREF_BACKEND_URL = "backend_url"
         private const val PREF_API_KEY = "api_key"
+        private const val PREF_BACKUP_URL = "backup_backend_url"
+        private const val PREF_BACKUP_API_KEY = "backup_api_key"
+        private const val PREF_AUTO_SWITCH_BACKUP = "auto_switch_backup"
+        private const val PREF_KEEP_BACKUP_AWAKE = "keep_backup_awake"
         private const val PREF_DEFAULT_QUALITY = "default_quality"
         private const val PREF_FLOATING_AUTO_CLEAR = "floating_auto_clear"
         private const val PREF_FLOATING_VIBRATE = "floating_vibrate"
@@ -106,6 +110,15 @@ class FloatingBubbleService : Service() {
         const val PREF_PANEL_COMPACT = "floating_panel_compact"
         const val KEEP_ALIVE_INTERVAL_MS = 10 * 60 * 1000L // 10 minutes
         const val KEEP_ALIVE_FRESH_WINDOW_MS = 12 * 60 * 1000L // 12 minutes
+
+        const val ACTION_NOTIF_CANCEL = "com.omnidrop.app.action.NOTIF_CANCEL"
+        const val ACTION_NOTIF_DELETE = "com.omnidrop.app.action.NOTIF_DELETE"
+        const val ACTION_NOTIF_RETRY = "com.omnidrop.app.action.NOTIF_RETRY"
+        const val EXTRA_DOWNLOAD_URL = "extra_download_url"
+        const val EXTRA_NOTIF_ID = "extra_notif_id"
+        const val EXTRA_URI_LIST = "extra_uri_list"
+        const val EXTRA_QUALITY = "extra_quality"
+        const val EXTRA_TITLE = "extra_title"
 
         @Volatile var isOmniDropInForeground: Boolean = false
         @Volatile private var forceShowUntil: Long = 0L
@@ -221,6 +234,8 @@ class FloatingBubbleService : Service() {
 
     // Server Core Views
     private var serverReactorView: ServerReactorView? = null
+    private var activeServerLedDot: View? = null
+    private var activeServerStatusText: TextView? = null
     private var keepAliveLedDot: View? = null
     private var keepAliveStateLabel: TextView? = null
     private var keepAliveLastPingLine: TextView? = null
@@ -267,6 +282,10 @@ class FloatingBubbleService : Service() {
     private var hideInsideAppEnabled: Boolean = true
     private var backendUrl: String = ""
     private var apiKey: String = ""
+    private var backupBackendUrl: String = ""
+    private var backupApiKey: String = ""
+    private var autoSwitchToBackup: Boolean = true
+    private var keepBackupAwake: Boolean = false
     private var defaultQuality: String = "best"
     private var floatingSize: String = "medium"
     private var floatingOpacityPercent: Int = 45
@@ -316,6 +335,9 @@ class FloatingBubbleService : Service() {
     // Auto-check updates state
     private var autoCheckUpdatesEnabled: Boolean = true
     private var isTabEnabled: Boolean = false
+    private val activeNotifActionsCount = java.util.concurrent.atomic.AtomicInteger(0)
+    @Volatile private var activeDownloadNotifId: Int = -1
+    @Volatile private var activeDownloadControl: VideoDownloaderPlugin.Companion.ActiveDownloadControl? = null
 
     // Keep-Alive State (automatic 10-minute Render keep-alive tied strictly to floating tab)
     @Volatile private var isServiceDestroyed: Boolean = false
@@ -410,17 +432,8 @@ class FloatingBubbleService : Service() {
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
         loadSavedSettings()
-        QuickTileService.updateTile(this)
         ensureNotificationChannel(this)
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                startForeground(1001, buildServiceNotification(), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-            } else {
-                startForeground(1001, buildServiceNotification())
-            }
-        } catch (_: Exception) {
-            startForeground(1001, buildServiceNotification())
-        }
+        NotificationHelper.ensureChannels(this)
 
         val filter = IntentFilter().apply {
             this.addAction(Intent.ACTION_SCREEN_ON)
@@ -429,20 +442,197 @@ class FloatingBubbleService : Service() {
         registerReceiver(screenReceiver, filter)
 
         if (isTabEnabled) {
+            QuickTileService.updateTile(this)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    startForeground(1001, buildServiceNotification(), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                } else {
+                    startForeground(1001, buildServiceNotification())
+                }
+            } catch (_: Exception) {
+                startForeground(1001, buildServiceNotification())
+            }
             initEdgeTab()
             initPanelOverlay()
             resetIdleFade()
+            startTabRuntimeLoops()
         }
+    }
 
-        val ht = HandlerThread("OmniDropKeepAlive").apply {
-            this.start()
+    private fun startTabRuntimeLoops() {
+        if (keepAliveThread == null) {
+            val ht = HandlerThread("OmniDropKeepAlive").apply {
+                this.start()
+            }
+            keepAliveThread = ht
+            keepAliveHandler = Handler(ht.looper)
         }
-        keepAliveThread = ht
-        keepAliveHandler = Handler(ht.looper)
-
+        mainHandler.removeCallbacks(dualPingRunnable)
         mainHandler.post(dualPingRunnable)
+        mainHandler.removeCallbacks(updateCheckRunnable)
         mainHandler.postDelayed(updateCheckRunnable, 5000L)
+        keepAliveHandler?.removeCallbacks(keepAliveRunnable)
         keepAliveHandler?.post(keepAliveRunnable)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val action = intent?.action
+        if (action == ACTION_NOTIF_CANCEL || action == ACTION_NOTIF_DELETE || action == ACTION_NOTIF_RETRY) {
+            handleNotificationAction(intent, startId)
+            return START_NOT_STICKY
+        }
+
+        val tabOn = prefs?.getBoolean("floating_bubble_enabled", false) ?: isTabEnabled
+        isTabEnabled = tabOn
+        if (!isTabEnabled) {
+            finishTransientStopIfIdle(startId)
+            return START_NOT_STICKY
+        }
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(1001, buildServiceNotification(), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(1001, buildServiceNotification())
+            }
+        } catch (_: Exception) {
+            try { startForeground(1001, buildServiceNotification()) } catch (_: Exception) {}
+        }
+        syncViews()
+        return START_STICKY
+    }
+
+    private fun finishTransientStopIfIdle(startId: Int) {
+        mainHandler.post {
+            try {
+                val stillTabOff = !(prefs?.getBoolean("floating_bubble_enabled", false) ?: false)
+                if (stillTabOff && activeNotifActionsCount.get() <= 0 && !isDownloading) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
+                    } else {
+                        @Suppress("DEPRECATION")
+                        try { stopForeground(true) } catch (_: Throwable) {}
+                    }
+                    stopSelfResult(startId)
+                }
+            } catch (_: Throwable) {}
+        }
+    }
+
+    private fun handleNotificationAction(intent: Intent, startId: Int) {
+        when (intent.action) {
+            ACTION_NOTIF_CANCEL -> {
+                val targetUrl = intent.getStringExtra(EXTRA_DOWNLOAD_URL)
+                val notifId = intent.getIntExtra(EXTRA_NOTIF_ID, -1)
+                if (activeDownloadNotifId > 0 && (notifId == activeDownloadNotifId || (targetUrl != null && VideoDownloaderPlugin.normalizeUrl(targetUrl) == activeNormalizedUrl))) {
+                    cancelCurrentDownload()
+                }
+                VideoDownloaderPlugin.cancelActiveDownload(this, targetUrl, notifId)
+                if (!isTabEnabled) {
+                    finishTransientStopIfIdle(startId)
+                }
+            }
+            ACTION_NOTIF_DELETE -> {
+                val uriList = intent.getStringArrayListExtra(EXTRA_URI_LIST) ?: ArrayList()
+                val notifId = intent.getIntExtra(EXTRA_NOTIF_ID, -1)
+                if (notifId > 0) {
+                    NotificationHelper.cancelNotification(this, notifId)
+                }
+                if (uriList.isEmpty()) {
+                    if (!isTabEnabled) finishTransientStopIfIdle(startId)
+                    return
+                }
+                activeNotifActionsCount.incrementAndGet()
+                backgroundExecutor.execute {
+                    try {
+                        val deletedList = ArrayList<String>()
+                        var needsSystemConfirm = false
+                        val resolver = contentResolver
+                        for (uStr in uriList) {
+                            val uri = try { Uri.parse(uStr) } catch (_: Throwable) { null } ?: continue
+                            try {
+                                val rows = resolver.delete(uri, null, null)
+                                if (rows > 0) {
+                                    deletedList.add(uStr)
+                                    VideoDownloaderPlugin.removeHistoryByUri(this@FloatingBubbleService, uStr)
+                                } else {
+                                    var stillExists = false
+                                    try {
+                                        resolver.query(uri, arrayOf(MediaStore.MediaColumns._ID), null, null, null)?.use { c ->
+                                            stillExists = c.count > 0
+                                        }
+                                    } catch (_: Throwable) {}
+                                    if (stillExists) {
+                                        needsSystemConfirm = true
+                                    } else {
+                                        deletedList.add(uStr)
+                                        VideoDownloaderPlugin.removeHistoryByUri(this@FloatingBubbleService, uStr)
+                                    }
+                                }
+                            } catch (_: SecurityException) {
+                                needsSystemConfirm = true
+                            } catch (_: Throwable) {}
+                        }
+
+                        if (deletedList.isNotEmpty()) {
+                            VideoDownloaderPlugin.cleanUpDeletedMediaUris(this@FloatingBubbleService, deletedList)
+                            mainHandler.post {
+                                try { VideoDownloaderPlugin.instance?.emitLibraryChanged() } catch (_: Throwable) {}
+                                if (isTabEnabled) refreshTodayStatsUI()
+                            }
+                        }
+
+                        if (needsSystemConfirm) {
+                            val mainClass = try { Class.forName("com.omnidrop.app.MainActivity") } catch (_: Throwable) { null }
+                            if (mainClass != null) {
+                                val openVideos = Intent(this@FloatingBubbleService, mainClass).apply {
+                                    this.putExtra("open_tab", "videos")
+                                    this.putExtra("notif_message", "Tap Delete in the Videos tab to confirm removing this file on Android.")
+                                    this.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                                }
+                                startActivity(openVideos)
+                            }
+                        }
+                    } catch (_: Throwable) {
+                    } finally {
+                        activeNotifActionsCount.decrementAndGet()
+                        if (!isTabEnabled) {
+                            finishTransientStopIfIdle(startId)
+                        }
+                    }
+                }
+            }
+            ACTION_NOTIF_RETRY -> {
+                val url = intent.getStringExtra(EXTRA_DOWNLOAD_URL) ?: ""
+                val quality = intent.getStringExtra(EXTRA_QUALITY) ?: defaultQuality
+                val title = intent.getStringExtra(EXTRA_TITLE) ?: "Video"
+                val notifId = intent.getIntExtra(EXTRA_NOTIF_ID, -1)
+                if (notifId > 0) {
+                    NotificationHelper.cancelNotification(this, notifId)
+                }
+                if (url.isBlank()) {
+                    if (!isTabEnabled) finishTransientStopIfIdle(startId)
+                    return
+                }
+                if (isTabEnabled) {
+                    mainHandler.post {
+                        enqueueOrStartDownload(url, isManual = true, force = true)
+                    }
+                } else {
+                    activeNotifActionsCount.incrementAndGet()
+                    VideoDownloaderPlugin.startDetachedRetryDownload(
+                        context = applicationContext,
+                        rawUrl = url,
+                        quality = quality,
+                        title = title,
+                        onComplete = {
+                            activeNotifActionsCount.decrementAndGet()
+                            finishTransientStopIfIdle(startId)
+                        }
+                    )
+                }
+            }
+        }
     }
 
     private fun loadSavedSettings() {
@@ -452,6 +642,10 @@ class FloatingBubbleService : Service() {
             autoDownloadEnabled = p.getBoolean(PREF_AUTO_DOWNLOAD, true)
             backendUrl = p.getString(PREF_BACKEND_URL, "") ?: ""
             apiKey = p.getString(PREF_API_KEY, "") ?: ""
+            backupBackendUrl = p.getString(PREF_BACKUP_URL, "") ?: ""
+            backupApiKey = p.getString(PREF_BACKUP_API_KEY, "") ?: ""
+            autoSwitchToBackup = p.getBoolean(PREF_AUTO_SWITCH_BACKUP, true)
+            keepBackupAwake = p.getBoolean(PREF_KEEP_BACKUP_AWAKE, false)
             defaultQuality = p.getString(PREF_DEFAULT_QUALITY, "best") ?: "best"
             autoClearEnabled = p.getBoolean(PREF_FLOATING_AUTO_CLEAR, true)
             vibrateEnabled = p.getBoolean(PREF_FLOATING_VIBRATE, true)
@@ -491,10 +685,26 @@ class FloatingBubbleService : Service() {
         newAutoCheckUpdates: Boolean = true,
         newFloatingSide: String? = null,
         newFloatingSize: String? = null,
-        newFloatingOpacity: Int? = null
+        newFloatingOpacity: Int? = null,
+        newBackupUrl: String? = null,
+        newBackupApiKey: String? = null,
+        newAutoSwitchToBackup: Boolean? = null,
+        newKeepBackupAwake: Boolean? = null
     ) {
         backendUrl = newUrl.trim()
         apiKey = newApiKey.trim()
+        if (newBackupUrl != null) {
+            backupBackendUrl = newBackupUrl.trim()
+        }
+        if (newBackupApiKey != null) {
+            backupApiKey = newBackupApiKey.trim()
+        }
+        if (newAutoSwitchToBackup != null) {
+            autoSwitchToBackup = newAutoSwitchToBackup
+        }
+        if (newKeepBackupAwake != null) {
+            keepBackupAwake = newKeepBackupAwake
+        }
         defaultQuality = newQuality
         autoDownloadEnabled = newAutoDownload
         autoClearEnabled = newAutoClear
@@ -513,6 +723,10 @@ class FloatingBubbleService : Service() {
         prefs?.edit()?.apply {
             this.putString(PREF_BACKEND_URL, backendUrl)
             this.putString(PREF_API_KEY, apiKey)
+            this.putString(PREF_BACKUP_URL, backupBackendUrl)
+            this.putString(PREF_BACKUP_API_KEY, backupApiKey)
+            this.putBoolean(PREF_AUTO_SWITCH_BACKUP, autoSwitchToBackup)
+            this.putBoolean(PREF_KEEP_BACKUP_AWAKE, keepBackupAwake)
             this.putString(PREF_DEFAULT_QUALITY, defaultQuality)
             this.putBoolean(PREF_AUTO_DOWNLOAD, autoDownloadEnabled)
             this.putBoolean(PREF_FLOATING_AUTO_CLEAR, autoClearEnabled)
@@ -620,6 +834,7 @@ class FloatingBubbleService : Service() {
                 } else {
                     updateForegroundVisibility()
                 }
+                startTabRuntimeLoops()
                 updateKeepAliveUI()
             } else {
                 removeTabViews()
@@ -956,6 +1171,37 @@ class FloatingBubbleService : Service() {
             }
             this.layoutParams = lp
         }
+
+        val activeServerRow = LinearLayout(this).apply {
+            this.orientation = LinearLayout.HORIZONTAL
+            this.gravity = Gravity.CENTER_VERTICAL
+            val alp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                this.bottomMargin = (6 * density).toInt()
+            }
+            this.layoutParams = alp
+        }
+        val activeLed = View(this).apply {
+            val dlp = LinearLayout.LayoutParams((7 * density).toInt(), (7 * density).toInt()).apply {
+                this.rightMargin = (6 * density).toInt()
+            }
+            this.layoutParams = dlp
+            this.background = createCircleDrawable(Color.parseColor("#00F0FF"))
+        }
+        activeServerLedDot = activeLed
+        val activeTv = TextView(this).apply {
+            this.text = "ACTIVE SERVER: PRIMARY"
+            this.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f)
+            this.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            this.setTextColor(Color.parseColor("#67E8F9"))
+            this.setSingleLine(true)
+            this.maxLines = 1
+            this.ellipsize = TextUtils.TruncateAt.END
+            this.includeFontPadding = false
+        }
+        activeServerStatusText = activeTv
+        activeServerRow.addView(activeLed)
+        activeServerRow.addView(activeTv)
+        serverCoreCard.addView(activeServerRow)
 
         val serverCoreTop = LinearLayout(this).apply {
             this.orientation = LinearLayout.HORIZONTAL
@@ -1710,6 +1956,11 @@ class FloatingBubbleService : Service() {
         isWaitingForBytes = false
         wakeRetryStatusText = null
         mainHandler.removeCallbacks(downloadWaitTimerRunnable)
+        activeDownloadControl?.cancelled?.set(true)
+        if (activeDownloadNotifId > 0) {
+            NotificationHelper.cancelNotification(this, activeDownloadNotifId)
+            activeDownloadNotifId = -1
+        }
         try { activeDownloadOutputStream?.close() } catch (_: Exception) {}
         val connToAbort = activeDownloadConnection
         activeDownloadConnection = null
@@ -1722,8 +1973,10 @@ class FloatingBubbleService : Service() {
             try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
         }
         activeNormalizedUrl?.let { url ->
+            VideoDownloaderPlugin.activeDownloadControls.remove(url)
             VideoDownloaderPlugin.inFlightDownloads.remove(url)
         }
+        activeDownloadControl = null
         isDownloading = false
         currentDownloadSpeedMb = 0.0
         mainHandler.post {
@@ -2144,7 +2397,8 @@ class FloatingBubbleService : Service() {
     }
 
     private fun startBackgroundDownload(videoUrl: String, force: Boolean = false) {
-        if (backendUrl.isBlank()) {
+        val initialCandidates = VideoDownloaderPlugin.buildCandidateServers(this@FloatingBubbleService)
+        if (initialCandidates.isEmpty()) {
             Toast.makeText(this, "Set Render Backend URL in OmniDrop Settings", Toast.LENGTH_LONG).show()
             progressContainer?.visibility = View.VISIBLE
             progressStatusText?.text = "Server URL missing in Settings."
@@ -2168,6 +2422,29 @@ class FloatingBubbleService : Service() {
         activeDownloadConnection = null
         activeDownloadOutputStream = null
         lastFailedUrl = null
+
+        val notifId = NotificationHelper.nextNotificationId()
+        activeDownloadNotifId = notifId
+        val control = VideoDownloaderPlugin.Companion.ActiveDownloadControl(
+            normalizedUrl = normalizedUrl,
+            notifId = notifId,
+            onCancelUiCallback = {
+                mainHandler.post { cancelCurrentDownload() }
+            }
+        )
+        activeDownloadControl = control
+        VideoDownloaderPlugin.activeDownloadControls[normalizedUrl] = control
+
+        NotificationHelper.showDownloadProgressNotification(
+            context = this@FloatingBubbleService,
+            notifId = notifId,
+            downloadUrl = normalizedUrl,
+            title = "OmniDrop Download",
+            percent = 0,
+            speedMb = 0.0,
+            isIndeterminate = true,
+            statusOverride = "Connecting..."
+        )
 
         mainHandler.post {
             resetIdleFade()
@@ -2194,237 +2471,408 @@ class FloatingBubbleService : Service() {
             var streamSucceeded = false
             val operationStartMs = System.currentTimeMillis()
             val maxOperationMs = 300_000L
+            var effectiveQuality = VideoDownloaderPlugin.resolveEffectiveQuality(this@FloatingBubbleService, defaultQuality)
 
             try {
-                if (isDownloadCancelled) throw InterruptedException("Cancelled")
+                if (isDownloadCancelled || control.cancelled.get()) throw InterruptedException("Cancelled")
 
-                // Step 1: Optional POST /info with 25s timeout (failure never blocks download)
-                var thumbnail = ""
-                var uploader = "Creator"
-                var platform = ""
-                val availableQualities = HashSet<String>()
-
-                try {
-                    val infoEndpoint = "${backendUrl.removeSuffix("/")}/info"
-                    val infoHeaders = HashMap<String, String>().apply {
-                        this["Content-Type"] = "application/json; charset=UTF-8"
-                        if (apiKey.isNotBlank()) this["x-api-key"] = apiKey
-                    }
-                    val iPayload = JSONObject().apply { this.put("url", normalizedUrl) }
-                    val infoResp = VideoDownloaderPlugin.httpRequest(
-                        context = this@FloatingBubbleService,
-                        method = "POST",
-                        url = infoEndpoint,
-                        headers = infoHeaders,
-                        body = iPayload.toString(),
-                        connectTimeoutMs = 25000,
-                        readTimeoutMs = 25000,
-                        streamBody = false,
-                        connectionRefCallback = { activeDownloadConnection = it }
-                    )
-                    activeDownloadConnection = null
-                    if (infoResp.statusCode in 200..299) {
-                        val respText = infoResp.bodyText()
-                        if (respText.isNotBlank()) {
-                            val json = JSONObject(respText)
-                            title = json.optString("title", "")
-                            thumbnail = json.optString("thumbnail", "")
-                            uploader = json.optString("uploader", "Creator")
-                            platform = json.optString("platform", "")
-                            val qArr = json.optJSONArray("qualities")
-                            if (qArr != null) {
-                                for (qi in 0 until qArr.length()) {
-                                    val qItem = qArr.optString(qi, "").lowercase()
-                                    if (qItem.isNotBlank()) availableQualities.add(qItem)
-                                }
-                            }
-                        }
-                    }
-                } catch (_: Throwable) {}
-
-                if (isDownloadCancelled) throw InterruptedException("Cancelled")
-
-                val cleanPlatform = VideoDownloaderPlugin.cleanPlatformName(platform, normalizedUrl)
-                val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
-                val dateStr = sdf.format(java.util.Date())
-
-                if (title.isBlank() || title.equals("video", ignoreCase = true) || title.startsWith("OmniDrop", ignoreCase = true)) {
-                    title = "$cleanPlatform video - $dateStr"
+                val candidates = VideoDownloaderPlugin.buildCandidateServers(this@FloatingBubbleService)
+                if (candidates.isEmpty()) {
+                    throw java.io.IOException("Server URL missing in Settings.")
                 }
 
                 val fallbackToBest = prefs?.getBoolean("fallback_to_best", true) ?: true
-                var effectiveQuality = VideoDownloaderPlugin.resolveEffectiveQuality(this@FloatingBubbleService, defaultQuality)
-                if (fallbackToBest && availableQualities.isNotEmpty() && !effectiveQuality.equals("best", ignoreCase = true) && !effectiveQuality.equals("audio", ignoreCase = true)) {
-                    if (!availableQualities.contains(effectiveQuality.lowercase())) {
-                        effectiveQuality = "best"
-                    }
-                }
-
-                // Step 2: Direct POST /download with wake-up retry only when needed (timeout, connection error, or HTTP 502/503/504)
-                val downloadEndpoint = "${backendUrl.removeSuffix("/")}/download"
-                val dlHeaders = HashMap<String, String>().apply {
-                    this["Content-Type"] = "application/json; charset=UTF-8"
-                    this["Accept"] = "*/*"
-                    if (apiKey.isNotBlank()) this["x-api-key"] = apiKey
-                }
-
                 var activeResp: VideoDownloaderPlugin.HttpResponseData? = null
-                val maxAttempts = 6
-                for (attempt in 1..maxAttempts) {
-                    if (isDownloadCancelled) throw InterruptedException("Cancelled")
-                    val elapsedTotal = System.currentTimeMillis() - operationStartMs
-                    if (elapsedTotal >= maxOperationMs) {
-                        throw java.io.IOException("Timed out after 5m limit")
-                    }
+                var winningServer: VideoDownloaderPlugin.Companion.ServerEndpoint = candidates[0]
+                var thumbnail = ""
+                var uploader = "Creator"
+                var cleanPlatform = VideoDownloaderPlugin.detectPlatformName(normalizedUrl)
+                val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
+                var dateStr = sdf.format(java.util.Date())
+                effectiveQuality = VideoDownloaderPlugin.resolveEffectiveQuality(this@FloatingBubbleService, defaultQuality)
 
-                    if (attempt > 1) {
-                        val wakeMsg = "SERVER IS WAKING UP... attempt $attempt/$maxAttempts"
-                        wakeRetryStatusText = wakeMsg
+                for (serverIdx in candidates.indices) {
+                    if (isDownloadCancelled) throw InterruptedException("Cancelled")
+                    val server = candidates[serverIdx]
+                    val hasNextCandidate = serverIdx < candidates.size - 1
+                    val roleTag = if (server.role == "backup") "[BACKUP] " else ""
+                    val currentBaseUrl = server.baseUrl
+                    val currentApiKey = server.apiKey
+
+                    if (serverIdx > 0) {
+                        val switchLabel = "${roleTag}CONNECTING..."
+                        wakeRetryStatusText = switchLabel
                         mainHandler.post {
-                            progressStatusText?.text = wakeMsg
+                            progressStatusText?.text = switchLabel
                         }
                     }
 
-                    val payload = JSONObject().apply {
-                        this.put("url", normalizedUrl)
-                        this.put("quality", effectiveQuality)
-                    }
-                    var resp = VideoDownloaderPlugin.httpRequest(
-                        context = this@FloatingBubbleService,
-                        method = "POST",
-                        url = downloadEndpoint,
-                        headers = dlHeaders,
-                        body = payload.toString(),
-                        connectTimeoutMs = 30000,
-                        readTimeoutMs = 180000,
-                        streamBody = true,
-                        connectionRefCallback = {
-                            conn = it
-                            activeDownloadConnection = it
+                    // Step 1: Optional POST /info with 25s timeout (failure never blocks download)
+                    var platform = ""
+                    val availableQualities = HashSet<String>()
+
+                    try {
+                        val infoEndpoint = "$currentBaseUrl/info"
+                        val infoHeaders = HashMap<String, String>().apply {
+                            this["Content-Type"] = "application/json; charset=UTF-8"
+                            if (currentApiKey.isNotBlank()) this["x-api-key"] = currentApiKey
                         }
-                    )
+                        val iPayload = JSONObject().apply { this.put("url", normalizedUrl) }
+                        val infoResp = VideoDownloaderPlugin.httpRequest(
+                            context = this@FloatingBubbleService,
+                            method = "POST",
+                            url = infoEndpoint,
+                            headers = infoHeaders,
+                            body = iPayload.toString(),
+                            connectTimeoutMs = 25000,
+                            readTimeoutMs = 25000,
+                            streamBody = false,
+                            connectionRefCallback = { activeDownloadConnection = it }
+                        )
+                        activeDownloadConnection = null
+                        if (infoResp.statusCode in 200..299) {
+                            val respText = infoResp.bodyText()
+                            if (respText.isNotBlank()) {
+                                val json = JSONObject(respText)
+                                val jsonTitle = json.optString("title", "")
+                                if (jsonTitle.isNotBlank()) {
+                                    title = jsonTitle
+                                }
+                                thumbnail = json.optString("thumbnail", "")
+                                uploader = json.optString("uploader", "Creator")
+                                platform = json.optString("platform", "")
+                                val qArr = json.optJSONArray("qualities")
+                                if (qArr != null) {
+                                    for (qi in 0 until qArr.length()) {
+                                        val qItem = qArr.optString(qi, "").lowercase()
+                                        if (qItem.isNotBlank()) availableQualities.add(qItem)
+                                    }
+                                }
+                            }
+                        }
+                    } catch (_: Throwable) {}
 
                     if (isDownloadCancelled) throw InterruptedException("Cancelled")
 
-                    if (resp.statusCode !in 200..299 &&
-                        resp.statusCode !in listOf(0, 502, 503, 504) &&
-                        fallbackToBest &&
-                        !effectiveQuality.equals("best", ignoreCase = true) &&
-                        !effectiveQuality.equals("audio", ignoreCase = true)
-                    ) {
-                        effectiveQuality = "best"
-                        val fallbackPayload = JSONObject().apply {
+                    cleanPlatform = VideoDownloaderPlugin.cleanPlatformName(platform, normalizedUrl)
+                    dateStr = sdf.format(java.util.Date())
+
+                    if (title.isBlank() || title.equals("video", ignoreCase = true) || title.startsWith("OmniDrop", ignoreCase = true)) {
+                        title = "$cleanPlatform video - $dateStr"
+                    }
+
+                    effectiveQuality = VideoDownloaderPlugin.resolveEffectiveQuality(this@FloatingBubbleService, defaultQuality)
+                    if (fallbackToBest && availableQualities.isNotEmpty() && !effectiveQuality.equals("best", ignoreCase = true) && !effectiveQuality.equals("audio", ignoreCase = true)) {
+                        if (!availableQualities.contains(effectiveQuality.lowercase())) {
+                            effectiveQuality = "best"
+                        }
+                    }
+
+                    // Step 2: Direct POST /download with wake-up retry & backup failover
+                    val downloadEndpoint = "$currentBaseUrl/download"
+                    val dlHeaders = HashMap<String, String>().apply {
+                        this["Content-Type"] = "application/json; charset=UTF-8"
+                        this["Accept"] = "*/*"
+                        if (currentApiKey.isNotBlank()) this["x-api-key"] = currentApiKey
+                    }
+
+                    var shouldFailover = false
+                    val maxAttempts = 6
+                    for (attempt in 1..maxAttempts) {
+                        if (isDownloadCancelled) throw InterruptedException("Cancelled")
+                        val elapsedTotal = System.currentTimeMillis() - operationStartMs
+                        if (elapsedTotal >= maxOperationMs) {
+                            throw java.io.IOException("Timed out after 5m limit")
+                        }
+
+                        if (attempt > 1) {
+                            val wakeMsg = "${roleTag}SERVER IS WAKING UP... attempt $attempt/$maxAttempts"
+                            wakeRetryStatusText = wakeMsg
+                            mainHandler.post {
+                                progressStatusText?.text = wakeMsg
+                            }
+                            NotificationHelper.showDownloadProgressNotification(
+                                context = this@FloatingBubbleService,
+                                notifId = notifId,
+                                downloadUrl = normalizedUrl,
+                                title = title,
+                                percent = 0,
+                                speedMb = 0.0,
+                                isIndeterminate = true,
+                                statusOverride = wakeMsg
+                            )
+                        } else if (serverIdx > 0) {
+                            wakeRetryStatusText = "${roleTag}CONNECTING..."
+                            mainHandler.post {
+                                progressStatusText?.text = "${roleTag}CONNECTING..."
+                            }
+                            NotificationHelper.showDownloadProgressNotification(
+                                context = this@FloatingBubbleService,
+                                notifId = notifId,
+                                downloadUrl = normalizedUrl,
+                                title = title,
+                                percent = 0,
+                                speedMb = 0.0,
+                                isIndeterminate = true,
+                                statusOverride = "${roleTag}Connecting..."
+                            )
+                        } else {
+                            NotificationHelper.showDownloadProgressNotification(
+                                context = this@FloatingBubbleService,
+                                notifId = notifId,
+                                downloadUrl = normalizedUrl,
+                                title = title,
+                                percent = 0,
+                                speedMb = 0.0,
+                                isIndeterminate = true,
+                                statusOverride = "Connecting..."
+                            )
+                        }
+
+                        val payload = JSONObject().apply {
                             this.put("url", normalizedUrl)
                             this.put("quality", effectiveQuality)
                         }
-                        resp = VideoDownloaderPlugin.httpRequest(
+                        var resp = VideoDownloaderPlugin.httpRequest(
                             context = this@FloatingBubbleService,
                             method = "POST",
                             url = downloadEndpoint,
                             headers = dlHeaders,
-                            body = fallbackPayload.toString(),
+                            body = payload.toString(),
                             connectTimeoutMs = 30000,
                             readTimeoutMs = 180000,
                             streamBody = true,
                             connectionRefCallback = {
                                 conn = it
                                 activeDownloadConnection = it
+                                control.connection = it
                             }
                         )
+
                         if (isDownloadCancelled) throw InterruptedException("Cancelled")
+
+                        if (resp.statusCode !in 200..299 &&
+                            resp.statusCode !in listOf(0, 502, 503, 504) &&
+                            fallbackToBest &&
+                            !effectiveQuality.equals("best", ignoreCase = true) &&
+                            !effectiveQuality.equals("audio", ignoreCase = true)
+                        ) {
+                            effectiveQuality = "best"
+                            val fallbackPayload = JSONObject().apply {
+                                this.put("url", normalizedUrl)
+                                this.put("quality", effectiveQuality)
+                            }
+                            resp = VideoDownloaderPlugin.httpRequest(
+                                context = this@FloatingBubbleService,
+                                method = "POST",
+                                url = downloadEndpoint,
+                                headers = dlHeaders,
+                                body = fallbackPayload.toString(),
+                                connectTimeoutMs = 30000,
+                                readTimeoutMs = 180000,
+                                streamBody = true,
+                                connectionRefCallback = {
+                                    conn = it
+                                    activeDownloadConnection = it
+                                }
+                            )
+                            if (isDownloadCancelled) throw InterruptedException("Cancelled")
+                        }
+
+                        if (resp.statusCode in 200..299 && resp.inputStream != null) {
+                            activeResp = resp
+                            winningServer = server
+                            break
+                        }
+
+                        // Fail fast if phone has no internet connection
+                        if (resp.isNoInternet) {
+                            isWaitingForBytes = false
+                            mainHandler.removeCallbacks(downloadWaitTimerRunnable)
+                            val offlineReason = "No internet"
+                            lastFailedUrl = normalizedUrl
+                            currentDownloadSpeedMb = 0.0
+                            VideoDownloaderPlugin.recordFailedLink(this@FloatingBubbleService, normalizedUrl, cleanPlatform, title, offlineReason)
+                            VideoDownloaderPlugin.recordFailedStat(this@FloatingBubbleService)
+                            val notifyFail = prefs?.getBoolean("notify_download_fail", true) ?: true
+                            if (notifyFail) {
+                                NotificationHelper.showDownloadFailedNotification(
+                                    context = this@FloatingBubbleService,
+                                    title = "Download Failed",
+                                    message = offlineReason,
+                                    failedUrl = normalizedUrl,
+                                    quality = effectiveQuality
+                                )
+                            }
+                            mainHandler.post {
+                                progressStatusText?.text = offlineReason
+                                progressSpeedText?.text = "ERR"
+                                isDownloading = false
+                                speedArcGaugeView?.setSpeedMb(0f)
+                                tabInnerFrame?.setFailed()
+                                panelMachineCard?.setGlowColor(Color.parseColor("#EF4444"))
+                                segmentedProgressBar?.setProgressColor(Color.parseColor("#EF4444"))
+                                retryBtn?.visibility = View.VISIBLE
+                                updateSmartKeyUI()
+                                refreshClipboardHintChip()
+                                performHapticFeedback(isSuccess = false)
+                                mainHandler.postDelayed({ processNextInQueue() }, 1200L)
+                            }
+                            return@execute
+                        }
+
+                        // Immediate failover on DNS or connection error
+                        if (resp.isConnectionError && hasNextCandidate) {
+                            val nextLabel = if (candidates[serverIdx + 1].role == "backup") "backup" else "primary"
+                            val switchMsg = "Switching to $nextLabel server..."
+                            wakeRetryStatusText = switchMsg
+                            mainHandler.post {
+                                progressStatusText?.text = switchMsg
+                            }
+                            NotificationHelper.showDownloadProgressNotification(
+                                context = this@FloatingBubbleService,
+                                notifId = notifId,
+                                downloadUrl = normalizedUrl,
+                                title = title,
+                                percent = 0,
+                                speedMb = 0.0,
+                                isIndeterminate = true,
+                                statusOverride = switchMsg
+                            )
+                            shouldFailover = true
+                            break
+                        }
+
+                        val isWakeRetryable = (
+                            resp.isTimeout ||
+                            resp.isConnectionError ||
+                            resp.statusCode == 502 ||
+                            resp.statusCode == 503 ||
+                            resp.statusCode == 504
+                        )
+
+                        if (!isWakeRetryable) {
+                            isWaitingForBytes = false
+                            mainHandler.removeCallbacks(downloadWaitTimerRunnable)
+                            val immediateReason = resp.friendlyError.ifBlank { "Server returned ${resp.statusCode}" }
+                            lastFailedUrl = normalizedUrl
+                            currentDownloadSpeedMb = 0.0
+                            VideoDownloaderPlugin.recordFailedLink(this@FloatingBubbleService, normalizedUrl, cleanPlatform, title, immediateReason)
+                            VideoDownloaderPlugin.recordFailedStat(this@FloatingBubbleService)
+                            val notifyFail = prefs?.getBoolean("notify_download_fail", true) ?: true
+                            if (notifyFail) {
+                                NotificationHelper.showDownloadFailedNotification(
+                                    context = this@FloatingBubbleService,
+                                    title = "Download Failed",
+                                    message = immediateReason,
+                                    failedUrl = normalizedUrl,
+                                    quality = effectiveQuality
+                                )
+                            }
+                            mainHandler.post {
+                                progressStatusText?.text = immediateReason
+                                progressSpeedText?.text = "ERR"
+                                isDownloading = false
+                                speedArcGaugeView?.setSpeedMb(0f)
+                                tabInnerFrame?.setFailed()
+                                panelMachineCard?.setGlowColor(Color.parseColor("#EF4444"))
+                                segmentedProgressBar?.setProgressColor(Color.parseColor("#EF4444"))
+                                retryBtn?.visibility = View.VISIBLE
+                                updateSmartKeyUI()
+                                refreshClipboardHintChip()
+                                performHapticFeedback(isSuccess = false)
+                                mainHandler.postDelayed({ processNextInQueue() }, 1200L)
+                            }
+                            return@execute
+                        }
+
+                        if (attempt < maxAttempts) {
+                            val remainingMs = maxOperationMs - (System.currentTimeMillis() - operationStartMs)
+                            if (remainingMs <= 0L) {
+                                if (hasNextCandidate) {
+                                    shouldFailover = true
+                                    break
+                                }
+                                throw java.io.IOException("Timed out after 5m limit (${resp.friendlyError})")
+                            }
+                            val nextWakeMsg = "${roleTag}SERVER IS WAKING UP... attempt ${attempt + 1}/$maxAttempts"
+                            wakeRetryStatusText = nextWakeMsg
+                            mainHandler.post {
+                                progressStatusText?.text = nextWakeMsg
+                            }
+                            NotificationHelper.showDownloadProgressNotification(
+                                context = this@FloatingBubbleService,
+                                notifId = notifId,
+                                downloadUrl = normalizedUrl,
+                                title = title,
+                                percent = 0,
+                                speedMb = 0.0,
+                                isIndeterminate = true,
+                                statusOverride = nextWakeMsg
+                            )
+                            var slept = 0L
+                            val targetSleep = minOf(5000L, remainingMs)
+                            while (slept < targetSleep) {
+                                if (isDownloadCancelled || control.cancelled.get()) throw InterruptedException("Cancelled")
+                                val step = minOf(200L, targetSleep - slept)
+                                Thread.sleep(step)
+                                slept += step
+                            }
+                        } else if (hasNextCandidate) {
+                            val nextLabel = if (candidates[serverIdx + 1].role == "backup") "backup" else "primary"
+                            val switchMsg = "Switching to $nextLabel server..."
+                            wakeRetryStatusText = switchMsg
+                            mainHandler.post {
+                                progressStatusText?.text = switchMsg
+                            }
+                            shouldFailover = true
+                            break
+                        } else {
+                            isWaitingForBytes = false
+                            mainHandler.removeCallbacks(downloadWaitTimerRunnable)
+                            val finalReason = resp.friendlyError.ifBlank { "Server failed after $maxAttempts attempts" }
+                            lastFailedUrl = normalizedUrl
+                            currentDownloadSpeedMb = 0.0
+                            VideoDownloaderPlugin.recordFailedLink(this@FloatingBubbleService, normalizedUrl, cleanPlatform, title, finalReason)
+                            VideoDownloaderPlugin.recordFailedStat(this@FloatingBubbleService)
+                            val notifyFail = prefs?.getBoolean("notify_download_fail", true) ?: true
+                            if (notifyFail) {
+                                NotificationHelper.showDownloadFailedNotification(
+                                    context = this@FloatingBubbleService,
+                                    title = "Download Failed",
+                                    message = finalReason,
+                                    failedUrl = normalizedUrl,
+                                    quality = effectiveQuality
+                                )
+                            }
+                            mainHandler.post {
+                                progressStatusText?.text = finalReason
+                                progressSpeedText?.text = "ERR"
+                                isDownloading = false
+                                speedArcGaugeView?.setSpeedMb(0f)
+                                tabInnerFrame?.setFailed()
+                                panelMachineCard?.setGlowColor(Color.parseColor("#EF4444"))
+                                segmentedProgressBar?.setProgressColor(Color.parseColor("#EF4444"))
+                                retryBtn?.visibility = View.VISIBLE
+                                updateSmartKeyUI()
+                                refreshClipboardHintChip()
+                                performHapticFeedback(isSuccess = false)
+                                mainHandler.postDelayed({ processNextInQueue() }, 1200L)
+                            }
+                            return@execute
+                        }
                     }
 
-                    if (resp.statusCode in 200..299 && resp.inputStream != null) {
-                        activeResp = resp
+                    if (activeResp != null) {
                         break
                     }
-
-                    val isWakeRetryable = !resp.isNoInternet && (
-                        resp.isTimeout ||
-                        resp.isConnectionError ||
-                        resp.statusCode == 502 ||
-                        resp.statusCode == 503 ||
-                        resp.statusCode == 504
-                    )
-
-                    if (!isWakeRetryable) {
-                        isWaitingForBytes = false
-                        mainHandler.removeCallbacks(downloadWaitTimerRunnable)
-                        val immediateReason = resp.friendlyError.ifBlank { "Server returned ${resp.statusCode}" }
-                        lastFailedUrl = normalizedUrl
-                        currentDownloadSpeedMb = 0.0
-                        VideoDownloaderPlugin.recordFailedLink(this@FloatingBubbleService, normalizedUrl, cleanPlatform, title, immediateReason)
-                        VideoDownloaderPlugin.recordFailedStat(this@FloatingBubbleService)
-                        val notifyFail = prefs?.getBoolean("notify_download_fail", true) ?: true
-                        if (notifyFail) {
-                            NotificationHelper.showDownloadFailedNotification(this@FloatingBubbleService, "Download Failed", immediateReason)
-                        }
-                        mainHandler.post {
-                            progressStatusText?.text = immediateReason
-                            progressSpeedText?.text = "ERR"
-                            isDownloading = false
-                            speedArcGaugeView?.setSpeedMb(0f)
-                            tabInnerFrame?.setFailed()
-                            panelMachineCard?.setGlowColor(Color.parseColor("#EF4444"))
-                            segmentedProgressBar?.setProgressColor(Color.parseColor("#EF4444"))
-                            retryBtn?.visibility = View.VISIBLE
-                            updateSmartKeyUI()
-                            refreshClipboardHintChip()
-                            performHapticFeedback(isSuccess = false)
-                            mainHandler.postDelayed({ processNextInQueue() }, 1200L)
-                        }
-                        return@execute
-                    }
-
-                    if (attempt < maxAttempts) {
-                        val remainingMs = maxOperationMs - (System.currentTimeMillis() - operationStartMs)
-                        if (remainingMs <= 0L) {
-                            throw java.io.IOException("Timed out after 5m limit (${resp.friendlyError})")
-                        }
-                        val nextWakeMsg = "SERVER IS WAKING UP... attempt ${attempt + 1}/$maxAttempts"
-                        wakeRetryStatusText = nextWakeMsg
-                        mainHandler.post {
-                            progressStatusText?.text = nextWakeMsg
-                        }
-                        var slept = 0L
-                        val targetSleep = minOf(5000L, remainingMs)
-                        while (slept < targetSleep) {
-                            if (isDownloadCancelled) throw InterruptedException("Cancelled")
-                            val step = minOf(200L, targetSleep - slept)
-                            Thread.sleep(step)
-                            slept += step
-                        }
-                    } else {
-                        isWaitingForBytes = false
-                        mainHandler.removeCallbacks(downloadWaitTimerRunnable)
-                        val finalReason = resp.friendlyError.ifBlank { "Server failed after $maxAttempts attempts" }
-                        lastFailedUrl = normalizedUrl
-                        currentDownloadSpeedMb = 0.0
-                        VideoDownloaderPlugin.recordFailedLink(this@FloatingBubbleService, normalizedUrl, cleanPlatform, title, finalReason)
-                        VideoDownloaderPlugin.recordFailedStat(this@FloatingBubbleService)
-                        val notifyFail = prefs?.getBoolean("notify_download_fail", true) ?: true
-                        if (notifyFail) {
-                            NotificationHelper.showDownloadFailedNotification(this@FloatingBubbleService, "Download Failed", finalReason)
-                        }
-                        mainHandler.post {
-                            progressStatusText?.text = finalReason
-                            progressSpeedText?.text = "ERR"
-                            isDownloading = false
-                            speedArcGaugeView?.setSpeedMb(0f)
-                            tabInnerFrame?.setFailed()
-                            panelMachineCard?.setGlowColor(Color.parseColor("#EF4444"))
-                            segmentedProgressBar?.setProgressColor(Color.parseColor("#EF4444"))
-                            retryBtn?.visibility = View.VISIBLE
-                            updateSmartKeyUI()
-                            refreshClipboardHintChip()
-                            performHapticFeedback(isSuccess = false)
-                            mainHandler.postDelayed({ processNextInQueue() }, 1200L)
-                        }
-                        return@execute
+                    if (!shouldFailover) {
+                        break
                     }
                 }
 
                 val readyResp = activeResp ?: throw java.io.IOException("No response stream from server")
+                VideoDownloaderPlugin.setStickyActiveRole(this@FloatingBubbleService, winningServer.role)
                 conn = readyResp.connection
                 val respStream = readyResp.inputStream ?: throw java.io.IOException("Empty response stream from server")
 
@@ -2499,6 +2947,16 @@ class FloatingBubbleService : Service() {
                                     progressStatusText?.text = "Saving photo $currentCount to Pictures/OmniDrop..."
                                     progressSpeedText?.text = "SAVING"
                                 }
+                                NotificationHelper.showDownloadProgressNotification(
+                                    context = this@FloatingBubbleService,
+                                    notifId = notifId,
+                                    downloadUrl = normalizedUrl,
+                                    title = title,
+                                    percent = (30 + (currentCount * 5)).coerceAtMost(95),
+                                    speedMb = 0.0,
+                                    isIndeterminate = true,
+                                    statusOverride = "Saving photo $currentCount..."
+                                )
                             }
                         }
                         zis.closeEntry()
@@ -2510,6 +2968,7 @@ class FloatingBubbleService : Service() {
                     val totalPhotos = savedUris.size
                     val firstUri = savedUris.firstOrNull()?.toString() ?: ""
                     val archiveFileName = "$title [TikTok photos]"
+                    val photoUriStrings = savedUris.map { it.toString() }
                     val savedTimestamp = System.currentTimeMillis()
                     recentDownloads[normalizedUrl] = savedTimestamp
                     lastFinishedFileUri = firstUri
@@ -2544,17 +3003,21 @@ class FloatingBubbleService : Service() {
                     }
                     VideoDownloaderPlugin.saveHistoryEntry(this@FloatingBubbleService, historyEntry)
                     VideoDownloaderPlugin.instance?.emitNativeDownloadFinished(historyEntry)
+                    VideoDownloaderPlugin.instance?.emitLibraryChanged()
                     VideoDownloaderPlugin.removeFailedLinkByUrl(this@FloatingBubbleService, normalizedUrl)
                     VideoDownloaderPlugin.recordDownloadStat(this@FloatingBubbleService, "TikTok", "photo", (totalPhotos.toLong() * 800L * 1024L))
 
+                    NotificationHelper.cancelNotification(this@FloatingBubbleService, notifId)
                     val notifyFinish = prefs?.getBoolean("notify_download_finish", true) ?: true
                     if (notifyFinish) {
                         NotificationHelper.showDownloadFinishedNotification(
-                            this@FloatingBubbleService,
-                            "Saved $totalPhotos photos",
-                            "Saved to Pictures/OmniDrop",
-                            firstUri,
-                            isImage = true
+                            context = this@FloatingBubbleService,
+                            title = title,
+                            message = if (totalPhotos == 1) "Saved 1 photo" else "Saved $totalPhotos photos",
+                            filePath = firstUri,
+                            isImage = true,
+                            thumbnailUrl = thumbnail,
+                            photoUris = photoUriStrings
                         )
                     }
 
@@ -2651,9 +3114,11 @@ class FloatingBubbleService : Service() {
                     return@execute
                 }
                 activeTargetUri = targetUri
+                control.targetUri = targetUri
 
                 output = resolver.openOutputStream(targetUri)
                 activeDownloadOutputStream = output
+                control.outputStream = output
                 input = respStream
                 val totalBytes = readyResp.contentLength
 
@@ -2661,10 +3126,11 @@ class FloatingBubbleService : Service() {
                 val buffer = ByteArray(8192)
                 var bytesRead: Int
                 var lastProgressUpdate = System.currentTimeMillis()
+                var lastNotifUpdateTime = 0L
                 var bytesSinceLastSample: Long = 0
 
                 while (input.read(buffer).also { bytesRead = it } != -1) {
-                    if (isDownloadCancelled) throw InterruptedException("Cancelled")
+                    if (isDownloadCancelled || control.cancelled.get()) throw InterruptedException("Cancelled")
                     if (isWaitingForBytes) {
                         isWaitingForBytes = false
                         mainHandler.removeCallbacks(downloadWaitTimerRunnable)
@@ -2694,8 +3160,21 @@ class FloatingBubbleService : Service() {
                             progressStatusText?.text = "DOWNLOADING... $totalMb MB ($pct%)"
                             progressSpeedText?.text = String.format(Locale.US, "DN %.1f MB/s", speedMbPerSec)
                         }
+                        if (now - lastNotifUpdateTime >= 500L) {
+                            lastNotifUpdateTime = now
+                            NotificationHelper.showDownloadProgressNotification(
+                                context = this@FloatingBubbleService,
+                                notifId = notifId,
+                                downloadUrl = normalizedUrl,
+                                title = title,
+                                percent = pct,
+                                speedMb = speedMbPerSec,
+                                isIndeterminate = (totalBytes <= 0L)
+                            )
+                        }
                     }
                 }
+                if (isDownloadCancelled || control.cancelled.get()) throw InterruptedException("Cancelled")
                 output?.flush()
                 streamSucceeded = true
 
@@ -2706,6 +3185,7 @@ class FloatingBubbleService : Service() {
                     resolver.update(targetUri, updateValues, null, null)
                 }
 
+                val savedFolder = if (isAudio) "Music/OmniDrop" else "Movies/OmniDrop"
                 val savedTimestamp = System.currentTimeMillis()
                 recentDownloads[normalizedUrl] = savedTimestamp
                 lastFinishedFileUri = targetUri.toString()
@@ -2736,16 +3216,23 @@ class FloatingBubbleService : Service() {
                 }
                 VideoDownloaderPlugin.saveHistoryEntry(this, historyEntry)
                 VideoDownloaderPlugin.instance?.emitNativeDownloadFinished(historyEntry)
+                VideoDownloaderPlugin.instance?.emitLibraryChanged()
                 VideoDownloaderPlugin.removeFailedLinkByUrl(this, normalizedUrl)
                 VideoDownloaderPlugin.recordDownloadStat(this, cleanPlatform, if (isAudio) "audio" else "video", bytesCopied)
 
+                NotificationHelper.cancelNotification(this, notifId)
                 val notifyFinish = prefs?.getBoolean("notify_download_finish", true) ?: true
                 if (notifyFinish) {
                     NotificationHelper.showDownloadFinishedNotification(
-                        this,
-                        "Saved to Gallery",
-                        "$fileName saved to ${if (isAudio) "Music/OmniDrop" else "Movies/OmniDrop"}",
-                        targetUri.toString()
+                        context = this,
+                        title = title,
+                        message = "$fileName saved to $savedFolder",
+                        filePath = targetUri.toString(),
+                        isImage = false,
+                        isAudio = isAudio,
+                        bytesCopied = bytesCopied,
+                        folderPath = savedFolder,
+                        thumbnailUrl = thumbnail
                     )
                 }
 
@@ -2795,7 +3282,7 @@ class FloatingBubbleService : Service() {
                     try { contentResolver.delete(targetUri, null, null) } catch (_: Exception) {}
                 }
                 currentDownloadSpeedMb = 0.0
-                if (isDownloadCancelled) {
+                if (isDownloadCancelled || control.cancelled.get()) {
                     mainHandler.post {
                         progressStatusText?.text = "Cancelled"
                         progressSpeedText?.text = ""
@@ -2816,7 +3303,13 @@ class FloatingBubbleService : Service() {
                     VideoDownloaderPlugin.recordFailedStat(this@FloatingBubbleService)
                     val notifyFail = prefs?.getBoolean("notify_download_fail", true) ?: true
                     if (notifyFail) {
-                        NotificationHelper.showDownloadFailedNotification(this@FloatingBubbleService, "Download Failed", shortReason)
+                        NotificationHelper.showDownloadFailedNotification(
+                            context = this@FloatingBubbleService,
+                            title = "Download Failed",
+                            message = shortReason,
+                            failedUrl = normalizedUrl,
+                            quality = effectiveQuality
+                        )
                     }
                     mainHandler.post {
                         progressStatusText?.text = shortReason
@@ -2837,13 +3330,17 @@ class FloatingBubbleService : Service() {
                 isWaitingForBytes = false
                 wakeRetryStatusText = null
                 mainHandler.removeCallbacks(downloadWaitTimerRunnable)
+                NotificationHelper.cancelNotification(this@FloatingBubbleService, notifId)
+                activeDownloadNotifId = -1
+                activeDownloadControl = null
+                VideoDownloaderPlugin.activeDownloadControls.remove(normalizedUrl)
                 VideoDownloaderPlugin.inFlightDownloads.remove(normalizedUrl)
                 activeDownloadConnection = null
                 activeDownloadOutputStream = null
                 currentDownloadSpeedMb = 0.0
                 try { input?.close() } catch (_: Exception) {}
                 try { output?.close() } catch (_: Exception) {}
-                if (!streamSucceeded || isDownloadCancelled) {
+                if (!streamSucceeded || isDownloadCancelled || control.cancelled.get()) {
                     try { conn?.disconnect() } catch (_: Throwable) {}
                 }
             }
@@ -3279,6 +3776,30 @@ class FloatingBubbleService : Service() {
                 } catch (_: Throwable) {}
             }
 
+            // Optional keep-alive ping for backup server (only if "Keep backup awake too" is enabled)
+            val backupSnap = VideoDownloaderPlugin.normalizeBaseServerUrl(backupBackendUrl)
+            val backupKeySnap = backupApiKey.trim()
+            if (keepBackupAwake && backupSnap.isNotBlank() && backupSnap != VideoDownloaderPlugin.normalizeBaseServerUrl(urlSnapshot)) {
+                try {
+                    val backupEndpoint = "$backupSnap/health"
+                    val backupHeaders = HashMap<String, String>().apply {
+                        this["User-Agent"] = "OmniDrop-KeepAlive/1.0"
+                        if (backupKeySnap.isNotBlank()) {
+                            this["x-api-key"] = backupKeySnap
+                        }
+                    }
+                    VideoDownloaderPlugin.httpRequest(
+                        context = this@FloatingBubbleService,
+                        method = "GET",
+                        url = backupEndpoint,
+                        headers = backupHeaders,
+                        connectTimeoutMs = 15000,
+                        readTimeoutMs = 20000,
+                        streamBody = false
+                    )
+                } catch (_: Throwable) {}
+            }
+
             if (!isServiceDestroyed) {
                 keepAliveHandler?.postDelayed(keepAliveRunnable, KEEP_ALIVE_INTERVAL_MS)
             }
@@ -3292,10 +3813,51 @@ class FloatingBubbleService : Service() {
         }
     }
 
+    fun refreshActiveServerUI() {
+        mainHandler.post {
+            try {
+                val role = VideoDownloaderPlugin.getStickyActiveRole(this@FloatingBubbleService)
+                if (role == "backup" && backupBackendUrl.trim().isNotBlank() && autoSwitchToBackup) {
+                    activeServerStatusText?.text = "ACTIVE SERVER: BACKUP"
+                    activeServerStatusText?.setTextColor(Color.parseColor("#FBBF24"))
+                    activeServerLedDot?.background = createCircleDrawable(Color.parseColor("#F59E0B"))
+                } else {
+                    activeServerStatusText?.text = "ACTIVE SERVER: PRIMARY"
+                    activeServerStatusText?.setTextColor(Color.parseColor("#67E8F9"))
+                    val dotColor = when {
+                        backendUrl.trim().isBlank() -> Color.parseColor("#64748B")
+                        keepAliveLastStatus == "NO_RESPONSE" || keepAliveLastStatus == "OFFLINE" -> Color.parseColor("#EF4444")
+                        keepAliveLastStatus == "OK" -> Color.parseColor("#10B981")
+                        else -> Color.parseColor("#00F0FF")
+                    }
+                    activeServerLedDot?.background = createCircleDrawable(dotColor)
+                }
+            } catch (_: Throwable) {}
+        }
+    }
+
     private fun updateKeepAliveUI() {
         val now = System.currentTimeMillis()
         val hasUrl = backendUrl.trim().isNotBlank()
         val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
+
+        // Refresh active server badge (PRIMARY vs BACKUP)
+        val stickyRole = VideoDownloaderPlugin.getStickyActiveRole(this@FloatingBubbleService)
+        if (stickyRole == "backup" && backupBackendUrl.trim().isNotBlank() && autoSwitchToBackup) {
+            activeServerStatusText?.text = "ACTIVE SERVER: BACKUP"
+            activeServerStatusText?.setTextColor(Color.parseColor("#FBBF24"))
+            activeServerLedDot?.background = createCircleDrawable(Color.parseColor("#F59E0B"))
+        } else {
+            activeServerStatusText?.text = "ACTIVE SERVER: PRIMARY"
+            activeServerStatusText?.setTextColor(Color.parseColor("#67E8F9"))
+            val dotColor = when {
+                !hasUrl -> Color.parseColor("#64748B")
+                keepAliveLastStatus == "NO_RESPONSE" || keepAliveLastStatus == "OFFLINE" -> Color.parseColor("#EF4444")
+                keepAliveLastStatus == "OK" -> Color.parseColor("#10B981")
+                else -> Color.parseColor("#00F0FF")
+            }
+            activeServerLedDot?.background = createCircleDrawable(dotColor)
+        }
 
         // 1. LED + KEEP-ALIVE ON/OFF label
         if (isTabEnabled && hasUrl && !isServiceDestroyed) {
@@ -3432,11 +3994,13 @@ class FloatingBubbleService : Service() {
         super.onDestroy()
         isServiceDestroyed = true
         instance = null
-        prefs?.edit()?.apply {
-            this.putBoolean("floating_bubble_enabled", false)
-            this.apply()
+        if (isTabEnabled) {
+            prefs?.edit()?.apply {
+                this.putBoolean("floating_bubble_enabled", false)
+                this.apply()
+            }
+            QuickTileService.updateTile(this)
         }
-        QuickTileService.updateTile(this)
         try { unregisterReceiver(screenReceiver) } catch (_: Exception) {}
         mainHandler.removeCallbacks(dualPingRunnable)
         mainHandler.removeCallbacks(trafficRunnable)

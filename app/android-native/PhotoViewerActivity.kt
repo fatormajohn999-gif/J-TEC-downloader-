@@ -95,6 +95,10 @@ class PhotoViewerActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         try {
+            val notifId = intent.getIntExtra("notif_id", -1)
+            if (notifId > 0) {
+                NotificationHelper.cancelNotification(this, notifId)
+            }
             applyPrivacyScreenFlag()
             // Read extras
             val incomingUris = intent.getStringArrayListExtra("photo_uris")

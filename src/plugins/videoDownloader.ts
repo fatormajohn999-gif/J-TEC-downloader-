@@ -1,5 +1,13 @@
 import { registerPlugin, PluginListenerHandle } from '@capacitor/core';
-import { DownloadHistoryItem, VideoLibraryItem, PhotoLibraryItem, FailedDownloadItem, CollectionItem, DownloadStatsData } from '../types';
+import {
+  DownloadHistoryItem,
+  VideoLibraryItem,
+  PhotoLibraryItem,
+  FailedDownloadItem,
+  CollectionItem,
+  DownloadStatsData,
+  SpeedTestResult,
+} from '../types';
 
 export interface SystemChecksResult {
   overlayGranted: boolean;
@@ -61,6 +69,10 @@ export interface VideoDownloaderPlugin {
   saveNativeSettings(options: {
     backendUrl: string;
     apiKey?: string;
+    backupBackendUrl?: string;
+    backupApiKey?: string;
+    autoSwitchToBackup?: boolean;
+    keepBackupAwake?: boolean;
     defaultQuality?: string;
     autoDownload?: boolean;
     autoDownloadOnPaste?: boolean;
@@ -88,6 +100,17 @@ export interface VideoDownloaderPlugin {
     floatingOpacity?: number;
     hideInRecents?: boolean;
   }): Promise<{ saved: boolean }>;
+  getActiveServerStatus(): Promise<{
+    activeServer: 'primary' | 'backup';
+    switchedAt: number;
+    remainingSeconds: number;
+  }>;
+  setActiveServerStatus(options: { activeServer: 'primary' | 'backup' }): Promise<{ saved: boolean }>;
+  runServerSpeedTest(options?: {
+    url?: string;
+    apiKey?: string;
+    serverRole?: 'primary' | 'backup';
+  }): Promise<SpeedTestResult>;
   getSystemChecks(): Promise<SystemChecksResult>;
   requestNotificationPermission(): Promise<{ requested: boolean; granted?: boolean; openedSettings?: boolean }>;
   requestInstallPermission(): Promise<{ requested: boolean }>;
@@ -110,7 +133,10 @@ export interface VideoDownloaderPlugin {
     title: string;
     backendUrl: string;
     apiKey?: string;
-  }): Promise<{ fileName: string }>;
+    backupBackendUrl?: string;
+    backupApiKey?: string;
+    autoSwitchToBackup?: boolean;
+  }): Promise<{ fileName: string; usedServer?: 'primary' | 'backup' }>;
   getNativeHistory(): Promise<{ history: DownloadHistoryItem[] }>;
   clearNativeHistory(): Promise<{ cleared: boolean }>;
   getFailedLinks(): Promise<{ failedLinks: FailedDownloadItem[] }>;
@@ -170,6 +196,14 @@ export interface VideoDownloaderPlugin {
   addListener(
     eventName: 'openSettingsTab',
     listenerFunc: (data: { tab: string }) => void
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'openTab',
+    listenerFunc: (data: { tab: string; message?: string }) => void
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'onLibraryChanged',
+    listenerFunc: () => void
   ): Promise<PluginListenerHandle>;
   addListener(
     eventName: 'onFailedLinksChanged',
@@ -288,6 +322,38 @@ const VideoDownloaderWeb: VideoDownloaderPlugin = {
   },
   async saveNativeSettings() {
     return { saved: true };
+  },
+  async getActiveServerStatus() {
+    try {
+      const raw = localStorage.getItem('omnidrop_active_server_v1');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        const now = Date.now();
+        if (parsed.activeServer === 'backup' && parsed.setAt && now - parsed.setAt < 600000) {
+          return {
+            activeServer: 'backup' as const,
+            switchedAt: parsed.setAt,
+            remainingSeconds: Math.max(0, Math.round((600000 - (now - parsed.setAt)) / 1000)),
+          };
+        }
+      }
+    } catch {}
+    return { activeServer: 'primary' as const, switchedAt: 0, remainingSeconds: 0 };
+  },
+  async setActiveServerStatus(options) {
+    try {
+      localStorage.setItem(
+        'omnidrop_active_server_v1',
+        JSON.stringify({
+          activeServer: options.activeServer,
+          setAt: options.activeServer === 'backup' ? Date.now() : 0,
+        })
+      );
+    } catch {}
+    return { saved: true };
+  },
+  async runServerSpeedTest() {
+    throw new Error('Use performServerSpeedTest on web.');
   },
   async getSystemChecks() {
     const notificationsGranted =

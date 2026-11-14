@@ -75,14 +75,177 @@ class VideoDownloaderPlugin : Plugin() {
         const val PREF_STATS_RECORDS_KEY = "native_download_stats_records"
         const val PREF_STATS_SUMMARY_KEY = "native_download_stats_summary"
 
+        const val PREF_BACKUP_URL = "backup_backend_url"
+        const val PREF_BACKUP_API_KEY = "backup_api_key"
+        const val PREF_AUTO_SWITCH_BACKUP = "auto_switch_backup"
+        const val PREF_KEEP_BACKUP_AWAKE = "keep_backup_awake"
+        const val PREF_ACTIVE_SERVER = "active_server_role"
+        const val PREF_ACTIVE_SERVER_AT = "active_server_set_at"
+        const val STICKY_BACKUP_WINDOW_MS = 600_000L
+
         const val REQUEST_CODE_DELETE = 7101
         const val REQUEST_CODE_RENAME = 7102
 
         // In-flight download lock keyed by normalized sourceUrl
         val inFlightDownloads = ConcurrentHashMap<String, Boolean>()
 
+        data class ActiveDownloadControl(
+            val normalizedUrl: String,
+            val notifId: Int,
+            val cancelled: java.util.concurrent.atomic.AtomicBoolean = java.util.concurrent.atomic.AtomicBoolean(false),
+            @Volatile var connection: HttpURLConnection? = null,
+            @Volatile var outputStream: OutputStream? = null,
+            @Volatile var targetUri: Uri? = null,
+            @Volatile var onCancelUiCallback: (() -> Unit)? = null
+        )
+
+        val activeDownloadControls = ConcurrentHashMap<String, ActiveDownloadControl>()
+
+        fun cancelActiveDownload(context: Context, downloadUrl: String?, notifId: Int = -1): Boolean {
+            var matched = false
+            val norm = if (!downloadUrl.isNullOrBlank()) normalizeUrl(downloadUrl) else ""
+            val targets = ArrayList<ActiveDownloadControl>()
+            if (norm.isNotBlank()) {
+                activeDownloadControls[norm]?.let { targets.add(it) }
+            }
+            if (targets.isEmpty() && notifId > 0) {
+                for (ctrl in activeDownloadControls.values) {
+                    if (ctrl.notifId == notifId) {
+                        targets.add(ctrl)
+                    }
+                }
+            }
+            if (targets.isEmpty() && norm.isBlank() && notifId <= 0) {
+                targets.addAll(activeDownloadControls.values)
+            }
+            for (ctrl in targets) {
+                matched = true
+                ctrl.cancelled.set(true)
+                try { ctrl.outputStream?.close() } catch (_: Throwable) {}
+                val connToAbort = ctrl.connection
+                ctrl.connection = null
+                if (connToAbort != null) {
+                    Thread {
+                        try { connToAbort.disconnect() } catch (_: Throwable) {}
+                    }.start()
+                }
+                ctrl.targetUri?.let { uri ->
+                    try { context.contentResolver.delete(uri, null, null) } catch (_: Throwable) {}
+                }
+                NotificationHelper.cancelNotification(context, ctrl.notifId)
+                inFlightDownloads.remove(ctrl.normalizedUrl)
+                try { ctrl.onCancelUiCallback?.invoke() } catch (_: Throwable) {}
+            }
+            if (notifId > 0) {
+                NotificationHelper.cancelNotification(context, notifId)
+            }
+            return matched
+        }
+
         private val networkLogLock = Any()
         private const val NETWORK_LOG_FILE = "network_log.txt"
+
+        data class ServerEndpoint(
+            val role: String,
+            val baseUrl: String,
+            val apiKey: String
+        )
+
+        fun normalizeBaseServerUrl(rawUrl: String?): String {
+            val trimmed = rawUrl?.trim()?.removeSuffix("/") ?: ""
+            if (trimmed.isBlank()) return ""
+            return if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+                trimmed
+            } else {
+                "https://$trimmed"
+            }
+        }
+
+        fun getStickyActiveRole(context: Context): String {
+            return try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val backupUrl = prefs.getString(PREF_BACKUP_URL, "")?.trim() ?: ""
+                val autoSwitch = prefs.getBoolean(PREF_AUTO_SWITCH_BACKUP, true)
+                if (!autoSwitch || backupUrl.isBlank()) {
+                    return "primary"
+                }
+                val savedRole = prefs.getString(PREF_ACTIVE_SERVER, "primary") ?: "primary"
+                val setAt = prefs.getLong(PREF_ACTIVE_SERVER_AT, 0L)
+                val now = System.currentTimeMillis()
+                if (savedRole == "backup" && setAt > 0L && (now - setAt) < STICKY_BACKUP_WINDOW_MS) {
+                    "backup"
+                } else {
+                    if (savedRole == "backup") {
+                        prefs.edit().apply {
+                            this.putString(PREF_ACTIVE_SERVER, "primary")
+                            this.putLong(PREF_ACTIVE_SERVER_AT, 0L)
+                            this.apply()
+                        }
+                    }
+                    "primary"
+                }
+            } catch (_: Throwable) {
+                "primary"
+            }
+        }
+
+        fun setStickyActiveRole(context: Context, role: String) {
+            try {
+                val cleanRole = if (role == "backup") "backup" else "primary"
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                prefs.edit().apply {
+                    this.putString(PREF_ACTIVE_SERVER, cleanRole)
+                    this.putLong(PREF_ACTIVE_SERVER_AT, if (cleanRole == "backup") System.currentTimeMillis() else 0L)
+                    this.apply()
+                }
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    try {
+                        FloatingBubbleService.instance?.refreshActiveServerUI()
+                    } catch (_: Throwable) {}
+                }
+            } catch (_: Throwable) {}
+        }
+
+        fun buildCandidateServers(
+            context: Context,
+            primaryOverride: String? = null,
+            primaryKeyOverride: String? = null,
+            backupOverride: String? = null,
+            backupKeyOverride: String? = null,
+            autoSwitchOverride: Boolean? = null
+        ): List<ServerEndpoint> {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val rawPrimary = if (primaryOverride != null) primaryOverride else (prefs.getString("backend_url", "") ?: "")
+            val rawPrimaryKey = if (primaryKeyOverride != null) primaryKeyOverride else (prefs.getString("api_key", "") ?: "")
+            val rawBackup = if (backupOverride != null) backupOverride else (prefs.getString(PREF_BACKUP_URL, "") ?: "")
+            val rawBackupKey = if (backupKeyOverride != null) backupKeyOverride else (prefs.getString(PREF_BACKUP_API_KEY, "") ?: "")
+            val autoSwitch = autoSwitchOverride ?: prefs.getBoolean(PREF_AUTO_SWITCH_BACKUP, true)
+
+            val primaryNorm = normalizeBaseServerUrl(rawPrimary)
+            val backupNorm = normalizeBaseServerUrl(rawBackup)
+
+            val primaryEp = if (primaryNorm.isNotBlank()) {
+                ServerEndpoint("primary", primaryNorm, rawPrimaryKey.trim())
+            } else {
+                null
+            }
+            val backupEp = if (autoSwitch && backupNorm.isNotBlank() && backupNorm != primaryNorm) {
+                ServerEndpoint("backup", backupNorm, rawBackupKey.trim())
+            } else {
+                null
+            }
+
+            if (primaryEp != null && backupEp != null) {
+                return if (getStickyActiveRole(context) == "backup") {
+                    listOf(backupEp, primaryEp)
+                } else {
+                    listOf(primaryEp, backupEp)
+                }
+            }
+            if (primaryEp != null) return listOf(primaryEp)
+            if (backupEp != null) return listOf(backupEp)
+            return emptyList()
+        }
 
         data class HttpResponseData(
             val statusCode: Int,
@@ -1207,6 +1370,763 @@ class VideoDownloaderPlugin : Plugin() {
                 }
             }.start()
         }
+
+        fun startDetachedRetryDownload(
+            context: Context,
+            rawUrl: String,
+            quality: String = "best",
+            title: String = "Video",
+            onComplete: (() -> Unit)? = null
+        ) {
+            val normalizedUrl = normalizeUrl(rawUrl)
+            if (normalizedUrl.isBlank()) {
+                onComplete?.invoke()
+                return
+            }
+            if (inFlightDownloads.putIfAbsent(normalizedUrl, true) != null) {
+                onComplete?.invoke()
+                return
+            }
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val savedQuality = prefs.getString("default_quality", "best") ?: "best"
+            val effectiveReqQuality = if (quality.isNotBlank()) quality else savedQuality
+            val backendUrl = prefs.getString("backend_url", "") ?: ""
+            val apiKey = prefs.getString("api_key", "") ?: ""
+
+            runDownloadPipeline(
+                appContext = context.applicationContext,
+                normalizedUrl = normalizedUrl,
+                quality = effectiveReqQuality,
+                rawTitle = title.ifBlank { "Video" },
+                rawBackendUrl = backendUrl,
+                apiKey = apiKey,
+                callToResolve = null,
+                onFinishedCallback = onComplete
+            )
+        }
+
+        fun runDownloadPipeline(
+            appContext: Context,
+            normalizedUrl: String,
+            quality: String,
+            rawTitle: String,
+            rawBackendUrl: String,
+            apiKey: String?,
+            callToResolve: PluginCall? = null,
+            backupBackendUrlOverride: String? = null,
+            backupApiKeyOverride: String? = null,
+            autoSwitchOverride: Boolean? = null,
+            onFinishedCallback: (() -> Unit)? = null
+        ) {
+            val candidates = buildCandidateServers(
+                context = appContext,
+                primaryOverride = rawBackendUrl,
+                primaryKeyOverride = apiKey,
+                backupOverride = backupBackendUrlOverride,
+                backupApiKeyOverride = backupApiKeyOverride,
+                autoSwitchOverride = autoSwitchOverride
+            )
+
+            val notifId = NotificationHelper.nextNotificationId()
+            val control = ActiveDownloadControl(
+                normalizedUrl = normalizedUrl,
+                notifId = notifId,
+                onCancelUiCallback = {
+                    instance?.reportProgress(0, "Cancelled", 0.0)
+                }
+            )
+            activeDownloadControls[normalizedUrl] = control
+
+            Thread {
+                var connection: HttpURLConnection? = null
+                var inputStream: InputStream? = null
+                var outputStream: OutputStream? = null
+                var targetUri: Uri? = null
+                var finalTitle = rawTitle
+                var cleanPlatform = detectPlatformName(normalizedUrl)
+                var streamSucceeded = false
+                val operationStartMs = System.currentTimeMillis()
+                val maxOperationMs = 300_000L
+                var effectiveQuality = resolveEffectiveQuality(appContext, quality)
+
+                fun notifyProgressUpdate(percent: Int, statusText: String, speedMb: Double = 0.0) {
+                    instance?.reportProgress(percent, statusText, speedMb)
+                }
+
+                try {
+                    if (control.cancelled.get()) throw InterruptedException("Cancelled")
+                    if (candidates.isEmpty()) {
+                        throw IOException("Backend URL not configured in Settings.")
+                    }
+
+                    val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    val fallbackToBest = prefs.getBoolean("fallback_to_best", true)
+                    val notifyFinish = prefs.getBoolean("notify_download_finish", true)
+                    val notifyFail = prefs.getBoolean("notify_download_fail", true)
+
+                    var downloadResp: HttpResponseData? = null
+                    var winningServer: ServerEndpoint = candidates[0]
+                    var thumbnail = ""
+                    var uploader = "Creator"
+                    var cleanTitle = finalTitle
+                    var fileName = ""
+                    var isAudio = effectiveQuality.equals("audio", ignoreCase = true)
+                    var mediaType = if (isAudio) "audio/mpeg" else "video/mp4"
+
+                    NotificationHelper.showDownloadProgressNotification(
+                        context = appContext,
+                        notifId = notifId,
+                        downloadUrl = normalizedUrl,
+                        title = finalTitle.ifBlank { "OmniDrop Download" },
+                        percent = 0,
+                        speedMb = 0.0,
+                        isIndeterminate = true,
+                        statusOverride = "Connecting..."
+                    )
+
+                    for (serverIdx in candidates.indices) {
+                        if (control.cancelled.get()) throw InterruptedException("Cancelled")
+                        val server = candidates[serverIdx]
+                        val hasNextCandidate = serverIdx < candidates.size - 1
+                        val roleTag = if (server.role == "backup") "[BACKUP] " else ""
+                        val currentBaseUrl = server.baseUrl
+                        val currentApiKey = server.apiKey
+                        val endpoint = "$currentBaseUrl/download"
+
+                        notifyProgressUpdate(10, "${roleTag}CONNECTING... Fetching details")
+
+                        var platform = ""
+                        val availableQualities = HashSet<String>()
+
+                        try {
+                            val infoEndpoint = "$currentBaseUrl/info"
+                            val infoHeaders = HashMap<String, String>().apply {
+                                this["Content-Type"] = "application/json; charset=UTF-8"
+                                if (currentApiKey.isNotBlank()) {
+                                    this["x-api-key"] = currentApiKey
+                                }
+                            }
+                            val iPayload = JSONObject().apply {
+                                this.put("url", normalizedUrl)
+                            }
+                            val infoResp = httpRequest(
+                                context = appContext,
+                                method = "POST",
+                                url = infoEndpoint,
+                                headers = infoHeaders,
+                                body = iPayload.toString(),
+                                connectTimeoutMs = 25000,
+                                readTimeoutMs = 25000,
+                                streamBody = false,
+                                connectionRefCallback = { control.connection = it }
+                            )
+                            control.connection = null
+                            if (infoResp.statusCode in 200..299) {
+                                val respStr = infoResp.bodyText()
+                                if (respStr.isNotBlank()) {
+                                    val json = JSONObject(respStr)
+                                    if (json.has("title") && !json.optString("title").isNullOrBlank()) {
+                                        finalTitle = json.optString("title")
+                                    }
+                                    thumbnail = json.optString("thumbnail", "")
+                                    uploader = json.optString("uploader", "Creator")
+                                    platform = json.optString("platform", "")
+                                    val qArr = json.optJSONArray("qualities")
+                                    if (qArr != null) {
+                                        for (qi in 0 until qArr.length()) {
+                                            val qItem = qArr.optString(qi, "").lowercase(Locale.US)
+                                            if (qItem.isNotBlank()) availableQualities.add(qItem)
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (_: Throwable) {}
+
+                        if (control.cancelled.get()) throw InterruptedException("Cancelled")
+
+                        cleanPlatform = cleanPlatformName(platform, normalizedUrl)
+                        val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
+                        val dateStr = sdf.format(Date())
+                        if (finalTitle.isBlank() || finalTitle.equals("video", ignoreCase = true) || finalTitle.startsWith("OmniDrop", ignoreCase = true)) {
+                            finalTitle = "$cleanPlatform video - $dateStr"
+                        }
+
+                        effectiveQuality = resolveEffectiveQuality(appContext, quality)
+                        if (fallbackToBest && availableQualities.isNotEmpty() && !effectiveQuality.equals("best", ignoreCase = true) && !effectiveQuality.equals("audio", ignoreCase = true)) {
+                            if (!availableQualities.contains(effectiveQuality.lowercase(Locale.US))) {
+                                effectiveQuality = "best"
+                            }
+                        }
+
+                        isAudio = effectiveQuality.equals("audio", ignoreCase = true)
+                        val ext = if (isAudio) ".mp3" else ".mp4"
+                        mediaType = if (isAudio) "audio/mpeg" else "video/mp4"
+
+                        cleanTitle = finalTitle
+                            .replace("[\\\\/:*?\"<>|\\r\\n]".toRegex(), "_")
+                            .replace("\\s+".toRegex(), " ")
+                            .trim()
+                            .take(80)
+                            .ifBlank { "$cleanPlatform video - $dateStr" }
+                        fileName = buildStyledFileName(appContext, cleanTitle, cleanPlatform, ext)
+
+                        val dlHeaders = HashMap<String, String>().apply {
+                            this["Content-Type"] = "application/json; charset=UTF-8"
+                            this["Accept"] = "*/*"
+                            if (currentApiKey.isNotBlank()) {
+                                this["x-api-key"] = currentApiKey
+                            }
+                        }
+
+                        var shouldFailover = false
+                        val maxAttempts = 6
+                        for (attempt in 1..maxAttempts) {
+                            if (control.cancelled.get()) throw InterruptedException("Cancelled")
+                            val elapsedTotal = System.currentTimeMillis() - operationStartMs
+                            if (elapsedTotal >= maxOperationMs) {
+                                throw IOException("Timed out after 5m limit")
+                            }
+
+                            val statusMsg = if (attempt == 1) {
+                                "${roleTag}Connecting..."
+                            } else {
+                                "${roleTag}Waking server... attempt $attempt/$maxAttempts"
+                            }
+                            notifyProgressUpdate(15 + (attempt * 2), statusMsg)
+                            NotificationHelper.showDownloadProgressNotification(
+                                context = appContext,
+                                notifId = notifId,
+                                downloadUrl = normalizedUrl,
+                                title = finalTitle,
+                                percent = 0,
+                                speedMb = 0.0,
+                                isIndeterminate = true,
+                                statusOverride = statusMsg
+                            )
+
+                            val jsonPayload = JSONObject().apply {
+                                this.put("url", normalizedUrl)
+                                this.put("quality", effectiveQuality)
+                            }
+
+                            var resp = httpRequest(
+                                context = appContext,
+                                method = "POST",
+                                url = endpoint,
+                                headers = dlHeaders,
+                                body = jsonPayload.toString(),
+                                connectTimeoutMs = 30000,
+                                readTimeoutMs = 180000,
+                                streamBody = true,
+                                connectionRefCallback = {
+                                    connection = it
+                                    control.connection = it
+                                }
+                            )
+
+                            if (control.cancelled.get()) throw InterruptedException("Cancelled")
+
+                            if (resp.statusCode !in 200..299 &&
+                                resp.statusCode !in listOf(0, 502, 503, 504) &&
+                                fallbackToBest &&
+                                !effectiveQuality.equals("best", ignoreCase = true) &&
+                                !effectiveQuality.equals("audio", ignoreCase = true)
+                            ) {
+                                effectiveQuality = "best"
+                                isAudio = false
+                                mediaType = "video/mp4"
+                                val fallbackPayload = JSONObject().apply {
+                                    this.put("url", normalizedUrl)
+                                    this.put("quality", effectiveQuality)
+                                }
+                                resp = httpRequest(
+                                    context = appContext,
+                                    method = "POST",
+                                    url = endpoint,
+                                    headers = dlHeaders,
+                                    body = fallbackPayload.toString(),
+                                    connectTimeoutMs = 30000,
+                                    readTimeoutMs = 180000,
+                                    streamBody = true,
+                                    connectionRefCallback = {
+                                        connection = it
+                                        control.connection = it
+                                    }
+                                )
+                                if (control.cancelled.get()) throw InterruptedException("Cancelled")
+                            }
+
+                            if (resp.statusCode in 200..299 && resp.inputStream != null) {
+                                downloadResp = resp
+                                winningServer = server
+                                break
+                            }
+
+                            if (resp.isNoInternet) {
+                                val offlineMsg = "No internet"
+                                recordFailedLink(appContext, normalizedUrl, cleanPlatform, finalTitle, offlineMsg)
+                                recordFailedStat(appContext)
+                                if (notifyFail) {
+                                    NotificationHelper.showDownloadFailedNotification(
+                                        context = appContext,
+                                        title = "Download Failed",
+                                        message = offlineMsg,
+                                        failedUrl = normalizedUrl,
+                                        quality = effectiveQuality
+                                    )
+                                }
+                                callToResolve?.reject(offlineMsg)
+                                return@Thread
+                            }
+
+                            if (resp.isConnectionError && hasNextCandidate) {
+                                val nextLabel = if (candidates[serverIdx + 1].role == "backup") "backup" else "primary"
+                                val switchText = "Switching to $nextLabel server..."
+                                notifyProgressUpdate(14, switchText)
+                                NotificationHelper.showDownloadProgressNotification(
+                                    context = appContext,
+                                    notifId = notifId,
+                                    downloadUrl = normalizedUrl,
+                                    title = finalTitle,
+                                    percent = 0,
+                                    speedMb = 0.0,
+                                    isIndeterminate = true,
+                                    statusOverride = switchText
+                                )
+                                shouldFailover = true
+                                break
+                            }
+
+                            val isWakeRetryable = (
+                                resp.isTimeout ||
+                                resp.isConnectionError ||
+                                resp.statusCode == 502 ||
+                                resp.statusCode == 503 ||
+                                resp.statusCode == 504
+                            )
+
+                            if (!isWakeRetryable) {
+                                val immediateMsg = resp.friendlyError.ifBlank { "Server returned ${resp.statusCode}" }
+                                recordFailedLink(appContext, normalizedUrl, cleanPlatform, finalTitle, immediateMsg)
+                                recordFailedStat(appContext)
+                                if (notifyFail) {
+                                    NotificationHelper.showDownloadFailedNotification(
+                                        context = appContext,
+                                        title = "Download Failed",
+                                        message = immediateMsg.take(120),
+                                        failedUrl = normalizedUrl,
+                                        quality = effectiveQuality
+                                    )
+                                }
+                                callToResolve?.reject(immediateMsg)
+                                return@Thread
+                            }
+
+                            if (attempt < maxAttempts) {
+                                val remainingMs = maxOperationMs - (System.currentTimeMillis() - operationStartMs)
+                                if (remainingMs <= 0L) {
+                                    if (hasNextCandidate) {
+                                        shouldFailover = true
+                                        break
+                                    }
+                                    throw IOException("Timed out after 5m limit (${resp.friendlyError})")
+                                }
+                                val nextWakeMsg = "${roleTag}SERVER IS WAKING UP... attempt ${attempt + 1}/$maxAttempts"
+                                notifyProgressUpdate(15 + (attempt * 2), nextWakeMsg)
+                                NotificationHelper.showDownloadProgressNotification(
+                                    context = appContext,
+                                    notifId = notifId,
+                                    downloadUrl = normalizedUrl,
+                                    title = finalTitle,
+                                    percent = 0,
+                                    speedMb = 0.0,
+                                    isIndeterminate = true,
+                                    statusOverride = nextWakeMsg
+                                )
+                                var slept = 0L
+                                val waitMs = minOf(5000L, remainingMs)
+                                while (slept < waitMs) {
+                                    if (control.cancelled.get()) throw InterruptedException("Cancelled")
+                                    val step = minOf(200L, waitMs - slept)
+                                    Thread.sleep(step)
+                                    slept += step
+                                }
+                            } else if (hasNextCandidate) {
+                                val nextLabel = if (candidates[serverIdx + 1].role == "backup") "backup" else "primary"
+                                notifyProgressUpdate(14, "Server timed out — switching to $nextLabel server...")
+                                shouldFailover = true
+                                break
+                            } else {
+                                val finalErr = resp.friendlyError.ifBlank { "Server failed after $maxAttempts attempts" }
+                                recordFailedLink(appContext, normalizedUrl, cleanPlatform, finalTitle, finalErr)
+                                recordFailedStat(appContext)
+                                if (notifyFail) {
+                                    NotificationHelper.showDownloadFailedNotification(
+                                        context = appContext,
+                                        title = "Download Failed",
+                                        message = finalErr.take(120),
+                                        failedUrl = normalizedUrl,
+                                        quality = effectiveQuality
+                                    )
+                                }
+                                callToResolve?.reject(finalErr)
+                                return@Thread
+                            }
+                        }
+
+                        if (downloadResp != null || !shouldFailover) {
+                            break
+                        }
+                    }
+
+                    val activeResp = downloadResp ?: throw IOException("No response stream from server")
+                    setStickyActiveRole(appContext, winningServer.role)
+                    connection = activeResp.connection
+                    control.connection = connection
+                    val responseStream = activeResp.inputStream ?: throw IOException("Empty response stream from server")
+
+                    val contentType = activeResp.contentType
+                    if (contentType.contains("application/zip", ignoreCase = true)) {
+                        notifyProgressUpdate(35, "DOWNLOADING...")
+                        val zis = ZipInputStream(responseStream)
+                        val resolver = appContext.contentResolver
+                        val savedUris = ArrayList<Uri>()
+                        var zipEntry = zis.nextEntry
+                        var photoIndex = 0
+
+                        while (zipEntry != null) {
+                            if (control.cancelled.get()) throw InterruptedException("Cancelled")
+                            val entryName = zipEntry.name
+                            if (!zipEntry.isDirectory && (entryName.endsWith(".jpg", ignoreCase = true) || entryName.endsWith(".jpeg", ignoreCase = true) || entryName.endsWith(".png", ignoreCase = true) || entryName.endsWith(".webp", ignoreCase = true))) {
+                                photoIndex++
+                                val paddedNum = String.format(Locale.US, "%02d", photoIndex)
+                                val cleanPhotoTitle = finalTitle
+                                    .replace("[\\\\/:*?\"<>|\\r\\n]".toRegex(), "_")
+                                    .replace("\\s+".toRegex(), " ")
+                                    .trim()
+                                    .take(60)
+                                    .ifBlank { "TikTok_photo" }
+                                val photoDisplayName = "${cleanPhotoTitle}_$paddedNum.jpg"
+
+                                val imgValues = ContentValues().apply {
+                                    this.put(MediaStore.MediaColumns.DISPLAY_NAME, photoDisplayName)
+                                    this.put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                        this.put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/OmniDrop")
+                                        this.put(MediaStore.MediaColumns.IS_PENDING, 1)
+                                    }
+                                }
+
+                                val collectionUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                    MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                                } else {
+                                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                                }
+
+                                val itemUri = resolver.insert(collectionUri, imgValues)
+                                if (itemUri != null) {
+                                    resolver.openOutputStream(itemUri)?.use { outStream ->
+                                        val buf = ByteArray(8192)
+                                        var len: Int
+                                        while (zis.read(buf).also { len = it } != -1) {
+                                            if (control.cancelled.get()) throw InterruptedException("Cancelled")
+                                            outStream.write(buf, 0, len)
+                                        }
+                                        outStream.flush()
+                                    }
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                        val updateValues = ContentValues().apply {
+                                            this.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                                        }
+                                        resolver.update(itemUri, updateValues, null, null)
+                                    }
+                                    savedUris.add(itemUri)
+                                    val pct = (35 + (photoIndex * 5)).coerceAtMost(95)
+                                    notifyProgressUpdate(pct, "Saving photo $photoIndex to Pictures/OmniDrop...")
+                                    NotificationHelper.showDownloadProgressNotification(
+                                        context = appContext,
+                                        notifId = notifId,
+                                        downloadUrl = normalizedUrl,
+                                        title = finalTitle,
+                                        percent = pct,
+                                        speedMb = 0.0,
+                                        isIndeterminate = true,
+                                        statusOverride = "Saving photo $photoIndex..."
+                                    )
+                                }
+                            }
+                            zis.closeEntry()
+                            zipEntry = zis.nextEntry
+                        }
+                        zis.close()
+
+                        val totalPhotos = savedUris.size
+                        streamSucceeded = true
+                        val firstUri = savedUris.firstOrNull()?.toString() ?: ""
+                        val archiveFileName = "$finalTitle [TikTok photos]"
+                        val photoUriStrings = savedUris.map { it.toString() }
+
+                        notifyProgressUpdate(100, "Saved $totalPhotos photos to Pictures/OmniDrop!")
+                        NotificationHelper.cancelNotification(appContext, notifId)
+
+                        if (notifyFinish) {
+                            NotificationHelper.showDownloadFinishedNotification(
+                                context = appContext,
+                                title = finalTitle,
+                                message = if (totalPhotos == 1) "Saved 1 photo" else "Saved $totalPhotos photos",
+                                filePath = firstUri,
+                                isImage = true,
+                                thumbnailUrl = thumbnail,
+                                photoUris = photoUriStrings
+                            )
+                        }
+
+                        val metaObj = JSONObject().apply {
+                            this.put("type", "photo")
+                            this.put("title", finalTitle)
+                            this.put("platform", "TikTok")
+                            this.put("uploader", uploader)
+                            this.put("thumbnailUrl", thumbnail)
+                            this.put("sourceUrl", normalizedUrl)
+                            this.put("imageCount", totalPhotos)
+                            this.put("downloadTime", System.currentTimeMillis())
+                            this.put("fileName", archiveFileName)
+                            this.put("fileUri", firstUri)
+                        }
+                        saveVideoMetadata(appContext, archiveFileName, metaObj)
+
+                        val entryObj = JSONObject().apply {
+                            this.put("id", "dl_" + System.currentTimeMillis())
+                            this.put("type", "photo")
+                            this.put("url", normalizedUrl)
+                            this.put("title", finalTitle)
+                            this.put("thumbnail", thumbnail)
+                            this.put("uploader", uploader)
+                            this.put("platform", "TikTok")
+                            this.put("quality", "photo")
+                            this.put("imageCount", totalPhotos)
+                            this.put("savedAt", System.currentTimeMillis())
+                            this.put("fileName", archiveFileName)
+                            this.put("fileUri", firstUri)
+                        }
+                        saveHistoryEntry(appContext, entryObj)
+                        instance?.emitNativeDownloadFinished(entryObj)
+                        instance?.emitLibraryChanged()
+                        removeFailedLinkByUrl(appContext, normalizedUrl)
+                        recordDownloadStat(appContext, "TikTok", "photo", (totalPhotos.toLong() * 800L * 1024L))
+
+                        val res = JSObject().apply {
+                            this.put("fileName", archiveFileName)
+                            this.put("uri", firstUri)
+                            this.put("type", "photo")
+                            this.put("imageCount", totalPhotos)
+                            this.put("usedServer", winningServer.role)
+                        }
+                        callToResolve?.resolve(res)
+                        return@Thread
+                    }
+
+                    val relativeFolder = if (isAudio) "Music/OmniDrop" else "Movies/OmniDrop"
+                    notifyProgressUpdate(30, "DOWNLOADING...")
+
+                    val resolver = appContext.contentResolver
+                    val contentValues = ContentValues().apply {
+                        this.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                        this.put(MediaStore.MediaColumns.MIME_TYPE, mediaType)
+
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            this.put(MediaStore.MediaColumns.RELATIVE_PATH, relativeFolder)
+                            this.put(MediaStore.MediaColumns.IS_PENDING, 1)
+                        }
+                    }
+
+                    val collectionUri = if (isAudio) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                        } else {
+                            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                        }
+                    } else {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                        } else {
+                            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                        }
+                    }
+
+                    targetUri = resolver.insert(collectionUri, contentValues)
+                    if (targetUri == null) {
+                        callToResolve?.reject("Failed to create MediaStore entry in phone gallery.")
+                        return@Thread
+                    }
+                    control.targetUri = targetUri
+
+                    outputStream = resolver.openOutputStream(targetUri)
+                    if (outputStream == null) {
+                        callToResolve?.reject("Failed to open output stream to phone gallery.")
+                        return@Thread
+                    }
+                    control.outputStream = outputStream
+
+                    inputStream = responseStream
+                    val totalBytes = activeResp.contentLength
+                    var bytesCopied: Long = 0
+                    var lastSampleBytes: Long = 0
+                    val buffer = ByteArray(8192)
+                    var bytesRead: Int
+                    var lastProgressReportTime: Long = System.currentTimeMillis()
+                    var lastNotifUpdateTime: Long = 0L
+                    var firstBytesReported = false
+
+                    while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                        if (control.cancelled.get()) throw InterruptedException("Cancelled")
+                        outputStream.write(buffer, 0, bytesRead)
+                        bytesCopied += bytesRead
+
+                        if (!firstBytesReported) {
+                            firstBytesReported = true
+                            notifyProgressUpdate(40, "DOWNLOADING...", 0.0)
+                        }
+
+                        val now = System.currentTimeMillis()
+                        val elapsedMs = now - lastProgressReportTime
+                        if (elapsedMs > 300) {
+                            val deltaBytes = bytesCopied - lastSampleBytes
+                            val speedMb = (deltaBytes.toDouble() / (1024.0 * 1024.0)) / (elapsedMs.toDouble() / 1000.0)
+                            lastProgressReportTime = now
+                            lastSampleBytes = bytesCopied
+                            val pct = if (totalBytes > 0) {
+                                (40 + (bytesCopied.toDouble() / totalBytes * 55)).toInt().coerceIn(40, 95)
+                            } else {
+                                75
+                            }
+                            val notifPct = if (totalBytes > 0) {
+                                ((bytesCopied * 100L) / totalBytes).toInt().coerceIn(1, 99)
+                            } else {
+                                50
+                            }
+                            val mb = String.format(Locale.US, "%.1f", bytesCopied / (1024.0 * 1024.0))
+                            notifyProgressUpdate(pct, "DOWNLOADING... $mb MB", speedMb)
+                            if (now - lastNotifUpdateTime >= 500L) {
+                                lastNotifUpdateTime = now
+                                NotificationHelper.showDownloadProgressNotification(
+                                    context = appContext,
+                                    notifId = notifId,
+                                    downloadUrl = normalizedUrl,
+                                    title = finalTitle,
+                                    percent = notifPct,
+                                    speedMb = speedMb,
+                                    isIndeterminate = (totalBytes <= 0L)
+                                )
+                            }
+                        }
+                    }
+                    if (control.cancelled.get()) throw InterruptedException("Cancelled")
+                    outputStream.flush()
+                    streamSucceeded = true
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        val updateValues = ContentValues().apply {
+                            this.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                        }
+                        resolver.update(targetUri, updateValues, null, null)
+                    }
+
+                    notifyProgressUpdate(100, "Saved to $relativeFolder!")
+                    NotificationHelper.cancelNotification(appContext, notifId)
+
+                    if (notifyFinish) {
+                        NotificationHelper.showDownloadFinishedNotification(
+                            context = appContext,
+                            title = finalTitle,
+                            message = "$fileName saved to $relativeFolder",
+                            filePath = targetUri.toString(),
+                            isImage = false,
+                            isAudio = isAudio,
+                            bytesCopied = bytesCopied,
+                            folderPath = relativeFolder,
+                            thumbnailUrl = thumbnail
+                        )
+                    }
+
+                    val metaObj = JSONObject().apply {
+                        this.put("title", finalTitle)
+                        this.put("platform", cleanPlatform)
+                        this.put("uploader", uploader)
+                        this.put("thumbnailUrl", thumbnail)
+                        this.put("sourceUrl", normalizedUrl)
+                        this.put("downloadTime", System.currentTimeMillis())
+                        this.put("fileName", fileName)
+                        this.put("fileUri", targetUri.toString())
+                    }
+                    saveVideoMetadata(appContext, fileName, metaObj)
+
+                    val entryObj = JSONObject().apply {
+                        this.put("id", "dl_" + System.currentTimeMillis())
+                        this.put("url", normalizedUrl)
+                        this.put("title", finalTitle)
+                        this.put("thumbnail", thumbnail)
+                        this.put("uploader", uploader)
+                        this.put("platform", cleanPlatform)
+                        this.put("quality", effectiveQuality)
+                        this.put("savedAt", System.currentTimeMillis())
+                        this.put("fileName", fileName)
+                        this.put("fileUri", targetUri.toString())
+                    }
+                    saveHistoryEntry(appContext, entryObj)
+                    instance?.emitNativeDownloadFinished(entryObj)
+                    instance?.emitLibraryChanged()
+                    removeFailedLinkByUrl(appContext, normalizedUrl)
+                    recordDownloadStat(appContext, cleanPlatform, if (isAudio) "audio" else "video", bytesCopied)
+
+                    val res = JSObject().apply {
+                        this.put("fileName", fileName)
+                        this.put("uri", targetUri.toString())
+                        this.put("usedServer", winningServer.role)
+                    }
+                    callToResolve?.resolve(res)
+
+                } catch (t: Throwable) {
+                    if (targetUri != null) {
+                        try {
+                            appContext.contentResolver.delete(targetUri, null, null)
+                        } catch (_: Exception) {}
+                    }
+                    if (control.cancelled.get()) {
+                        notifyProgressUpdate(0, "Cancelled", 0.0)
+                        callToResolve?.reject("Download cancelled")
+                    } else {
+                        val rawErr = t.message ?: "Unknown error"
+                        recordFailedLink(appContext, normalizedUrl, cleanPlatform, finalTitle, rawErr)
+                        recordFailedStat(appContext)
+                        val notifyFailPref = try {
+                            appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                                .getBoolean("notify_download_fail", true)
+                        } catch (_: Throwable) { true }
+                        if (notifyFailPref) {
+                            NotificationHelper.showDownloadFailedNotification(
+                                context = appContext,
+                                title = "Download Failed",
+                                message = rawErr.take(120),
+                                failedUrl = normalizedUrl,
+                                quality = effectiveQuality
+                            )
+                        }
+                        callToResolve?.reject(rawErr)
+                    }
+                } finally {
+                    NotificationHelper.cancelNotification(appContext, notifId)
+                    activeDownloadControls.remove(normalizedUrl)
+                    inFlightDownloads.remove(normalizedUrl)
+                    try { inputStream?.close() } catch (_: Exception) {}
+                    try { outputStream?.close() } catch (_: Exception) {}
+                    if (!streamSucceeded || control.cancelled.get()) {
+                        try { connection?.disconnect() } catch (_: Throwable) {}
+                    }
+                    try { onFinishedCallback?.invoke() } catch (_: Throwable) {}
+                }
+            }.start()
+        }
     }
 
     override fun load() {
@@ -1230,6 +2150,10 @@ class VideoDownloaderPlugin : Plugin() {
 
     private fun handleIncomingIntent(intent: Intent?) {
         if (intent == null) return
+        val notifId = intent.getIntExtra("notif_id", -1)
+        if (notifId > 0) {
+            NotificationHelper.cancelNotification(context, notifId)
+        }
         val action = intent.action
         val type = intent.type
 
@@ -1249,11 +2173,19 @@ class VideoDownloaderPlugin : Plugin() {
             }
         }
 
-        if (intent.getStringExtra("open_tab") == "settings") {
+        val openTab = intent.getStringExtra("open_tab")
+        val notifMessage = intent.getStringExtra("notif_message") ?: ""
+        if (!openTab.isNullOrBlank()) {
             val ret = JSObject().apply {
-                this.put("tab", "settings")
+                this.put("tab", openTab)
+                if (notifMessage.isNotBlank()) {
+                    this.put("message", notifMessage)
+                }
             }
-            notifyListeners("openSettingsTab", ret, true)
+            notifyListeners("openTab", ret, true)
+            if (openTab == "settings") {
+                notifyListeners("openSettingsTab", ret, true)
+            }
         }
     }
 
@@ -1575,6 +2507,10 @@ class VideoDownloaderPlugin : Plugin() {
         notifyListeners("nativeDownloadFinished", jsEntryFromObj(entry), true)
     }
 
+    fun emitLibraryChanged() {
+        notifyListeners("onLibraryChanged", JSObject(), true)
+    }
+
     private fun jsEntryFromObj(entry: JSONObject): JSObject {
         return JSObject().apply {
             this.put("id", entry.optString("id"))
@@ -1703,10 +2639,24 @@ class VideoDownloaderPlugin : Plugin() {
         val playerGesturesEnabled = call.getBoolean("playerGesturesEnabled", true) ?: true
         val hideInRecents = call.getBoolean("hideInRecents", false) ?: false
 
+        // Backup server & failover prefs
+        val backupBackendUrl = call.getString("backupBackendUrl") ?: ""
+        val backupApiKey = call.getString("backupApiKey") ?: ""
+        val autoSwitchToBackup = call.getBoolean("autoSwitchToBackup", true) ?: true
+        val keepBackupAwake = call.getBoolean("keepBackupAwake", false) ?: false
+
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().apply {
             this.putString("backend_url", backendUrl)
             this.putString("api_key", apiKey)
+            this.putString(PREF_BACKUP_URL, backupBackendUrl)
+            this.putString(PREF_BACKUP_API_KEY, backupApiKey)
+            this.putBoolean(PREF_AUTO_SWITCH_BACKUP, autoSwitchToBackup)
+            this.putBoolean(PREF_KEEP_BACKUP_AWAKE, keepBackupAwake)
+            if (!autoSwitchToBackup || backupBackendUrl.trim().isBlank()) {
+                this.putString(PREF_ACTIVE_SERVER, "primary")
+                this.putLong(PREF_ACTIVE_SERVER_AT, 0L)
+            }
             this.putString("default_quality", defaultQuality)
             this.putBoolean("auto_download", autoDownload)
             this.putBoolean("auto_download_on_paste", autoDownloadOnPaste)
@@ -1750,7 +2700,11 @@ class VideoDownloaderPlugin : Plugin() {
             autoCheckUpdates,
             floatingSide,
             floatingSize,
-            floatingOpacity
+            floatingOpacity,
+            backupBackendUrl,
+            backupApiKey,
+            autoSwitchToBackup,
+            keepBackupAwake
         )
 
         FloatingBubbleService.syncService(context)
@@ -2012,15 +2966,31 @@ class VideoDownloaderPlugin : Plugin() {
         val videoUrl = call.getString("url")
         val quality = call.getString("quality") ?: "best"
         val rawTitle = call.getString("title") ?: "video"
-        val backendUrl = call.getString("backendUrl")
+        val backendUrl = call.getString("backendUrl") ?: ""
         val apiKey = call.getString("apiKey")
+        val backupBackendUrl = call.getString("backupBackendUrl")
+        val backupApiKey = call.getString("backupApiKey")
+        val autoSwitchToBackup = if (call.data.has("autoSwitchToBackup")) {
+            call.getBoolean("autoSwitchToBackup", true)
+        } else {
+            null
+        }
 
         if (videoUrl.isNullOrBlank()) {
             call.reject("Missing required parameter: url")
             return
         }
 
-        if (backendUrl.isNullOrBlank()) {
+        val candidatesCheck = buildCandidateServers(
+            context = context,
+            primaryOverride = backendUrl,
+            primaryKeyOverride = apiKey,
+            backupOverride = backupBackendUrl,
+            backupKeyOverride = backupApiKey,
+            autoSwitchOverride = autoSwitchToBackup
+        )
+
+        if (candidatesCheck.isEmpty()) {
             call.reject("Please configure your Render Backend URL in Settings before downloading on mobile.")
             return
         }
@@ -2033,7 +3003,17 @@ class VideoDownloaderPlugin : Plugin() {
             return
         }
 
-        executeDownloadPipeline(normalizedUrl, quality, rawTitle, backendUrl, apiKey, call)
+        executeDownloadPipeline(
+            normalizedUrl = normalizedUrl,
+            quality = quality,
+            rawTitle = rawTitle,
+            rawBackendUrl = backendUrl,
+            apiKey = apiKey,
+            callToResolve = call,
+            backupBackendUrlOverride = backupBackendUrl,
+            backupApiKeyOverride = backupApiKey,
+            autoSwitchOverride = autoSwitchToBackup
+        )
     }
 
     private fun executeDownloadPipeline(
@@ -2042,512 +3022,24 @@ class VideoDownloaderPlugin : Plugin() {
         rawTitle: String,
         rawBackendUrl: String,
         apiKey: String?,
-        callToResolve: PluginCall? = null
+        callToResolve: PluginCall? = null,
+        backupBackendUrlOverride: String? = null,
+        backupApiKeyOverride: String? = null,
+        autoSwitchOverride: Boolean? = null
     ) {
-        val backendUrl = rawBackendUrl.trim().removeSuffix("/")
-        val endpoint = if (backendUrl.startsWith("http://") || backendUrl.startsWith("https://")) {
-            "$backendUrl/download"
-        } else {
-            "https://$backendUrl/download"
-        }
-
-        Thread {
-            var connection: HttpURLConnection? = null
-            var inputStream: InputStream? = null
-            var outputStream: OutputStream? = null
-            var targetUri: Uri? = null
-            var finalTitle = rawTitle
-            var cleanPlatform = "Other"
-            var streamSucceeded = false
-            val operationStartMs = System.currentTimeMillis()
-            val maxOperationMs = 300_000L
-
-            try {
-                reportProgress(10, "CONNECTING... Fetching details")
-
-                // Step 1: Optional POST /info with 25s timeout (failure never blocks download)
-                var thumbnail = ""
-                var uploader = "Creator"
-                var platform = ""
-                val availableQualities = HashSet<String>()
-
-                try {
-                    val infoEndpoint = if (backendUrl.startsWith("http://") || backendUrl.startsWith("https://")) {
-                        "$backendUrl/info"
-                    } else {
-                        "https://$backendUrl/info"
-                    }
-                    val infoHeaders = HashMap<String, String>().apply {
-                        this["Content-Type"] = "application/json; charset=UTF-8"
-                        if (!apiKey.isNullOrBlank()) {
-                            this["x-api-key"] = apiKey.trim()
-                        }
-                    }
-                    val iPayload = JSONObject().apply {
-                        this.put("url", normalizedUrl)
-                    }
-                    val infoResp = httpRequest(
-                        context = context,
-                        method = "POST",
-                        url = infoEndpoint,
-                        headers = infoHeaders,
-                        body = iPayload.toString(),
-                        connectTimeoutMs = 25000,
-                        readTimeoutMs = 25000,
-                        streamBody = false
-                    )
-                    if (infoResp.statusCode in 200..299) {
-                        val respStr = infoResp.bodyText()
-                        if (respStr.isNotBlank()) {
-                            val json = JSONObject(respStr)
-                            if (json.has("title") && !json.optString("title").isNullOrBlank()) {
-                                finalTitle = json.optString("title")
-                            }
-                            thumbnail = json.optString("thumbnail", "")
-                            uploader = json.optString("uploader", "Creator")
-                            platform = json.optString("platform", "")
-                            val qArr = json.optJSONArray("qualities")
-                            if (qArr != null) {
-                                for (qi in 0 until qArr.length()) {
-                                    val qItem = qArr.optString(qi, "").lowercase(Locale.US)
-                                    if (qItem.isNotBlank()) availableQualities.add(qItem)
-                                }
-                            }
-                        }
-                    }
-                } catch (_: Throwable) {
-                    // Optional /info failure never blocks download
-                }
-
-                // Clean platform: never use "Video" as platform
-                cleanPlatform = cleanPlatformName(platform, normalizedUrl)
-
-                // Fallback title if /info failed or had no title: "<platform> video - <date and time>"
-                val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
-                val dateStr = sdf.format(Date())
-                if (finalTitle.isBlank() || finalTitle.equals("video", ignoreCase = true) || finalTitle.startsWith("OmniDrop", ignoreCase = true)) {
-                    finalTitle = "$cleanPlatform video - $dateStr"
-                }
-
-                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                val fallbackToBest = prefs.getBoolean("fallback_to_best", true)
-                val notifyFinish = prefs.getBoolean("notify_download_finish", true)
-                val notifyFail = prefs.getBoolean("notify_download_fail", true)
-
-                var effectiveQuality = resolveEffectiveQuality(context, quality)
-                if (fallbackToBest && availableQualities.isNotEmpty() && !effectiveQuality.equals("best", ignoreCase = true) && !effectiveQuality.equals("audio", ignoreCase = true)) {
-                    if (!availableQualities.contains(effectiveQuality.lowercase(Locale.US))) {
-                        effectiveQuality = "best"
-                    }
-                }
-
-                val isAudio = effectiveQuality.equals("audio", ignoreCase = true)
-                val ext = if (isAudio) ".mp3" else ".mp4"
-                val mediaType = if (isAudio) "audio/mpeg" else "video/mp4"
-
-                // Clean filename: remove forbidden characters (\ / : * ? " < > | \r \n), shorten to 80 chars
-                val cleanTitle = finalTitle
-                    .replace("[\\\\/:*?\"<>|\\r\\n]".toRegex(), "_")
-                    .replace("\\s+".toRegex(), " ")
-                    .trim()
-                    .take(80)
-                    .ifBlank { "$cleanPlatform video - $dateStr" }
-                val fileName = buildStyledFileName(context, cleanTitle, cleanPlatform, ext)
-
-                // Step 2: Direct POST /download with wake-up retry only on timeout, connection error, or HTTP 502/503/504
-                val dlHeaders = HashMap<String, String>().apply {
-                    this["Content-Type"] = "application/json; charset=UTF-8"
-                    this["Accept"] = "*/*"
-                    if (!apiKey.isNullOrBlank()) {
-                        this["x-api-key"] = apiKey.trim()
-                    }
-                }
-
-                var downloadResp: HttpResponseData? = null
-                val maxAttempts = 6
-                for (attempt in 1..maxAttempts) {
-                    val elapsedTotal = System.currentTimeMillis() - operationStartMs
-                    if (elapsedTotal >= maxOperationMs) {
-                        throw IOException("Timed out after 5m limit")
-                    }
-
-                    val statusMsg = if (attempt == 1) {
-                        "CONNECTING..."
-                    } else {
-                        "SERVER IS WAKING UP... attempt $attempt/$maxAttempts"
-                    }
-                    reportProgress(15 + (attempt * 2), statusMsg)
-
-                    val jsonPayload = JSONObject().apply {
-                        this.put("url", normalizedUrl)
-                        this.put("quality", effectiveQuality)
-                    }
-
-                    var resp = httpRequest(
-                        context = context,
-                        method = "POST",
-                        url = endpoint,
-                        headers = dlHeaders,
-                        body = jsonPayload.toString(),
-                        connectTimeoutMs = 30000,
-                        readTimeoutMs = 180000,
-                        streamBody = true,
-                        connectionRefCallback = { connection = it }
-                    )
-
-                    if (resp.statusCode !in 200..299 &&
-                        resp.statusCode !in listOf(0, 502, 503, 504) &&
-                        fallbackToBest &&
-                        !effectiveQuality.equals("best", ignoreCase = true) &&
-                        !effectiveQuality.equals("audio", ignoreCase = true)
-                    ) {
-                        effectiveQuality = "best"
-                        val fallbackPayload = JSONObject().apply {
-                            this.put("url", normalizedUrl)
-                            this.put("quality", effectiveQuality)
-                        }
-                        resp = httpRequest(
-                            context = context,
-                            method = "POST",
-                            url = endpoint,
-                            headers = dlHeaders,
-                            body = fallbackPayload.toString(),
-                            connectTimeoutMs = 30000,
-                            readTimeoutMs = 180000,
-                            streamBody = true,
-                            connectionRefCallback = { connection = it }
-                        )
-                    }
-
-                    if (resp.statusCode in 200..299 && resp.inputStream != null) {
-                        downloadResp = resp
-                        break
-                    }
-
-                    val isWakeRetryable = !resp.isNoInternet && (
-                        resp.isTimeout ||
-                        resp.isConnectionError ||
-                        resp.statusCode == 502 ||
-                        resp.statusCode == 503 ||
-                        resp.statusCode == 504
-                    )
-
-                    if (!isWakeRetryable) {
-                        val immediateMsg = resp.friendlyError.ifBlank { "Server returned ${resp.statusCode}" }
-                        recordFailedLink(context, normalizedUrl, cleanPlatform, finalTitle, immediateMsg)
-                        recordFailedStat(context)
-                        if (notifyFail) {
-                            NotificationHelper.showDownloadFailedNotification(context, "Download Failed", immediateMsg.take(120))
-                        }
-                        callToResolve?.reject(immediateMsg)
-                        return@Thread
-                    }
-
-                    if (attempt < maxAttempts) {
-                        val remainingMs = maxOperationMs - (System.currentTimeMillis() - operationStartMs)
-                        if (remainingMs <= 0L) {
-                            throw IOException("Timed out after 5m limit (${resp.friendlyError})")
-                        }
-                        reportProgress(15 + (attempt * 2), "SERVER IS WAKING UP... attempt ${attempt + 1}/$maxAttempts")
-                        val waitMs = minOf(5000L, remainingMs)
-                        Thread.sleep(waitMs)
-                    } else {
-                        val finalErr = resp.friendlyError.ifBlank { "Server failed after $maxAttempts attempts" }
-                        recordFailedLink(context, normalizedUrl, cleanPlatform, finalTitle, finalErr)
-                        recordFailedStat(context)
-                        if (notifyFail) {
-                            NotificationHelper.showDownloadFailedNotification(context, "Download Failed", finalErr.take(120))
-                        }
-                        callToResolve?.reject(finalErr)
-                        return@Thread
-                    }
-                }
-
-                val activeResp = downloadResp ?: throw IOException("No response stream from server")
-                connection = activeResp.connection
-                val responseStream = activeResp.inputStream ?: throw IOException("Empty response stream from server")
-
-                val contentType = activeResp.contentType
-                if (contentType.contains("application/zip", ignoreCase = true)) {
-                    reportProgress(35, "DOWNLOADING...")
-                    val zis = ZipInputStream(responseStream)
-                    val resolver = context.contentResolver
-                    val savedUris = ArrayList<Uri>()
-                    var zipEntry = zis.nextEntry
-                    var photoIndex = 0
-
-                    while (zipEntry != null) {
-                        val entryName = zipEntry.name
-                        if (!zipEntry.isDirectory && (entryName.endsWith(".jpg", ignoreCase = true) || entryName.endsWith(".jpeg", ignoreCase = true) || entryName.endsWith(".png", ignoreCase = true) || entryName.endsWith(".webp", ignoreCase = true))) {
-                            photoIndex++
-                            val paddedNum = String.format(Locale.US, "%02d", photoIndex)
-                            val cleanTitle = finalTitle
-                                .replace("[\\\\/:*?\"<>|\\r\\n]".toRegex(), "_")
-                                .replace("\\s+".toRegex(), " ")
-                                .trim()
-                                .take(60)
-                                .ifBlank { "TikTok_photo" }
-                            val photoDisplayName = "${cleanTitle}_$paddedNum.jpg"
-
-                            val imgValues = ContentValues().apply {
-                                this.put(MediaStore.MediaColumns.DISPLAY_NAME, photoDisplayName)
-                                this.put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                                    this.put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/OmniDrop")
-                                    this.put(MediaStore.MediaColumns.IS_PENDING, 1)
-                                }
-                            }
-
-                            val collectionUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-                            } else {
-                                MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-                            }
-
-                            val itemUri = resolver.insert(collectionUri, imgValues)
-                            if (itemUri != null) {
-                                resolver.openOutputStream(itemUri)?.use { outStream ->
-                                    val buf = ByteArray(8192)
-                                    var len: Int
-                                    while (zis.read(buf).also { len = it } != -1) {
-                                        outStream.write(buf, 0, len)
-                                    }
-                                    outStream.flush()
-                                }
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                                    val updateValues = ContentValues().apply {
-                                        this.put(MediaStore.MediaColumns.IS_PENDING, 0)
-                                    }
-                                    resolver.update(itemUri, updateValues, null, null)
-                                }
-                                savedUris.add(itemUri)
-                                val pct = (35 + (photoIndex * 5)).coerceAtMost(95)
-                                reportProgress(pct, "Saving photo $photoIndex to Pictures/OmniDrop...")
-                            }
-                        }
-                        zis.closeEntry()
-                        zipEntry = zis.nextEntry
-                    }
-                    zis.close()
-
-                    val totalPhotos = savedUris.size
-                    streamSucceeded = true
-                    val firstUri = savedUris.firstOrNull()?.toString() ?: ""
-                    val archiveFileName = "$finalTitle [TikTok photos]"
-
-                    reportProgress(100, "Saved $totalPhotos photos to Pictures/OmniDrop!")
-
-                    if (notifyFinish) {
-                        NotificationHelper.showDownloadFinishedNotification(
-                            context,
-                            "Saved $totalPhotos photos",
-                            "Saved to Pictures/OmniDrop",
-                            firstUri,
-                            isImage = true
-                        )
-                    }
-
-                    val metaObj = JSONObject().apply {
-                        this.put("type", "photo")
-                        this.put("title", finalTitle)
-                        this.put("platform", "TikTok")
-                        this.put("uploader", uploader)
-                        this.put("thumbnailUrl", thumbnail)
-                        this.put("sourceUrl", normalizedUrl)
-                        this.put("imageCount", totalPhotos)
-                        this.put("downloadTime", System.currentTimeMillis())
-                        this.put("fileName", archiveFileName)
-                        this.put("fileUri", firstUri)
-                    }
-                    saveVideoMetadata(context, archiveFileName, metaObj)
-
-                    val entryObj = JSONObject().apply {
-                        this.put("id", "dl_" + System.currentTimeMillis())
-                        this.put("type", "photo")
-                        this.put("url", normalizedUrl)
-                        this.put("title", finalTitle)
-                        this.put("thumbnail", thumbnail)
-                        this.put("uploader", uploader)
-                        this.put("platform", "TikTok")
-                        this.put("quality", "photo")
-                        this.put("imageCount", totalPhotos)
-                        this.put("savedAt", System.currentTimeMillis())
-                        this.put("fileName", archiveFileName)
-                        this.put("fileUri", firstUri)
-                    }
-                    saveHistoryEntry(context, entryObj)
-                    emitNativeDownloadFinished(entryObj)
-                    removeFailedLinkByUrl(context, normalizedUrl)
-                    recordDownloadStat(context, "TikTok", "photo", (totalPhotos.toLong() * 800L * 1024L))
-
-                    val res = JSObject().apply {
-                        this.put("fileName", archiveFileName)
-                        this.put("uri", firstUri)
-                        this.put("type", "photo")
-                        this.put("imageCount", totalPhotos)
-                    }
-                    callToResolve?.resolve(res)
-                    return@Thread
-                }
-
-                reportProgress(30, "DOWNLOADING...")
-
-                val resolver = context.contentResolver
-                val contentValues = ContentValues().apply {
-                    this.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                    this.put(MediaStore.MediaColumns.MIME_TYPE, mediaType)
-
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        val relativeFolder = if (isAudio) "Music/OmniDrop" else "Movies/OmniDrop"
-                        this.put(MediaStore.MediaColumns.RELATIVE_PATH, relativeFolder)
-                        this.put(MediaStore.MediaColumns.IS_PENDING, 1)
-                    }
-                }
-
-                val collectionUri = if (isAudio) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-                    } else {
-                        MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
-                    }
-                } else {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-                    } else {
-                        MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-                    }
-                }
-
-                targetUri = resolver.insert(collectionUri, contentValues)
-                if (targetUri == null) {
-                    callToResolve?.reject("Failed to create MediaStore entry in phone gallery.")
-                    return@Thread
-                }
-
-                outputStream = resolver.openOutputStream(targetUri)
-                if (outputStream == null) {
-                    callToResolve?.reject("Failed to open output stream to phone gallery.")
-                    return@Thread
-                }
-
-                inputStream = responseStream
-                val totalBytes = activeResp.contentLength
-                var bytesCopied: Long = 0
-                var lastSampleBytes: Long = 0
-                val buffer = ByteArray(8192)
-                var bytesRead: Int
-                var lastProgressReportTime: Long = System.currentTimeMillis()
-                var firstBytesReported = false
-
-                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                    outputStream.write(buffer, 0, bytesRead)
-                    bytesCopied += bytesRead
-
-                    if (!firstBytesReported) {
-                        firstBytesReported = true
-                        reportProgress(40, "DOWNLOADING...", 0.0)
-                    }
-
-                    val now = System.currentTimeMillis()
-                    val elapsedMs = now - lastProgressReportTime
-                    if (elapsedMs > 300) {
-                        val deltaBytes = bytesCopied - lastSampleBytes
-                        val speedMb = (deltaBytes.toDouble() / (1024.0 * 1024.0)) / (elapsedMs.toDouble() / 1000.0)
-                        lastProgressReportTime = now
-                        lastSampleBytes = bytesCopied
-                        val pct = if (totalBytes > 0) {
-                            (40 + (bytesCopied.toDouble() / totalBytes * 55)).toInt().coerceIn(40, 95)
-                        } else {
-                            75
-                        }
-                        val mb = String.format(Locale.US, "%.1f", bytesCopied / (1024.0 * 1024.0))
-                        reportProgress(pct, "DOWNLOADING... $mb MB", speedMb)
-                    }
-                }
-                outputStream.flush()
-                streamSucceeded = true
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val updateValues = ContentValues().apply {
-                        this.put(MediaStore.MediaColumns.IS_PENDING, 0)
-                    }
-                    resolver.update(targetUri, updateValues, null, null)
-                }
-
-                reportProgress(100, "Saved to ${if (isAudio) "Music/OmniDrop" else "Movies/OmniDrop"}!")
-
-                if (notifyFinish) {
-                    NotificationHelper.showDownloadFinishedNotification(
-                        context,
-                        "Saved to Gallery",
-                        "$fileName saved to ${if (isAudio) "Music/OmniDrop" else "Movies/OmniDrop"}",
-                        targetUri.toString()
-                    )
-                }
-
-                // Save to SharedPreferences metadata store (keyed by fileName, up to 500)
-                val metaObj = JSONObject().apply {
-                    this.put("title", finalTitle)
-                    this.put("platform", cleanPlatform)
-                    this.put("uploader", uploader)
-                    this.put("thumbnailUrl", thumbnail)
-                    this.put("sourceUrl", normalizedUrl)
-                    this.put("downloadTime", System.currentTimeMillis())
-                    this.put("fileName", fileName)
-                    this.put("fileUri", targetUri.toString())
-                }
-                saveVideoMetadata(context, fileName, metaObj)
-
-                // Save to native history and notify listeners
-                val entryObj = JSONObject().apply {
-                    this.put("id", "dl_" + System.currentTimeMillis())
-                    this.put("url", normalizedUrl)
-                    this.put("title", finalTitle)
-                    this.put("thumbnail", thumbnail)
-                    this.put("uploader", uploader)
-                    this.put("platform", cleanPlatform)
-                    this.put("quality", effectiveQuality)
-                    this.put("savedAt", System.currentTimeMillis())
-                    this.put("fileName", fileName)
-                    this.put("fileUri", targetUri.toString())
-                }
-                saveHistoryEntry(context, entryObj)
-                emitNativeDownloadFinished(entryObj)
-                removeFailedLinkByUrl(context, normalizedUrl)
-                recordDownloadStat(context, cleanPlatform, if (isAudio) "audio" else "video", bytesCopied)
-
-                val res = JSObject().apply {
-                    this.put("fileName", fileName)
-                    this.put("uri", targetUri.toString())
-                }
-                callToResolve?.resolve(res)
-
-            } catch (t: Throwable) {
-                if (targetUri != null) {
-                    try {
-                        context.contentResolver.delete(targetUri, null, null)
-                    } catch (_: Exception) {}
-                }
-                val rawErr = t.message ?: "Unknown error"
-                recordFailedLink(context, normalizedUrl, cleanPlatform, finalTitle, rawErr)
-                recordFailedStat(context)
-                val notifyFailPref = try {
-                    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                        .getBoolean("notify_download_fail", true)
-                } catch (_: Throwable) { true }
-                if (notifyFailPref) {
-                    NotificationHelper.showDownloadFailedNotification(context, "Download Failed", rawErr.take(120))
-                }
-                callToResolve?.reject(rawErr)
-            } finally {
-                inFlightDownloads.remove(normalizedUrl)
-                try { inputStream?.close() } catch (_: Exception) {}
-                try { outputStream?.close() } catch (_: Exception) {}
-                if (!streamSucceeded) {
-                    try { connection?.disconnect() } catch (_: Throwable) {}
-                }
-            }
-        }.start()
+        runDownloadPipeline(
+            appContext = context.applicationContext,
+            normalizedUrl = normalizedUrl,
+            quality = quality,
+            rawTitle = rawTitle,
+            rawBackendUrl = rawBackendUrl,
+            apiKey = apiKey,
+            callToResolve = callToResolve,
+            backupBackendUrlOverride = backupBackendUrlOverride,
+            backupApiKeyOverride = backupApiKeyOverride,
+            autoSwitchOverride = autoSwitchOverride,
+            onFinishedCallback = null
+        )
     }
 
     private fun reportProgress(percent: Int, statusText: String, speedMb: Double = 0.0) {
@@ -3460,15 +3952,16 @@ class VideoDownloaderPlugin : Plugin() {
             return
         }
 
+        val candidatesCheck = buildCandidateServers(context)
+        if (candidatesCheck.isEmpty()) {
+            call.reject("Please configure Render Backend URL in Settings before retrying.")
+            return
+        }
+
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val backendUrl = prefs.getString("backend_url", "") ?: ""
         val apiKey = prefs.getString("api_key", "") ?: ""
         val defaultQuality = prefs.getString("default_quality", "best") ?: "best"
-
-        if (backendUrl.isBlank()) {
-            call.reject("Please configure Render Backend URL in Settings before retrying.")
-            return
-        }
 
         val normUrl = normalizeUrl(targetUrl)
         if (inFlightDownloads.putIfAbsent(normUrl, true) != null) {
@@ -4128,6 +4621,197 @@ class VideoDownloaderPlugin : Plugin() {
                 this.put("totalBytes", totalBytes)
             }
             call.resolve(ret)
+        }.start()
+    }
+
+    @PluginMethod
+    fun getActiveServerStatus(call: PluginCall) {
+        try {
+            val role = getStickyActiveRole(context)
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val setAt = prefs.getLong(PREF_ACTIVE_SERVER_AT, 0L)
+            val now = System.currentTimeMillis()
+            val remainingMs = if (role == "backup" && setAt > 0L) {
+                (STICKY_BACKUP_WINDOW_MS - (now - setAt)).coerceAtLeast(0L)
+            } else {
+                0L
+            }
+            val ret = JSObject().apply {
+                this.put("activeServer", role)
+                this.put("switchedAt", setAt)
+                this.put("remainingSeconds", (remainingMs / 1000L).toInt())
+                this.put("remainingMs", remainingMs)
+            }
+            call.resolve(ret)
+        } catch (_: Throwable) {
+            val ret = JSObject().apply {
+                this.put("activeServer", "primary")
+                this.put("switchedAt", 0L)
+                this.put("remainingSeconds", 0)
+                this.put("remainingMs", 0L)
+            }
+            call.resolve(ret)
+        }
+    }
+
+    @PluginMethod
+    fun setActiveServerStatus(call: PluginCall) {
+        val role = call.getString("activeServer") ?: "primary"
+        setStickyActiveRole(context, role)
+        val ret = JSObject().apply {
+            this.put("saved", true)
+        }
+        call.resolve(ret)
+    }
+
+    @PluginMethod
+    fun runServerSpeedTest(call: PluginCall) {
+        val rawUrl = call.getString("url") ?: call.getString("serverUrl") ?: ""
+        val serverKey = call.getString("apiKey")?.trim() ?: ""
+        val serverRole = call.getString("serverRole") ?: getStickyActiveRole(context)
+        val normalizedBase = normalizeBaseServerUrl(rawUrl)
+        if (normalizedBase.isBlank()) {
+            call.reject("Missing server URL for speed test")
+            return
+        }
+
+        val ctx = context
+        Thread {
+            try {
+                if (!hasInternetConnection(ctx)) {
+                    call.reject("No internet")
+                    return@Thread
+                }
+
+                val headers = HashMap<String, String>().apply {
+                    this["Accept-Encoding"] = "identity"
+                    if (serverKey.isNotBlank()) {
+                        this["x-api-key"] = serverKey
+                    }
+                }
+
+                // 1. Run 5 small GET /health latency probes
+                val healthSamples = ArrayList<Int>()
+                var lastHealthErr = ""
+                val healthUrl = "$normalizedBase/health"
+                for (i in 1..5) {
+                    val hResp = httpRequest(
+                        context = ctx,
+                        method = "GET",
+                        url = healthUrl,
+                        headers = headers,
+                        connectTimeoutMs = 15000,
+                        readTimeoutMs = 15000,
+                        streamBody = false
+                    )
+                    if (hResp.isNoInternet) {
+                        call.reject("No internet")
+                        return@Thread
+                    }
+                    if (hResp.statusCode in 200..299) {
+                        healthSamples.add(hResp.elapsedMs.toInt().coerceAtLeast(1))
+                    } else {
+                        lastHealthErr = hResp.friendlyError.ifBlank { "Server returned ${hResp.statusCode}" }
+                        if (hResp.statusCode == 401 || hResp.statusCode == 403) {
+                            call.reject(lastHealthErr)
+                            return@Thread
+                        }
+                    }
+                }
+
+                if (healthSamples.isEmpty()) {
+                    call.reject(lastHealthErr.ifBlank { "Server unreachable during ping probes" })
+                    return@Thread
+                }
+
+                val avgLatencyMs = healthSamples.sum() / healthSamples.size
+                val minLatencyMs = healthSamples.minOrNull() ?: avgLatencyMs
+                val maxLatencyMs = healthSamples.maxOrNull() ?: avgLatencyMs
+
+                // 2. Download 2 MB from GET /speedtest?size=2000000
+                val speedUrl = "$normalizedBase/speedtest?size=2000000"
+                var spConn: HttpURLConnection? = null
+                var spInput: InputStream? = null
+                try {
+                    val dlStartNs = System.nanoTime()
+                    val spResp = httpRequest(
+                        context = ctx,
+                        method = "GET",
+                        url = speedUrl,
+                        headers = headers,
+                        connectTimeoutMs = 30000,
+                        readTimeoutMs = 60000,
+                        streamBody = true,
+                        connectionRefCallback = { spConn = it }
+                    )
+
+                    if (spResp.statusCode == 404 || spResp.statusCode == 405) {
+                        val unsupported = JSObject().apply {
+                            this.put("supported", false)
+                            this.put("serverRole", serverRole)
+                            this.put("serverUrl", normalizedBase)
+                            this.put("avgLatencyMs", avgLatencyMs)
+                            this.put("minLatencyMs", minLatencyMs)
+                            this.put("maxLatencyMs", maxLatencyMs)
+                            this.put("mbps", 0.0)
+                            this.put("bytesDownloaded", 0L)
+                            this.put("downloadElapsedMs", 0L)
+                            this.put("verdict", if (avgLatencyMs < 1500) "GOOD" else if (avgLatencyMs >= 4000) "VERY SLOW" else "SLOW")
+                            this.put("testedAt", System.currentTimeMillis())
+                            this.put("error", "Update your server to use the speed test")
+                        }
+                        call.resolve(unsupported)
+                        return@Thread
+                    }
+
+                    if (spResp.isNoInternet) {
+                        call.reject("No internet")
+                        return@Thread
+                    }
+
+                    if (spResp.statusCode !in 200..299 || spResp.inputStream == null) {
+                        call.reject(spResp.friendlyError.ifBlank { "Speed test failed (HTTP ${spResp.statusCode})" })
+                        return@Thread
+                    }
+
+                    spInput = spResp.inputStream
+                    val buf = ByteArray(16384)
+                    var totalBytesRead = 0L
+                    var n: Int
+                    while (spInput.read(buf).also { n = it } != -1) {
+                        totalBytesRead += n
+                    }
+                    val elapsedNs = (System.nanoTime() - dlStartNs).coerceAtLeast(1_000_000L)
+                    val elapsedMs = elapsedNs / 1_000_000L
+                    val mbps = (totalBytesRead * 8.0) / (elapsedNs.toDouble() / 1_000_000_000.0) / 1_000_000.0
+                    val roundedMbps = Math.round(mbps * 100.0) / 100.0
+
+                    val verdict = when {
+                        avgLatencyMs < 1500 && roundedMbps > 2.0 -> "GOOD"
+                        avgLatencyMs >= 4000 || roundedMbps < 0.75 -> "VERY SLOW"
+                        else -> "SLOW"
+                    }
+
+                    val res = JSObject().apply {
+                        this.put("supported", true)
+                        this.put("serverRole", serverRole)
+                        this.put("serverUrl", normalizedBase)
+                        this.put("avgLatencyMs", avgLatencyMs)
+                        this.put("minLatencyMs", minLatencyMs)
+                        this.put("maxLatencyMs", maxLatencyMs)
+                        this.put("mbps", roundedMbps)
+                        this.put("bytesDownloaded", totalBytesRead)
+                        this.put("downloadElapsedMs", elapsedMs)
+                        this.put("verdict", verdict)
+                        this.put("testedAt", System.currentTimeMillis())
+                    }
+                    call.resolve(res)
+                } finally {
+                    try { spInput?.close() } catch (_: Throwable) {}
+                }
+            } catch (t: Throwable) {
+                call.reject(t.message ?: "Speed test failed")
+            }
         }.start()
     }
 }

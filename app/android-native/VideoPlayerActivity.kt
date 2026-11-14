@@ -259,6 +259,11 @@ class VideoPlayerActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         try {
+            val notifId = intent.getIntExtra("notif_id", -1)
+            if (notifId > 0) {
+                NotificationHelper.cancelNotification(this, notifId)
+            }
+
             audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
             touchSlop = ViewConfiguration.get(this).scaledTouchSlop
 
@@ -294,9 +299,25 @@ class VideoPlayerActivity : Activity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        if (intent != null) {
+            setIntent(intent)
+            val notifId = intent.getIntExtra("notif_id", -1)
+            if (notifId > 0) {
+                NotificationHelper.cancelNotification(this, notifId)
+            }
+            parseIntentData()
+            loadVideoAtCurrentIndex(animate = false, slideLeft = true)
+        }
+    }
+
     private fun parseIntentData() {
-        val initialUri = intent.data ?: intent.getStringExtra("video_uri")?.let { Uri.parse(it) }
-        val initialTitle = intent.getStringExtra("video_title") ?: "OmniDrop Video"
+        val rawUriStr = intent.getStringExtra("video_uri") ?: intent.getStringExtra("uri")
+        val initialUri = intent.data ?: rawUriStr?.takeIf { it.isNotBlank() }?.let { Uri.parse(it) }
+        val initialTitle = intent.getStringExtra("video_title")
+            ?: intent.getStringExtra("title")
+            ?: "OmniDrop Video"
         val targetIndex = intent.getIntExtra("current_index", 0)
 
         playlist.clear()
@@ -310,13 +331,15 @@ class VideoPlayerActivity : Activity() {
             }
         }
 
-        if (playlist.isEmpty() && initialUri != null) {
-            playlist.add(PlaylistItem(initialUri.toString(), initialTitle, "Other"))
-        }
-
         if (initialUri != null) {
-            val foundIdx = playlist.indexOfFirst { it.uri == initialUri.toString() }
-            currentIndex = if (foundIdx >= 0) foundIdx else targetIndex.coerceIn(0, (playlist.size - 1).coerceAtLeast(0))
+            val initialUriStr = initialUri.toString()
+            val foundIdx = playlist.indexOfFirst { it.uri == initialUriStr }
+            if (foundIdx >= 0) {
+                currentIndex = foundIdx
+            } else {
+                playlist.add(0, PlaylistItem(initialUriStr, initialTitle, "Other"))
+                currentIndex = 0
+            }
         } else {
             currentIndex = targetIndex.coerceIn(0, (playlist.size - 1).coerceAtLeast(0))
         }

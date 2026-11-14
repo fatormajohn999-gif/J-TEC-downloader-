@@ -12,9 +12,9 @@ import urllib.error
 from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks, status
+from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks, status, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import yt_dlp
 
@@ -402,6 +402,28 @@ def download_gallery_photos(target_url: str, title: str) -> Tuple[str, str, str]
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+@app.get("/speedtest", dependencies=[Depends(verify_api_key)])
+async def speedtest(size: int = Query(default=2000000, ge=1)):
+    capped_size = min(size, 5_000_000)
+
+    def _random_stream():
+        remaining = capped_size
+        chunk_size = 65536
+        while remaining > 0:
+            to_read = min(chunk_size, remaining)
+            yield os.urandom(to_read)
+            remaining -= to_read
+
+    return StreamingResponse(
+        _random_stream(),
+        media_type="application/octet-stream",
+        headers={
+            "Content-Length": str(capped_size),
+            "Content-Encoding": "identity",
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+        },
+    )
 
 @app.post("/info", dependencies=[Depends(verify_api_key)])
 async def get_video_info(payload: InfoRequest):

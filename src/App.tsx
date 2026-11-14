@@ -33,6 +33,10 @@ const TAB_ORDER: NavTab[] = ['home', 'videos', 'photos', 'settings', 'about'];
 const DEFAULT_SETTINGS: AppSettings = {
   backendUrl: '',
   apiKey: '',
+  backupBackendUrl: '',
+  backupApiKey: '',
+  autoSwitchToBackup: true,
+  keepBackupAwake: false,
   defaultQuality: 'best',
   dataSaver: false,
   mobileDataPromptMb: 'off',
@@ -119,6 +123,7 @@ export default function App() {
 
   const [pendingUrl, setPendingUrl] = useState<string>('');
   const [detectedClipboardUrl, setDetectedClipboardUrl] = useState<string>('');
+  const [notifBanner, setNotifBanner] = useState<string | null>(null);
 
   // Keep DOM accent + reduce-motion attributes in sync with settings
   useEffect(() => {
@@ -140,6 +145,10 @@ export default function App() {
   const syncNativePrefsPayload = (s: AppSettings) => ({
     backendUrl: s.backendUrl,
     apiKey: s.apiKey,
+    backupBackendUrl: s.backupBackendUrl ?? '',
+    backupApiKey: s.backupApiKey ?? '',
+    autoSwitchToBackup: s.autoSwitchToBackup ?? true,
+    keepBackupAwake: s.keepBackupAwake ?? false,
     defaultQuality: s.defaultQuality,
     autoDownload: true,
     autoDownloadOnPaste: s.autoDownloadOnPaste,
@@ -211,19 +220,35 @@ export default function App() {
     }
   }, []);
 
-  // Listen to native openSettingsTab event (from notification click)
+  // Listen to native openTab and openSettingsTab events (from notification click / DELETE fallback)
   useEffect(() => {
-    let handle: any = null;
+    let handleSettings: any = null;
+    let handleTab: any = null;
     VideoDownloader.addListener('openSettingsTab', () => {
       handleSelectTab('settings');
     })
       .then((h) => {
-        handle = h;
+        handleSettings = h;
+      })
+      .catch(() => {});
+
+    VideoDownloader.addListener('openTab', (data) => {
+      const target = data?.tab as NavTab | undefined;
+      if (target && TAB_ORDER.includes(target)) {
+        handleSelectTab(target);
+      }
+      if (data?.message) {
+        setNotifBanner(data.message);
+      }
+    })
+      .then((h) => {
+        handleTab = h;
       })
       .catch(() => {});
 
     return () => {
-      if (handle && handle.remove) handle.remove();
+      if (handleSettings && handleSettings.remove) handleSettings.remove();
+      if (handleTab && handleTab.remove) handleTab.remove();
     };
   }, [handleSelectTab]);
 
@@ -452,6 +477,19 @@ export default function App() {
       {/* Main View Area */}
       <main className="flex-1 w-full max-w-md mx-auto px-4 pt-3 overflow-x-clip">
         <ServerWakingBanner isWaking={isWakingServer} attempt={wakingAttempt} />
+
+        {notifBanner && (
+          <div className="mb-3 rounded-xl border border-amber-500/40 bg-amber-950/60 px-3.5 py-2.5 flex items-center justify-between gap-2 text-xs text-amber-100">
+            <span className="font-mono leading-snug">{notifBanner}</span>
+            <button
+              type="button"
+              onClick={() => setNotifBanner(null)}
+              className="px-2 py-1 rounded bg-amber-500/20 text-amber-200 font-mono text-[11px] hover:bg-amber-500/30 shrink-0"
+            >
+              OK
+            </button>
+          </div>
+        )}
 
         <div key={currentTab} className={tabTransitionClass}>
           {currentTab === 'home' && (

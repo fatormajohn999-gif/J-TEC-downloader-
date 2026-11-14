@@ -321,15 +321,20 @@ export const VideosScreen: React.FC<VideosScreenProps> = ({ onRefreshTrigger }) 
 
   useEffect(() => {
     let handle: any = null;
+    let libHandle: any = null;
     (async () => {
       try {
         handle = await VideoDownloader.addListener('nativeDownloadFinished', () => {
+          loadLibrary();
+        });
+        libHandle = await VideoDownloader.addListener('onLibraryChanged', () => {
           loadLibrary();
         });
       } catch {}
     })();
     return () => {
       if (handle && handle.remove) handle.remove();
+      if (libHandle && libHandle.remove) libHandle.remove();
     };
   }, [loadLibrary]);
 

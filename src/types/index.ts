@@ -66,6 +66,10 @@ export type MobileDataPromptMb = 'off' | 50 | 100 | 200;
 export interface AppSettings {
   backendUrl: string;
   apiKey: string;
+  backupBackendUrl?: string;
+  backupApiKey?: string;
+  autoSwitchToBackup?: boolean;
+  keepBackupAwake?: boolean;
   defaultQuality: string;
   floatingBubbleEnabled: boolean;
   persistentNotificationEnabled: boolean;
@@ -105,6 +109,28 @@ export interface AppSettings {
 
   // 4. Privacy
   hideInRecents?: boolean;
+}
+
+export interface ServerHealthProbe {
+  configured: boolean;
+  ok: boolean;
+  latencyMs: number;
+  error?: string;
+}
+
+export interface SpeedTestResult {
+  supported: boolean;
+  serverRole: 'primary' | 'backup';
+  serverUrl: string;
+  avgLatencyMs: number;
+  minLatencyMs: number;
+  maxLatencyMs: number;
+  mbps: number;
+  bytesDownloaded: number;
+  downloadElapsedMs: number;
+  verdict: 'GOOD' | 'SLOW' | 'VERY SLOW';
+  testedAt: number;
+  error?: string;
 }
 
 export interface AppUpdateInfo {
